@@ -20,12 +20,22 @@ class PeekAPI:
                 # Используем rdns=True для remote DNS resolution
                 connector = ProxyConnector.from_url(self.proxy_url, rdns=True)
             
+            # Заголовки для обхода защиты peek.tg API
+            headers = {
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+                "Accept": "application/json, text/plain, */*",
+                "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7",
+                "Origin": "https://peek.tg",
+                "Referer": "https://peek.tg/",
+                "Sec-Fetch-Dest": "empty",
+                "Sec-Fetch-Mode": "cors",
+                "Sec-Fetch-Site": "same-site"
+            }
+            
             self.session = aiohttp.ClientSession(
                 connector=connector,
                 timeout=aiohttp.ClientTimeout(total=20),
-                headers={
-                    "User-Agent": "TelegramGiftParser/1.0"
-                }
+                headers=headers
             )
 
     async def get_gift(self, model: str, gift_number: int):
@@ -95,37 +105,52 @@ class PeekAPI:
     @staticmethod
     def format_gift(gift: dict) -> str:
         number = gift.get("giftNumber", gift.get("num", "?"))
-        username = gift.get("username")
+        username = gift.get("username", "").replace("t.me/", "").lstrip("@")
         user_id = gift.get("userId")
         owner = gift.get("owner")
         model = gift.get("model", "?")
         pattern = gift.get("pattern", "?")
         backdrop = gift.get("backdrop", "?")
+        gift_name = gift.get("giftName", gift.get("title", "?"))
+        
+        # Информация о редкости
+        rarity_model = gift.get("rarityModel", 0)
+        rarity_pattern = gift.get("rarityPattern", 0)
+        rarity_backdrop = gift.get("rarityBackdrop", 0)
+        
+        # Информация о рынке
+        market = gift.get("market", {})
+        price = market.get("price")
+        market_name = market.get("market", "").title()
 
         lines = [
             "🎁 <b>Найден подарок!</b>",
             f"🆔 ID: <code>{number}</code>",
-            f"🎨 Модель: <code>{model}</code>",
-            f"✨ Узор: <code>{pattern}</code>",
-            f"🌈 Фон: <code>{backdrop}</code>",
+            f"🎨 Название: <b>{gift_name}</b>",
+            f"✨ Модель: <code>{model}</code> (редкость: {rarity_model}%)",
+            f"🌸 Узор: <code>{pattern}</code> (редкость: {rarity_pattern}%)",
+            f"🌈 Фон: <code>{backdrop}</code> (редкость: {rarity_backdrop}%)",
         ]
 
         if username:
-            clean = str(username).lstrip("@")
-            lines.append(f"👤 Владелец: @{clean}")
-            lines.append(f"🔗 https://t.me/{clean}")
+            lines.append(f"👤 Владелец: @{username}")
+            lines.append(f"🔗 https://t.me/{username}")
         elif user_id:
             lines.append(f"👤 Telegram ID: <code>{user_id}</code>")
         elif owner:
             lines.append(f"👤 Владелец: <code>{owner}</code>")
         else:
             lines.append("👤 Владелец: не указан")
+        
+        # Информация о цене на маркетплейсе
+        if price and market_name:
+            lines.append(f"💰 Цена на {market_name}: <b>{price} TON</b>")
 
-        # Пытаемся построить стандартную collectible-ссылку.
-        # Не используем её как гарантию: настоящий slug может отличаться.
-        if model and number not in ("?", None):
-            safe_model = str(model).replace(" ", "")
-            lines.append(f"🎁 https://t.me/nft/{quote(safe_model)}-{number}")
+        # Ссылка на подарок
+        if gift_name and number not in ("?", None):
+            from urllib.parse import quote
+            safe_name = str(gift_name).replace(" ", "")
+            lines.append(f"🎁 https://t.me/nft/{quote(safe_name)}-{number}")
 
         return "\n".join(lines)
 
