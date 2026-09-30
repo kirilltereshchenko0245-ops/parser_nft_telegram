@@ -8,13 +8,119 @@ PEEK_URL = "https://server.peek.tg/api/nft/gifts/search"
 
 # Актуальный список моделей подарков (обновляется вручную)
 AVAILABLE_MODELS = [
-    "EternalRose", "Evil Eye", "Blue Star", "Delicious",
-    "Red Packet", "Gold Bar", "Tiger", "Rabbit",
+    "EternalRose", "EvilEye", "BlueStar", "Delicious",
+    "RedPacket", "GoldBar", "Tiger", "Rabbit",
     "Dragon", "Snake", "Horse", "Goat",
     "Monkey", "Rooster", "Dog", "Pig",
-    "Green Star", "Purple Star", "Pink Star", "Aqua Star",
-    "Birthday Cake", "Valentine Bouquet", "Happy New Year"
+    "GreenStar", "PurpleStar", "PinkStar", "AquaStar",
+    "BirthdayCake", "ValentineBouquet", "HappyNewYear"
 ]
+
+# Маппинг для нормализации названий (любой ввод → правильное название)
+MODEL_NAME_MAP = {
+    # EternalRose
+    "eternalrose": "EternalRose",
+    "eternal rose": "EternalRose",
+    "eternal_rose": "EternalRose",
+    "ETERNALROSE": "EternalRose",
+    "Eternal Rose": "EternalRose",
+    
+    # EvilEye
+    "evileye": "EvilEye",
+    "evil eye": "EvilEye",
+    "evil_eye": "EvilEye",
+    "EVILEYE": "EvilEye",
+    "Evil Eye": "EvilEye",
+    
+    # BlueStar
+    "bluestar": "BlueStar",
+    "blue star": "BlueStar",
+    "blue_star": "BlueStar",
+    "BLUESTAR": "BlueStar",
+    "Blue Star": "BlueStar",
+    
+    # Delicious
+    "delicious": "Delicious",
+    "DELICIOUS": "Delicious",
+    
+    # RedPacket
+    "redpacket": "RedPacket",
+    "red packet": "RedPacket",
+    "red_packet": "RedPacket",
+    "REDPACKET": "RedPacket",
+    "Red Packet": "RedPacket",
+    
+    # GoldBar
+    "goldbar": "GoldBar",
+    "gold bar": "GoldBar",
+    "gold_bar": "GoldBar",
+    "GOLDBAR": "GoldBar",
+    "Gold Bar": "GoldBar",
+    
+    # Животные
+    "tiger": "Tiger",
+    "rabbit": "Rabbit",
+    "dragon": "Dragon",
+    "snake": "Snake",
+    "horse": "Horse",
+    "goat": "Goat",
+    "monkey": "Monkey",
+    "rooster": "Rooster",
+    "dog": "Dog",
+    "pig": "Pig",
+    
+    # Звёзды
+    "greenstar": "GreenStar",
+    "green star": "GreenStar",
+    "purplestar": "PurpleStar",
+    "purple star": "PurpleStar",
+    "pinkstar": "PinkStar",
+    "pink star": "PinkStar",
+    "aquastar": "AquaStar",
+    "aqua star": "AquaStar",
+    
+    # Праздничные
+    "birthdaycake": "BirthdayCake",
+    "birthday cake": "BirthdayCake",
+    "valentinebouquet": "ValentineBouquet",
+    "valentine bouquet": "ValentineBouquet",
+    "happynewyear": "HappyNewYear",
+    "happy new year": "HappyNewYear",
+}
+
+def normalize_model_name(user_input: str) -> str:
+    """
+    Нормализует название модели введённое пользователем
+    
+    Примеры:
+    - "eternal rose" → "EternalRose"
+    - "evil eye" → "EvilEye"
+    - "ETERNALROSE" → "EternalRose"
+    - "EternalRose-5000" → "EternalRose" (для поиска по ID)
+    """
+    # Убираем лишние пробелы
+    user_input = user_input.strip()
+    
+    # Если это формат "модель-номер", берём только модель
+    if "-" in user_input:
+        user_input = user_input.split("-")[0].strip()
+    
+    # Убираем подчёркивания и приводим к lowercase для поиска
+    search_key = user_input.replace("_", " ").lower()
+    
+    # Ищем в маппинге
+    if search_key in MODEL_NAME_MAP:
+        return MODEL_NAME_MAP[search_key]
+    
+    # Если не нашли, пробуем убрать все пробелы
+    search_key_no_space = search_key.replace(" ", "")
+    if search_key_no_space in MODEL_NAME_MAP:
+        return MODEL_NAME_MAP[search_key_no_space]
+    
+    # Если всё равно не нашли, возвращаем как есть с большой буквы
+    # (для новых моделей которых ещё нет в маппинге)
+    return user_input.replace(" ", "").title()
+
 
 class PeekAPI:
     def __init__(self):

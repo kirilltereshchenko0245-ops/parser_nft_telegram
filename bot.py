@@ -12,7 +12,7 @@ from aiogram.client.default import DefaultBotProperties
 from dotenv import load_dotenv
 
 from database import Database
-from peek_api import peek_gift_info, AVAILABLE_MODELS, format_summary
+from peek_api import peek_gift_info, AVAILABLE_MODELS, format_summary, normalize_model_name
 from keyboards import (
     main_menu_keyboard, admin_menu_keyboard, cancel_keyboard,
     gift_result_keyboard, models_list_keyboard, payment_method_keyboard,
@@ -58,6 +58,7 @@ class SearchStates(StatesGroup):
 
 class AdminStates(StatesGroup):
     waiting_for_user_id = State()
+    waiting_for_trials_count = State()
 
 # === MIDDLEWARE: Проверка бана и доступа ===
 @dp.message.middleware()
@@ -197,8 +198,8 @@ async def search_model_entered(message: Message, state: FSMContext):
         )
         return
     
-    # Нормализация названия (убрать пробелы, привести к Title Case)
-    model_name = message.text.strip().replace(" ", "").title()
+    # Нормализация названия через маппинг
+    model_name = normalize_model_name(message.text)
     
     await state.update_data(model=model_name)
     await state.set_state(SearchStates.waiting_for_range)
@@ -414,7 +415,8 @@ async def search_by_id_process(message: Message, state: FSMContext):
         if len(parts) != 2:
             raise ValueError()
         
-        model = parts[0].strip().replace(" ", "").title()
+        # Нормализация названия модели через маппинг
+        model = normalize_model_name(parts[0].strip())
         gift_id = int(parts[1])
         
         if gift_id < 1:
@@ -704,14 +706,14 @@ async def admin_user_entered(message: Message, state: FSMContext):
             username = message.text[1:]
             user = db.get_user_by_username(username)
             if not user:
-                await message.answer("❌ Пользователь не найден")
+                await message.answer("❌ Пользователь не найден. Попробуйте ввести ID (число)")
                 return
             target_user_id = user['user_id']
         else:
             target_user_id = int(message.text)
             user = db.get_user(target_user_id)
             if not user:
-                await message.answer("❌ Пользователь не найден")
+                await message.answer("❌ Пользователь не найден. Проверьте ID")
                 return
         
         await state.clear()
@@ -723,8 +725,10 @@ async def admin_user_entered(message: Message, state: FSMContext):
             f"👤 <b>Пользователь</b>\n\n"
             f"🆔 ID: <code>{user['user_id']}</code>\n"
             f"👤 Username: @{user.get('username', 'не указан')}\n"
-            f"📅 Регистрация: {user['created_at'][:10]}\n"
+            f"� Имя: {user.get('first_name', 'не указано')}\n"
+            f"�📅 Регистрация: {user['registration_date'][:10]}\n"
             f"💎 Статус: {premium_status}\n"
+            f"🎫 Пробных поисков: {user['trial_searches_left']}/25\n"
             f"🔒 Бан: {ban_status}\n"
         )
         
@@ -799,6 +803,116 @@ async def callback_remove_premium(callback: CallbackQuery):
         f"❌ Premium удалён у пользователя {user_id}",
         reply_markup=ban_user_keyboard(user_id)
     )
+
+@dp.callback_query(F.data.startswith("trials_add10_"))
+async def callback_add_trials_10(callback: CallbackQuery):
+    """Добавить 10 пробных поисков"""
+    if callback.from_user.id != OWNER_ID:
+        await callback.answer("❌ Нет доступа", show_alert=True)
+        return
+    
+    user_id = int(callback.data.split("_")[2])
+    user = db.get_user(user_id)
+    
+    new_value = user['trial_searches_left'] + 10
+    db.update_trial_searches(user_id, new_value)
+    
+    await callback.answer(f"✅ Добавлено 10 поисков (теперь: {new_value})", show_alert=True)
+    
+    # Обновляем сообщение
+    ban_status = "🚫 Забанен" if user['is_banned'] else "✅ Активен"
+    premium_status = "⭐ Premium" if user['is_premium'] else "🎫 Trial"
+    
+    text = (
+        f"👤 <b>Пользователь</b>\n\n"
+        f"🆔 ID: <code>{user['user_id']}</code>\n"
+        f"👤 Username: @{user.get('username', 'не указан')}\n"
+        f"👤 Имя: {user.get('first_name', 'не указано')}\n"
+        f"📅 Регистрация: {user['registration_date'][:10]}\n"
+        f"💎 Статус: {premium_status}\n"
+        f"🎫 Пробных поисков: {new_value}/25\n"
+        f"🔒 Бан: {ban_status}\n"
+    )
+    
+    await callback.message.edit_text(text, reply_markup=ban_user_keyboard(user_id))
+
+@dp.callback_query(F.data.startswith("trials_add25_"))
+async def callback_add_trials_25(callback: CallbackQuery):
+    """Добавить 25 пробных поисков"""
+    if callback.from_user.id != OWNER_ID:
+        await callback.answer("❌ Нет доступа", show_alert=True)
+        return
+    
+    user_id = int(callback.data.split("_")[2])
+    user = db.get_user(user_id)
+    
+    new_value = user['trial_searches_left'] + 25
+    db.update_trial_searches(user_id, new_value)
+    
+    await callback.answer(f"✅ Добавлено 25 поисков (теперь: {new_value})", show_alert=True)
+    
+    # Обновляем сообщение
+    ban_status = "🚫 Забанен" if user['is_banned'] else "✅ Активен"
+    premium_status = "⭐ Premium" if user['is_premium'] else "🎫 Trial"
+    
+    text = (
+        f"👤 <b>Пользователь</b>\n\n"
+        f"🆔 ID: <code>{user['user_id']}</code>\n"
+        f"👤 Username: @{user.get('username', 'не указан')}\n"
+        f"👤 Имя: {user.get('first_name', 'не указано')}\n"
+        f"📅 Регистрация: {user['registration_date'][:10]}\n"
+        f"💎 Статус: {premium_status}\n"
+        f"🎫 Пробных поисков: {new_value}/25\n"
+        f"🔒 Бан: {ban_status}\n"
+    )
+    
+    await callback.message.edit_text(text, reply_markup=ban_user_keyboard(user_id))
+
+@dp.callback_query(F.data.startswith("trials_set_"))
+async def callback_set_trials(callback: CallbackQuery, state: FSMContext):
+    """Установить количество пробных поисков"""
+    if callback.from_user.id != OWNER_ID:
+        await callback.answer("❌ Нет доступа", show_alert=True)
+        return
+    
+    user_id = int(callback.data.split("_")[2])
+    
+    await state.set_state(AdminStates.waiting_for_trials_count)
+    await state.update_data(target_user_id=user_id)
+    
+    await callback.message.answer(
+        "🎫 <b>Установить количество поисков</b>\n\n"
+        "Введите число (например: 50):",
+        reply_markup=cancel_keyboard()
+    )
+    await callback.answer()
+
+@dp.message(AdminStates.waiting_for_trials_count)
+async def admin_trials_count_entered(message: Message, state: FSMContext):
+    """Обработка введённого количества поисков"""
+    if message.text == "❌ Отмена":
+        await state.clear()
+        await message.answer("❌ Отменено", reply_markup=admin_menu_keyboard())
+        return
+    
+    try:
+        count = int(message.text)
+        if count < 0:
+            raise ValueError()
+        
+        data = await state.get_data()
+        user_id = data['target_user_id']
+        
+        db.update_trial_searches(user_id, count)
+        
+        await state.clear()
+        await message.answer(
+            f"✅ Установлено {count} пробных поисков для пользователя {user_id}",
+            reply_markup=admin_menu_keyboard()
+        )
+        
+    except ValueError:
+        await message.answer("❌ Неверный формат! Введите число (например: 50)")
 
 @dp.message(F.text == "📈 Статистика")
 async def admin_stats(message: Message):

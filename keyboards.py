@@ -68,7 +68,7 @@ def admin_settings_keyboard(mode: str):
     return builder.as_markup()
 
 def ban_user_keyboard(user_id: int):
-    """Кнопки для бана/разбана пользователя"""
+    """Кнопки для управления пользователем"""
     builder = InlineKeyboardBuilder()
     
     builder.row(
@@ -78,6 +78,13 @@ def ban_user_keyboard(user_id: int):
     builder.row(
         InlineKeyboardButton(text="⭐ Дать Premium", callback_data=f"premium_give_{user_id}"),
         InlineKeyboardButton(text="❌ Забрать Premium", callback_data=f"premium_remove_{user_id}")
+    )
+    builder.row(
+        InlineKeyboardButton(text="🎫 +10 поисков", callback_data=f"trials_add10_{user_id}"),
+        InlineKeyboardButton(text="🎫 +25 поисков", callback_data=f"trials_add25_{user_id}")
+    )
+    builder.row(
+        InlineKeyboardButton(text="🎫 Установить поиски", callback_data=f"trials_set_{user_id}")
     )
     
     return builder.as_markup()
