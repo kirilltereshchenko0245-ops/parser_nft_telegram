@@ -2,11 +2,13 @@
 Модуль для логирования действий пользователей в канал
 """
 import logging
+import os
 from aiogram import Bot
 from aiogram.enums import ParseMode
 from datetime import datetime
 
-LOG_CHANNEL_ID = -1003864916255
+# ID канала для логов (можно переопределить через .env)
+LOG_CHANNEL_ID = int(os.getenv("LOG_CHANNEL_ID", "-1003864916255"))
 
 class ChannelLogger:
     """Логирование в Telegram канал"""

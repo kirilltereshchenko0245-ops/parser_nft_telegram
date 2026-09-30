@@ -8,6 +8,7 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import Message, CallbackQuery, InlineKeyboardButton
 from aiogram.enums import ParseMode
+from aiogram.client.default import DefaultBotProperties
 from dotenv import load_dotenv
 
 from database import Database
@@ -35,11 +36,14 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN не указан в .env")
 
-# ID владельца (ваш Telegram ID)
-OWNER_ID = 6969906545  # Замените на ваш реальный ID
+# ID владельца (ваш Telegram ID) - можно переопределить через .env
+OWNER_ID = int(os.getenv("OWNER_ID", "6969906545"))  # Замените на ваш реальный ID
 
 # Инициализация
-bot = Bot(token=BOT_TOKEN, parse_mode=ParseMode.HTML)
+bot = Bot(
+    token=BOT_TOKEN,
+    default=DefaultBotProperties(parse_mode=ParseMode.HTML)
+)
 storage = MemoryStorage()
 dp = Dispatcher(storage=storage)
 db = Database()
