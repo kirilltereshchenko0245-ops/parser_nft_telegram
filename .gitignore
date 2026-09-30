@@ -1,0 +1,10 @@
+.env
+__pycache__/
+*.pyc
+*.session
+*.session-journal
+parser.db
+venv/
+*.log
+.vscode/
+.idea/
