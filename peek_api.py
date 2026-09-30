@@ -41,6 +41,8 @@ class PeekAPI:
     async def get_gift(self, model: str, gift_number: int):
         await self._ensure_session()
         
+        import logging
+        
         params = {
             "name": model,
             "page": 1,
@@ -51,25 +53,43 @@ class PeekAPI:
 
         max_retries = 3
         for attempt in range(max_retries):
-            async with self.session.get(PEEK_URL, params=params) as response:
-                if response.status == 404:
-                    return None
+            try:
+                async with self.session.get(PEEK_URL, params=params) as response:
+                    logging.info(f"Gift {gift_number}: HTTP {response.status}")
+                    
+                    if response.status == 404:
+                        return None
 
-                if response.status == 429 or response.status == 403:
-                    # Rate limit или блокировка - ждём дольше
-                    wait_time = 3 + (attempt * 2)  # 3, 5, 7 секунд
-                    await __import__("asyncio").sleep(wait_time)
-                    continue
-
-                if response.status != 200:
-                    text = await response.text()
-                    if attempt < max_retries - 1:
-                        await __import__("asyncio").sleep(2)
+                    if response.status == 429 or response.status == 403:
+                        # Rate limit или блокировка - ждём дольше
+                        wait_time = 3 + (attempt * 2)  # 3, 5, 7 секунд
+                        logging.warning(f"Gift {gift_number}: Rate limit, waiting {wait_time}s")
+                        await __import__("asyncio").sleep(wait_time)
                         continue
-                    raise RuntimeError(f"Peek HTTP {response.status}: {text[:300]}")
-                
-                data = await response.json(content_type=None)
-                return self._extract(data, gift_number)
+
+                    if response.status != 200:
+                        text = await response.text()
+                        logging.error(f"Gift {gift_number}: HTTP {response.status}: {text[:100]}")
+                        if attempt < max_retries - 1:
+                            await __import__("asyncio").sleep(2)
+                            continue
+                        raise RuntimeError(f"Peek HTTP {response.status}: {text[:300]}")
+                    
+                    data = await response.json(content_type=None)
+                    result = self._extract(data, gift_number)
+                    
+                    if result:
+                        logging.info(f"Gift {gift_number}: FOUND!")
+                    else:
+                        logging.info(f"Gift {gift_number}: not found (no owner)")
+                    
+                    return result
+            except Exception as e:
+                logging.error(f"Gift {gift_number} attempt {attempt+1} exception: {type(e).__name__}: {e}")
+                if attempt < max_retries - 1:
+                    await __import__("asyncio").sleep(2)
+                else:
+                    raise
         
         # Если все попытки провалились
         return None
