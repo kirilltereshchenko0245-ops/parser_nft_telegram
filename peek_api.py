@@ -118,8 +118,8 @@ class PeekAPI:
         rarity_pattern = gift.get("rarityPattern", 0)
         rarity_backdrop = gift.get("rarityBackdrop", 0)
         
-        # Информация о рынке
-        market = gift.get("market", {})
+        # Информация о рынке (может быть None)
+        market = gift.get("market") or {}
         price = market.get("price")
         market_name = market.get("market", "").title()
 
