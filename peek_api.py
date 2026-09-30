@@ -49,24 +49,30 @@ class PeekAPI:
             "limit": 20,
         }
 
-        async with self.session.get(PEEK_URL, params=params) as response:
-            if response.status == 404:
-                return None
+        max_retries = 3
+        for attempt in range(max_retries):
+            async with self.session.get(PEEK_URL, params=params) as response:
+                if response.status == 404:
+                    return None
 
-            if response.status == 429:
-                # Простой retry при rate limit.
-                await __import__("asyncio").sleep(2)
-                async with self.session.get(PEEK_URL, params=params) as retry:
-                    if retry.status != 200:
-                        return None
-                    data = await retry.json(content_type=None)
-            elif response.status != 200:
-                text = await response.text()
-                raise RuntimeError(f"Peek HTTP {response.status}: {text[:300]}")
-            else:
+                if response.status == 429 or response.status == 403:
+                    # Rate limit или блокировка - ждём дольше
+                    wait_time = 3 + (attempt * 2)  # 3, 5, 7 секунд
+                    await __import__("asyncio").sleep(wait_time)
+                    continue
+
+                if response.status != 200:
+                    text = await response.text()
+                    if attempt < max_retries - 1:
+                        await __import__("asyncio").sleep(2)
+                        continue
+                    raise RuntimeError(f"Peek HTTP {response.status}: {text[:300]}")
+                
                 data = await response.json(content_type=None)
-
-        return self._extract(data, gift_number)
+                return self._extract(data, gift_number)
+        
+        # Если все попытки провалились
+        return None
 
     def _extract(self, data, gift_number):
         if not isinstance(data, dict):

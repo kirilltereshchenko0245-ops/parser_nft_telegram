@@ -136,8 +136,8 @@ async def end_received(message: Message, state: FSMContext):
                 except Exception:
                     pass
 
-            # Небольшая пауза, чтобы не долбить API слишком быстро.
-            await asyncio.sleep(0.15)
+            # Пауза между запросами, чтобы не получить rate limit
+            await asyncio.sleep(0.5)  # Увеличено с 0.15 до 0.5 секунды
 
         await status.edit_text(
             f"✅ <b>Готово</b>\n\n"
