@@ -9,22 +9,28 @@ PEEK_URL = "https://server.peek.tg/api/nft/gifts/search"
 class PeekAPI:
     def __init__(self):
         # Получаем настройки прокси из переменных окружения
-        proxy_url = os.getenv("PROXY_URL")  # например: socks5://192.168.0.100:10808
+        self.proxy_url = os.getenv("PROXY_URL")  # например: socks5://192.168.0.100:10808
+        self.session = None
         
-        connector = None
-        if proxy_url:
-            # Используем rdns=True для remote DNS resolution
-            connector = ProxyConnector.from_url(proxy_url, rdns=True)
-        
-        self.session = aiohttp.ClientSession(
-            connector=connector,
-            timeout=aiohttp.ClientTimeout(total=20),
-            headers={
-                "User-Agent": "TelegramGiftParser/1.0"
-            }
-        )
+    async def _ensure_session(self):
+        """Создаёт сессию, если её ещё нет"""
+        if self.session is None or self.session.closed:
+            connector = None
+            if self.proxy_url:
+                # Используем rdns=True для remote DNS resolution
+                connector = ProxyConnector.from_url(self.proxy_url, rdns=True)
+            
+            self.session = aiohttp.ClientSession(
+                connector=connector,
+                timeout=aiohttp.ClientTimeout(total=20),
+                headers={
+                    "User-Agent": "TelegramGiftParser/1.0"
+                }
+            )
 
     async def get_gift(self, model: str, gift_number: int):
+        await self._ensure_session()
+        
         params = {
             "name": model,
             "page": 1,
@@ -124,5 +130,5 @@ class PeekAPI:
         return "\n".join(lines)
 
     async def close(self):
-        if not self.session.closed:
+        if self.session and not self.session.closed:
             await self.session.close()
