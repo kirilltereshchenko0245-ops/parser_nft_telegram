@@ -29,7 +29,9 @@ class Database:
                 first_name TEXT,
                 is_banned BOOLEAN DEFAULT 0,
                 is_premium BOOLEAN DEFAULT 0,
+                is_nonupgraded_premium BOOLEAN DEFAULT 0,
                 trial_searches_left INTEGER DEFAULT 25,
+                nonupgraded_searches_left INTEGER DEFAULT 3,
                 total_searches INTEGER DEFAULT 0,
                 total_found INTEGER DEFAULT 0,
                 registration_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
@@ -474,3 +476,48 @@ class Database:
         """Обновить настройки бота"""
         if access_mode:
             self.set_setting('access_mode', access_mode)
+    
+    def set_nonupgraded_premium(self, user_id: int, is_premium: bool):
+        """Установить подписку на неулучшенные подарки"""
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        cursor.execute("""
+            UPDATE users SET is_nonupgraded_premium = ?
+            WHERE user_id = ?
+        """, (1 if is_premium else 0, user_id))
+        conn.commit()
+        conn.close()
+    
+    def update_nonupgraded_searches(self, user_id: int, new_value: int):
+        """Обновить количество поисков неулучшенных подарков"""
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        cursor.execute("""
+            UPDATE users SET nonupgraded_searches_left = ?
+            WHERE user_id = ?
+        """, (new_value, user_id))
+        conn.commit()
+        conn.close()
+    
+    def use_nonupgraded_search(self, user_id: int) -> bool:
+        """Использовать один поиск неулучшенных. Возвращает True если успешно"""
+        user = self.get_user(user_id)
+        if not user:
+            return False
+        
+        if user['is_nonupgraded_premium']:
+            return True
+        
+        if user['nonupgraded_searches_left'] <= 0:
+            return False
+        
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        cursor.execute("""
+            UPDATE users 
+            SET nonupgraded_searches_left = nonupgraded_searches_left - 1
+            WHERE user_id = ?
+        """, (user_id,))
+        conn.commit()
+        conn.close()
+        return True

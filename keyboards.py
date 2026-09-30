@@ -3,7 +3,7 @@ from aiogram.utils.keyboard import ReplyKeyboardBuilder, InlineKeyboardBuilder
 
 # === ГЛАВНОЕ МЕНЮ ===
 
-def main_menu_keyboard(is_admin: bool = False, is_premium: bool = False):
+def main_menu_keyboard(is_admin: bool = False, is_premium: bool = False, is_nonupgraded_premium: bool = False):
     """Главное меню бота"""
     builder = ReplyKeyboardBuilder()
     
@@ -22,6 +22,9 @@ def main_menu_keyboard(is_admin: bool = False, is_premium: bool = False):
     
     if not is_premium:
         builder.row(KeyboardButton(text="⭐ Купить Premium"))
+    
+    if is_premium and not is_nonupgraded_premium:
+        builder.row(KeyboardButton(text="💎 Купить подписку на неулучшенные"))
     
     if is_admin:
         builder.row(KeyboardButton(text="⚙️ Админка"))
@@ -95,6 +98,12 @@ def cancel_keyboard():
     """Кнопка отмены"""
     builder = ReplyKeyboardBuilder()
     builder.row(KeyboardButton(text="❌ Отмена"))
+    return builder.as_markup(resize_keyboard=True)
+
+def stop_search_keyboard():
+    """Кнопка остановки поиска"""
+    builder = ReplyKeyboardBuilder()
+    builder.row(KeyboardButton(text="⏹️ Стоп"))
     return builder.as_markup(resize_keyboard=True)
 
 # === РЕЗУЛЬТАТЫ ПОИСКА ===
@@ -173,15 +182,17 @@ def continue_search_keyboard():
 
 # === ПЛАТЕЖИ ===
 
-def payment_method_keyboard():
+def payment_method_keyboard(is_nonupgraded: bool = False):
     """Выбор метода оплаты"""
     builder = InlineKeyboardBuilder()
     
+    callback_prefix = "pay_nonupgraded" if is_nonupgraded else "pay"
+    
     builder.row(
-        InlineKeyboardButton(text="💎 CryptoBot", callback_data="pay_cryptobot")
+        InlineKeyboardButton(text="💎 CryptoBot", callback_data=f"{callback_prefix}_cryptobot")
     )
     builder.row(
-        InlineKeyboardButton(text="🚀 XRocket", callback_data="pay_xrocket")
+        InlineKeyboardButton(text="🚀 XRocket", callback_data=f"{callback_prefix}_xrocket")
     )
     builder.row(
         InlineKeyboardButton(text="💬 Связаться с поддержкой", url="https://t.me/kod30")
@@ -208,6 +219,19 @@ def continue_parsing_keyboard():
     )
     builder.row(
         InlineKeyboardButton(text="🔙 В меню", callback_data="back_to_menu")
+    )
+    
+    return builder.as_markup()
+
+def search_filter_keyboard():
+    """Выбор фильтра поиска"""
+    builder = InlineKeyboardBuilder()
+    
+    builder.row(
+        InlineKeyboardButton(text="🎁 Все подарки", callback_data="filter_all")
+    )
+    builder.row(
+        InlineKeyboardButton(text="💎 Только неулучшенные", callback_data="filter_nonupgraded")
     )
     
     return builder.as_markup()

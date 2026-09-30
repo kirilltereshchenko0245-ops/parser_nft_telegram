@@ -6,97 +6,75 @@ import os
 
 PEEK_URL = "https://server.peek.tg/api/nft/gifts/search"
 
-# Актуальный список моделей подарков (обновляется вручную)
+# Актуальный список моделей подарков (из Telegram)
 AVAILABLE_MODELS = [
-    "EternalRose", "EvilEye", "BlueStar", "Delicious",
-    "RedPacket", "GoldBar", "Tiger", "Rabbit",
-    "Dragon", "Snake", "Horse", "Goat",
-    "Monkey", "Rooster", "Dog", "Pig",
-    "GreenStar", "PurpleStar", "PinkStar", "AquaStar",
-    "BirthdayCake", "ValentineBouquet", "HappyNewYear"
+    "PreciousPeach", "PlushPepe", "HeroicHelmet", "MightyArm", "IonGem",
+    "DurovsCap", "NailBracelet", "PerfumeBottle", "MagicPotion", "MiniOscar",
+    "AstralShard", "ArtisanBrick", "GemSignet", "GenieLamp", "BondedRing",
+    "SharpTongue", "ElectricSkull", "BlingBinky", "WestsideSign", "KissedFrog",
+    "LootBag", "SignetRing", "ToyBear", "IceCream", "DeskCalendar",
+    "LightSword", "SnowGlobe", "ScaredCat", "JoyfulBundle", "EasterEgg",
+    "JellyBunny", "RestlessJar", "PrettyPosy", "SwagBag", "StellarRocket",
+    "PetSnake", "GingerCookie", "FreshSocks", "BerryBox", "InputKey",
+    "VictoryMedal", "HypnoLollipop", "SnoopCigar", "EvilEye", "SpringBasket",
+    "ValentineBox", "LushBouquet", "RecordPlayer", "InstantRamen", "HexPot",
+    "SnakeBox", "IonicDryer", "HomemadeCake", "SpicedWine", "SantaHat"
 ]
 
-# Маппинг для нормализации названий (любой ввод → правильное название)
-MODEL_NAME_MAP = {
-    # EternalRose
-    "eternalrose": "EternalRose",
-    "eternal rose": "EternalRose",
-    "eternal_rose": "EternalRose",
-    "ETERNALROSE": "EternalRose",
-    "Eternal Rose": "EternalRose",
+# Функция для правильной капитализации (каждое слово с большой буквы, без пробелов)
+def capitalize_model_name(text: str) -> str:
+    """
+    Превращает любой ввод в правильный формат:
+    - money pot → MoneyPot
+    - MONEY POT → MoneyPot
+    - moneypot → MoneyPot
+    """
+    # Убираем лишние пробелы и подчёркивания
+    text = text.strip().replace("_", " ")
     
-    # EvilEye
-    "evileye": "EvilEye",
-    "evil eye": "EvilEye",
-    "evil_eye": "EvilEye",
-    "EVILEYE": "EvilEye",
-    "Evil Eye": "EvilEye",
+    # Разделяем на слова
+    words = text.split()
     
-    # BlueStar
-    "bluestar": "BlueStar",
-    "blue star": "BlueStar",
-    "blue_star": "BlueStar",
-    "BLUESTAR": "BlueStar",
-    "Blue Star": "BlueStar",
+    # Каждое слово с большой буквы
+    capitalized = ''.join(word.capitalize() for word in words)
     
-    # Delicious
-    "delicious": "Delicious",
-    "DELICIOUS": "Delicious",
+    return capitalized
+
+# Маппинг для известных названий (для быстрого поиска)
+MODEL_NAME_MAP = {}
+
+# Автоматически создаём маппинг из списка моделей
+for model in AVAILABLE_MODELS:
+    # Добавляем все возможные варианты написания
+    lowercase = model.lower()
+    MODEL_NAME_MAP[lowercase] = model
     
-    # RedPacket
-    "redpacket": "RedPacket",
-    "red packet": "RedPacket",
-    "red_packet": "RedPacket",
-    "REDPACKET": "RedPacket",
-    "Red Packet": "RedPacket",
+    # Также добавляем варианты с пробелами
+    # Например: MoneyPot → money pot
+    words = []
+    current_word = model[0]
+    for char in model[1:]:
+        if char.isupper():
+            words.append(current_word)
+            current_word = char
+        else:
+            current_word += char
+    words.append(current_word)
     
-    # GoldBar
-    "goldbar": "GoldBar",
-    "gold bar": "GoldBar",
-    "gold_bar": "GoldBar",
-    "GOLDBAR": "GoldBar",
-    "Gold Bar": "GoldBar",
-    
-    # Животные
-    "tiger": "Tiger",
-    "rabbit": "Rabbit",
-    "dragon": "Dragon",
-    "snake": "Snake",
-    "horse": "Horse",
-    "goat": "Goat",
-    "monkey": "Monkey",
-    "rooster": "Rooster",
-    "dog": "Dog",
-    "pig": "Pig",
-    
-    # Звёзды
-    "greenstar": "GreenStar",
-    "green star": "GreenStar",
-    "purplestar": "PurpleStar",
-    "purple star": "PurpleStar",
-    "pinkstar": "PinkStar",
-    "pink star": "PinkStar",
-    "aquastar": "AquaStar",
-    "aqua star": "AquaStar",
-    
-    # Праздничные
-    "birthdaycake": "BirthdayCake",
-    "birthday cake": "BirthdayCake",
-    "valentinebouquet": "ValentineBouquet",
-    "valentine bouquet": "ValentineBouquet",
-    "happynewyear": "HappyNewYear",
-    "happy new year": "HappyNewYear",
-}
+    # Добавляем варианты с пробелами
+    with_spaces = ' '.join(words).lower()
+    MODEL_NAME_MAP[with_spaces] = model
 
 def normalize_model_name(user_input: str) -> str:
     """
     Нормализует название модели введённое пользователем
     
     Примеры:
-    - "eternal rose" → "EternalRose"
+    - "money pot" → "MoneyPot"
+    - "MONEY POT" → "MoneyPot"
+    - "moneypot" → "MoneyPot"
     - "evil eye" → "EvilEye"
-    - "ETERNALROSE" → "EternalRose"
-    - "EternalRose-5000" → "EternalRose" (для поиска по ID)
+    - "MoneyPot-5000" → "MoneyPot" (для поиска по ID)
     """
     # Убираем лишние пробелы
     user_input = user_input.strip()
@@ -105,8 +83,8 @@ def normalize_model_name(user_input: str) -> str:
     if "-" in user_input:
         user_input = user_input.split("-")[0].strip()
     
-    # Убираем подчёркивания и приводим к lowercase для поиска
-    search_key = user_input.replace("_", " ").lower()
+    # Приводим к lowercase для поиска
+    search_key = user_input.lower().replace("_", " ")
     
     # Ищем в маппинге
     if search_key in MODEL_NAME_MAP:
@@ -117,9 +95,8 @@ def normalize_model_name(user_input: str) -> str:
     if search_key_no_space in MODEL_NAME_MAP:
         return MODEL_NAME_MAP[search_key_no_space]
     
-    # Если всё равно не нашли, возвращаем как есть с большой буквы
-    # (для новых моделей которых ещё нет в маппинге)
-    return user_input.replace(" ", "").title()
+    # Если всё равно не нашли, применяем стандартную капитализацию
+    return capitalize_model_name(user_input)
 
 
 class PeekAPI:

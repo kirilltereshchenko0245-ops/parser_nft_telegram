@@ -17,7 +17,8 @@ from keyboards import (
     main_menu_keyboard, admin_menu_keyboard, cancel_keyboard,
     gift_result_keyboard, models_list_keyboard, payment_method_keyboard,
     stop_parsing_keyboard, continue_parsing_keyboard, profile_keyboard,
-    ban_user_keyboard, admin_settings_keyboard
+    ban_user_keyboard, admin_settings_keyboard, search_filter_keyboard,
+    stop_search_keyboard
 )
 from payments import PaymentManager
 from logger_channel import ChannelLogger
@@ -55,6 +56,7 @@ class SearchStates(StatesGroup):
     waiting_for_model = State()
     waiting_for_range = State()
     waiting_for_id = State()
+    waiting_for_filter_choice = State()  # Выбор фильтра (все/только неулучшенные)
 
 class AdminStates(StatesGroup):
     waiting_for_user_id = State()
@@ -104,7 +106,7 @@ async def cancel_handler(message: Message, state: FSMContext):
         # Иначе в главное меню
         await message.answer(
             "❌ Отменено",
-            reply_markup=main_menu_keyboard(is_admin=is_admin, is_premium=user['is_premium'])
+            reply_markup=main_menu_keyboard(is_admin=is_admin, is_premium=user['is_premium'], is_nonupgraded_premium=user.get('is_nonupgraded_premium', False))
         )
 
 @dp.message(Command("start"))
@@ -126,6 +128,7 @@ async def start_command(message: Message):
     is_admin = (user_id == OWNER_ID)
     user_data = db.get_user(user_id)
     is_premium = user_data['is_premium'] if user_data else False
+    is_nonupgraded_premium = user_data.get('is_nonupgraded_premium', False) if user_data else False
     
     text = (
         f"👋 Привет, <b>{first_name}</b>!\n\n"
@@ -147,7 +150,7 @@ async def start_command(message: Message):
     
     await message.answer(
         text,
-        reply_markup=main_menu_keyboard(is_admin=is_admin, is_premium=is_premium)
+        reply_markup=main_menu_keyboard(is_admin=is_admin, is_premium=is_premium, is_nonupgraded_premium=is_nonupgraded_premium)
     )
 
 @dp.message(Command("stop"))
@@ -161,6 +164,11 @@ async def stop_command(message: Message):
         "Нажмите <b>▶️ Продолжить</b> чтобы возобновить:",
         reply_markup=continue_parsing_keyboard()
     )
+
+@dp.message(F.text == "⏹️ Стоп")
+async def stop_button_handler(message: Message):
+    """Обработчик кнопки Стоп"""
+    await stop_command(message)
 
 @dp.message(Command("help"))
 async def help_command(message: Message):
@@ -220,7 +228,7 @@ async def search_model_entered(message: Message, state: FSMContext):
         is_admin = (message.from_user.id == OWNER_ID)
         await message.answer(
             "❌ Поиск отменён",
-            reply_markup=main_menu_keyboard(is_admin=is_admin, is_premium=user['is_premium'])
+            reply_markup=main_menu_keyboard(is_admin=is_admin, is_premium=user['is_premium'], is_nonupgraded_premium=user.get('is_nonupgraded_premium', False))
         )
         return
     
@@ -240,14 +248,14 @@ async def search_model_entered(message: Message, state: FSMContext):
 
 @dp.message(SearchStates.waiting_for_range)
 async def search_range_entered(message: Message, state: FSMContext):
-    """Обработка диапазона и начало парсинга"""
+    """Обработка диапазона"""
     if message.text == "❌ Отмена":
         await state.clear()
         user = db.get_user(message.from_user.id)
         is_admin = (message.from_user.id == OWNER_ID)
         await message.answer(
             "❌ Поиск отменён",
-            reply_markup=main_menu_keyboard(is_admin=is_admin, is_premium=user['is_premium'])
+            reply_markup=main_menu_keyboard(is_admin=is_admin, is_premium=user['is_premium'], is_nonupgraded_premium=user.get('is_nonupgraded_premium', False))
         )
         return
     
@@ -264,44 +272,38 @@ async def search_range_entered(message: Message, state: FSMContext):
             await message.answer("❌ Максимальный диапазон: 10000 ID")
             return
         
+        # Проверка лимитов для пробных пользователей
+        user = db.get_user(message.from_user.id)
+        if not user['is_premium']:
+            max_range = user['trial_searches_left']
+            actual_range = end - start + 1
+            
+            if actual_range > max_range:
+                await message.answer(
+                    f"❌ <b>Превышен лимит!</b>\n\n"
+                    f"📊 Вы хотите проверить: <b>{actual_range} ID</b>\n"
+                    f"🎫 У вас осталось: <b>{max_range} пробных запросов</b>\n\n"
+                    f"Максимальный диапазон: <code>{start}-{start + max_range - 1}</code>\n\n"
+                    f"Для безлимитных поисков оформите Premium подписку!"
+                )
+                return
+        
     except ValueError:
         await message.answer("❌ Неверный формат! Используйте: начало-конец (например: 1-100)")
         return
     
-    # Получаем данные
-    data = await state.get_data()
-    model = data['model']
-    user_id = message.from_user.id
-    username = message.from_user.username
+    # Сохраняем диапазон
+    await state.update_data(range_start=start, range_end=end)
     
-    # Очистить флаг остановки
-    db.clear_stop_flag(user_id)
+    # Спрашиваем фильтр
+    await state.set_state(SearchStates.waiting_for_filter_choice)
     
-    # Логирование начала поиска
-    await channel_logger.log_search(user_id, username, model, start, end)
-    
-    # Сохраняем поиск в историю
-    search_id = db.add_search(user_id, model, start, end)
-    
-    # Уменьшаем количество пробных поисков
-    user = db.get_user(user_id)
-    if not user['is_premium']:
-        db.update_trial_searches(user_id, user['trial_searches_left'] - 1)
-    
-    await state.clear()
-    
-    # Начинаем парсинг
     await message.answer(
-        f"🔍 <b>Начинаю поиск...</b>\n\n"
-        f"🎁 Модель: <code>{model}</code>\n"
-        f"📊 Диапазон: <code>{start}-{end}</code>\n\n"
-        f"⏱️ Это может занять некоторое время...\n"
-        f"Для остановки: /stop",
-        reply_markup=stop_parsing_keyboard()
+        "🔍 <b>Выберите фильтр:</b>\n\n"
+        "🎁 <b>Все подарки</b> - обычная подписка\n"
+        "💎 <b>Только неулучшенные</b> - специальная подписка (5 TON)",
+        reply_markup=search_filter_keyboard()
     )
-    
-    # Запускаем парсинг
-    await start_parsing(message, user_id, model, start, end, search_id)
 
 async def start_parsing(message: Message, user_id: int, model: str, start: int, end: int, search_id: int):
     """Основной процесс парсинга"""
@@ -390,8 +392,8 @@ async def start_parsing(message: Message, user_id: int, model: str, start: int, 
             except:
                 pass
         
-        # Задержка 5 секунд
-        await asyncio.sleep(5)
+        # Задержка 7 секунд (против нагрузки на API)
+        await asyncio.sleep(7)
     
     # Завершение
     await progress_msg.delete()
@@ -421,7 +423,7 @@ async def start_parsing(message: Message, user_id: int, model: str, start: int, 
     is_admin = (user_id == OWNER_ID)
     await message.answer(
         "Выберите действие:",
-        reply_markup=main_menu_keyboard(is_admin=is_admin, is_premium=user['is_premium'])
+        reply_markup=main_menu_keyboard(is_admin=is_admin, is_premium=user['is_premium'], is_nonupgraded_premium=user.get('is_nonupgraded_premium', False))
     )
 
 # === ПОИСК ПО ID ===
@@ -445,7 +447,7 @@ async def search_by_id_process(message: Message, state: FSMContext):
         is_admin = (message.from_user.id == OWNER_ID)
         await message.answer(
             "❌ Поиск отменён",
-            reply_markup=main_menu_keyboard(is_admin=is_admin, is_premium=user['is_premium'])
+            reply_markup=main_menu_keyboard(is_admin=is_admin, is_premium=user['is_premium'], is_nonupgraded_premium=user.get('is_nonupgraded_premium', False))
         )
         return
     
@@ -517,6 +519,14 @@ async def search_by_id_process(message: Message, state: FSMContext):
             "• Неверное название модели\n"
             "• Технические проблемы API"
         )
+    
+    # Вернуть главное меню после результата
+    user = db.get_user(message.from_user.id)
+    is_admin = (message.from_user.id == OWNER_ID)
+    await message.answer(
+        "Выберите действие:",
+        reply_markup=main_menu_keyboard(is_admin=is_admin, is_premium=user['is_premium'], is_nonupgraded_premium=user.get('is_nonupgraded_premium', False))
+    )
 
 # === СПИСОК ПОДАРКОВ ===
 @dp.message(F.text == "📋 Список подарков")
@@ -593,6 +603,154 @@ async def continue_last_search(message: Message):
         reply_markup=continue_parsing_keyboard()
     )
 
+# === CALLBACK: Выбор фильтра поиска ===
+@dp.callback_query(F.data == "filter_all")
+async def callback_filter_all(callback: CallbackQuery, state: FSMContext):
+    """Выбран фильтр: все подарки"""
+    data = await state.get_data()
+    model = data['model']
+    start = data['range_start']
+    end = data['range_end']
+    
+    user_id = callback.from_user.id
+    username = callback.from_user.username
+    
+    # Очистить флаг остановки
+    db.clear_stop_flag(user_id)
+    
+    # Логирование начала поиска
+    await channel_logger.log_search(user_id, username, model, start, end)
+    
+    # Сохраняем поиск в историю
+    search_id = db.add_search(user_id, model, start, end)
+    
+    # Уменьшаем количество пробных поисков (по количеству ID)
+    user = db.get_user(user_id)
+    if not user['is_premium']:
+        checked_ids = end - start + 1
+        new_value = user['trial_searches_left'] - checked_ids
+        db.update_trial_searches(user_id, max(0, new_value))
+    
+    await state.clear()
+    
+    # Начинаем парсинг
+    await callback.message.edit_text(
+        f"🔍 <b>Начинаю поиск...</b>\n\n"
+        f"🎁 Модель: <code>{model}</code>\n"
+        f"📊 Диапазон: <code>{start}-{end}</code>\n"
+        f"🔍 Фильтр: <b>Все подарки</b>\n\n"
+        f"⏱️ Это может занять некоторое время...\n"
+        f"Для остановки нажмите кнопку <b>⏹️ Стоп</b>"
+    )
+    
+    # Показываем кнопку Стоп на клавиатуре
+    await callback.message.answer(
+        "⏹️ Для остановки:",
+        reply_markup=stop_search_keyboard()
+    )
+    
+    # Запускаем парсинг
+    await start_parsing(callback.message, user_id, model, start, end, search_id, only_nonupgraded=False)
+    await callback.answer()
+
+@dp.callback_query(F.data == "filter_nonupgraded")
+async def callback_filter_nonupgraded(callback: CallbackQuery, state: FSMContext):
+    """Выбран фильтр: только неулучшенные"""
+    user_id = callback.from_user.id
+    user = db.get_user(user_id)
+    
+    data = await state.get_data()
+    start = data['range_start']
+    end = data['range_end']
+    actual_range = end - start + 1
+    
+    # Проверка лимитов для неулучшенных
+    if not user['is_nonupgraded_premium']:
+        max_range = user['nonupgraded_searches_left']
+        
+        if max_range <= 0:
+            await callback.message.edit_text(
+                "❌ <b>Пробные поиски неулучшенных закончились!</b>\n\n"
+                f"💎 Осталось: 0/3\n\n"
+                "Для продолжения работы оформите <b>подписку на неулучшенные</b>:\n"
+                f"💰 Стоимость: <b>5 TON</b>\n\n"
+                "⚠️ <b>Внимание:</b> Эта подписка доступна только при наличии обычной Premium подписки!\n\n"
+                "Выберите способ оплаты:",
+                reply_markup=payment_method_keyboard(is_nonupgraded=True)
+            )
+            await state.clear()
+            await callback.answer()
+            return
+        
+        if actual_range > max_range:
+            await callback.message.edit_text(
+                f"❌ <b>Превышен лимит неулучшенных!</b>\n\n"
+                f"📊 Вы хотите проверить: <b>{actual_range} ID</b>\n"
+                f"💎 У вас осталось: <b>{max_range} запросов</b>\n\n"
+                f"Максимальный диапазон: <code>{start}-{start + max_range - 1}</code>\n\n"
+                f"Для безлимитных поисков неулучшенных оформите подписку!"
+            )
+            await state.clear()
+            await callback.answer()
+            return
+    
+    # Проверка наличия обычной подписки
+    if not user['is_premium']:
+        await callback.message.edit_text(
+            "❌ <b>Требуется Premium подписка!</b>\n\n"
+            "Подписка на неулучшенные подарки доступна только\n"
+            "при наличии обычной Premium подписки.\n\n"
+            "Сначала оформите Premium (5 TON), затем\n"
+            "сможете купить доступ к неулучшенным (+5 TON).",
+            reply_markup=payment_method_keyboard(is_nonupgraded=False)
+        )
+        await state.clear()
+        await callback.answer()
+        return
+    
+    model = data['model']
+    start = data['range_start']
+    end = data['range_end']
+    
+    username = callback.from_user.username
+    
+    # Очистить флаг остановки
+    db.clear_stop_flag(user_id)
+    
+    # Логирование начала поиска
+    await channel_logger.log_search(user_id, username, model, start, end)
+    
+    # Сохраняем поиск в историю
+    search_id = db.add_search(user_id, model, start, end)
+    
+    # Уменьшаем количество поисков неулучшенных (по количеству ID)
+    if not user['is_nonupgraded_premium']:
+        checked_ids = end - start + 1
+        new_value = user['nonupgraded_searches_left'] - checked_ids
+        db.update_nonupgraded_searches(user_id, max(0, new_value))
+    
+    await state.clear()
+    
+    # Начинаем парсинг
+    await callback.message.edit_text(
+        f"🔍 <b>Начинаю поиск...</b>\n\n"
+        f"🎁 Модель: <code>{model}</code>\n"
+        f"📊 Диапазон: <code>{start}-{end}</code>\n"
+        f"💎 Фильтр: <b>Только неулучшенные</b>\n\n"
+        f"⏱️ Это может занять некоторое время...\n"
+        f"Для остановки нажмите кнопку <b>⏹️ Стоп</b>"
+    )
+    
+    # Показываем кнопку Стоп на клавиатуре
+    await callback.message.answer(
+        "⏹️ Для остановки:",
+        reply_markup=stop_search_keyboard()
+    )
+    
+    # Запускаем парсинг с фильтром
+    await start_parsing(callback.message, user_id, model, start, end, search_id, only_nonupgraded=True)
+    await callback.answer()
+
 # === CALLBACK: Продолжить парсинг ===
 @dp.callback_query(F.data == "continue_parsing")
 async def callback_continue_parsing(callback: CallbackQuery):
@@ -644,7 +802,7 @@ async def callback_back_to_menu(callback: CallbackQuery):
     await callback.message.edit_text("🏠 Главное меню:")
     await callback.message.answer(
         "Выберите действие:",
-        reply_markup=main_menu_keyboard(is_admin=is_admin, is_premium=user['is_premium'])
+        reply_markup=main_menu_keyboard(is_admin=is_admin, is_premium=user['is_premium'], is_nonupgraded_premium=user.get('is_nonupgraded_premium', False))
     )
     await callback.answer()
 
@@ -663,6 +821,40 @@ async def buy_premium_command(message: Message):
     )
     
     await message.answer(text, reply_markup=payment_method_keyboard())
+
+@dp.message(F.text == "💎 Купить подписку на неулучшенные")
+async def buy_nonupgraded_premium_command(message: Message):
+    """Показать варианты оплаты подписки на неулучшенные"""
+    user_id = message.from_user.id
+    user = db.get_user(user_id)
+    
+    # Проверка наличия обычной подписки
+    if not user['is_premium']:
+        text = (
+            "❌ <b>Требуется Premium подписка!</b>\n\n"
+            "Подписка на неулучшенные подарки доступна только\n"
+            "при наличии обычной Premium подписки.\n\n"
+            "Сначала оформите Premium (5 TON), затем\n"
+            "сможете купить доступ к неулучшенным (+5 TON).\n\n"
+            "Выберите способ оплаты для Premium:"
+        )
+        await message.answer(text, reply_markup=payment_method_keyboard(is_nonupgraded=False))
+        return
+    
+    text = (
+        "💎 <b>Подписка на неулучшенные подарки</b>\n\n"
+        "💎 <b>Преимущества:</b>\n"
+        "✅ Поиск только неулучшенных подарков\n"
+        "✅ Пропуск улучшенных в результатах\n"
+        "✅ Экономия времени на парсинг\n"
+        "✅ Больше шансов найти редкие\n\n"
+        f"💰 <b>Стоимость:</b> 5 TON\n"
+        f"🎫 <b>Пробных поисков:</b> {user.get('nonupgraded_searches_left', 3)}/3\n\n"
+        "⚠️ <b>Требуется:</b> Обычная Premium подписка ✅\n\n"
+        "Выберите способ оплаты:"
+    )
+    
+    await message.answer(text, reply_markup=payment_method_keyboard(is_nonupgraded=True))
 
 @dp.callback_query(F.data == "pay_cryptobot")
 async def callback_pay_cryptobot(callback: CallbackQuery):
@@ -705,6 +897,82 @@ async def callback_pay_xrocket(callback: CallbackQuery):
             "🚀 <b>XRocket Payment</b>\n\n"
             "Нажмите кнопку ниже для оплаты.\n"
             "После оплаты Premium активируется автоматически!",
+            reply_markup=builder.as_markup()
+        )
+    else:
+        await callback.answer("❌ Ошибка создания счёта", show_alert=True)
+    
+    await callback.answer()
+
+@dp.callback_query(F.data == "pay_nonupgraded_cryptobot")
+async def callback_pay_nonupgraded_cryptobot(callback: CallbackQuery):
+    """Оплата подписки на неулучшенные через CryptoBot"""
+    user_id = callback.from_user.id
+    username = callback.from_user.username
+    user = db.get_user(user_id)
+    
+    # Проверка наличия обычной подписки
+    if not user['is_premium']:
+        await callback.message.edit_text(
+            "❌ <b>Требуется Premium подписка!</b>\n\n"
+            "Подписка на неулучшенные подарки доступна только\n"
+            "при наличии обычной Premium подписки.\n\n"
+            "Сначала оформите Premium (5 TON).",
+            reply_markup=payment_method_keyboard(is_nonupgraded=False)
+        )
+        await callback.answer()
+        return
+    
+    invoice_url = await payment_manager.create_cryptobot_invoice(user_id, username, is_nonupgraded=True)
+    
+    if invoice_url:
+        from aiogram.utils.keyboard import InlineKeyboardBuilder
+        builder = InlineKeyboardBuilder()
+        builder.row(InlineKeyboardButton(text="💳 Оплатить", url=invoice_url))
+        
+        await callback.message.edit_text(
+            "💎 <b>CryptoBot Payment</b>\n"
+            "💎 <b>Подписка на неулучшенные подарки</b>\n\n"
+            "Нажмите кнопку ниже для оплаты.\n"
+            "После оплаты подписка активируется автоматически!",
+            reply_markup=builder.as_markup()
+        )
+    else:
+        await callback.answer("❌ Ошибка создания счёта", show_alert=True)
+    
+    await callback.answer()
+
+@dp.callback_query(F.data == "pay_nonupgraded_xrocket")
+async def callback_pay_nonupgraded_xrocket(callback: CallbackQuery):
+    """Оплата подписки на неулучшенные через XRocket"""
+    user_id = callback.from_user.id
+    user = db.get_user(user_id)
+    
+    # Проверка наличия обычной подписки
+    if not user['is_premium']:
+        await callback.message.edit_text(
+            "❌ <b>Требуется Premium подписка!</b>\n\n"
+            "Подписка на неулучшенные подарки доступна только\n"
+            "при наличии обычной Premium подписки.\n\n"
+            "Сначала оформите Premium (5 TON).",
+            reply_markup=payment_method_keyboard(is_nonupgraded=False)
+        )
+        await callback.answer()
+        return
+    
+    invoice_url = await payment_manager.create_xrocket_invoice(user_id, is_nonupgraded=True)
+    
+    if invoice_url:
+        from aiogram.utils.keyboard import InlineKeyboardBuilder
+        from aiogram.types import InlineKeyboardButton
+        builder = InlineKeyboardBuilder()
+        builder.row(InlineKeyboardButton(text="🚀 Оплатить", url=invoice_url))
+        
+        await callback.message.edit_text(
+            "🚀 <b>XRocket Payment</b>\n"
+            "💎 <b>Подписка на неулучшенные подарки</b>\n\n"
+            "Нажмите кнопку ниже для оплаты.\n"
+            "После оплаты подписка активируется автоматически!",
             reply_markup=builder.as_markup()
         )
     else:
@@ -785,7 +1053,7 @@ async def admin_user_entered(message: Message, state: FSMContext):
             f"🆔 ID: <code>{user['user_id']}</code>\n"
             f"👤 Username: @{user.get('username', 'не указан')}\n"
             f"� Имя: {user.get('first_name', 'не указано')}\n"
-            f"�📅 Регистрация: {user['registration_date'][:10]}\n"
+            f"�� Регистрация: {user['registration_date'][:10]}\n"
             f"💎 Статус: {premium_status}\n"
             f"🎫 Пробных поисков: {user['trial_searches_left']}/25\n"
             f"🔒 Бан: {ban_status}\n"
@@ -1053,7 +1321,7 @@ async def admin_back(message: Message):
     user = db.get_user(message.from_user.id)
     await message.answer(
         "🏠 Главное меню",
-        reply_markup=main_menu_keyboard(is_admin=True, is_premium=user['is_premium'])
+        reply_markup=main_menu_keyboard(is_admin=True, is_premium=user['is_premium'], is_nonupgraded_premium=user.get('is_nonupgraded_premium', False))
     )
 
 # === ЗАПУСК БОТА ===

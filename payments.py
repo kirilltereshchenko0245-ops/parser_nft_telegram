@@ -9,14 +9,15 @@ from typing import Optional, Dict
 CRYPTOBOT_TOKEN = "629296:AAw96aFWy4zy2Wz6t96lZU2HcccHN3CVyI5"
 XROCKET_TOKEN = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJhcHBJZCI6IjMwMDQ4MyIsImp0aSI6ImFwcDozMDA0ODM6ZjE1N2MyNzktOTMzZC00ZDI2LTk5MDctOWYzMzMxMjQ1ZWQyIiwiaWF0IjoxNzkwNzkxMjE5fQ.A4DFBmiCt5BD6TqOzA_ed_jRuSa0XWWRGu8PSN9X54k"
 
-# Цена подписки
+# Цены подписок
 SUBSCRIPTION_PRICE_TON = 5
+NONUPGRADED_SUBSCRIPTION_PRICE_TON = 5
 
 class PaymentManager:
     """Управление платежами"""
     
     @staticmethod
-    async def create_cryptobot_invoice(user_id: int, username: str = None) -> Optional[str]:
+    async def create_cryptobot_invoice(user_id: int, username: str = None, is_nonupgraded: bool = False) -> Optional[str]:
         """Создать счёт в CryptoBot"""
         url = "https://pay.crypt.bot/api/createInvoice"
         
@@ -24,11 +25,15 @@ class PaymentManager:
             "Crypto-Pay-API-Token": CRYPTOBOT_TOKEN
         }
         
+        price = NONUPGRADED_SUBSCRIPTION_PRICE_TON if is_nonupgraded else SUBSCRIPTION_PRICE_TON
+        description = "Подписка на неулучшенные подарки" if is_nonupgraded else "Premium подписка - Telegram Gift Parser"
+        payload_prefix = "nonupgraded_premium" if is_nonupgraded else "premium"
+        
         payload = {
-            "amount": SUBSCRIPTION_PRICE_TON,
+            "amount": price,
             "asset": "TON",
-            "description": "Premium подписка - Telegram Gift Parser",
-            "payload": f"premium_{user_id}",
+            "description": description,
+            "payload": f"{payload_prefix}_{user_id}",
             "allow_comments": False,
             "allow_anonymous": False
         }
@@ -48,7 +53,7 @@ class PaymentManager:
         return None
     
     @staticmethod
-    async def create_xrocket_invoice(user_id: int) -> Optional[str]:
+    async def create_xrocket_invoice(user_id: int, is_nonupgraded: bool = False) -> Optional[str]:
         """Создать счёт в XRocket"""
         url = "https://pay.xrocket.tg/api/v1/invoices"
         
@@ -57,11 +62,15 @@ class PaymentManager:
             "Content-Type": "application/json"
         }
         
+        price = NONUPGRADED_SUBSCRIPTION_PRICE_TON if is_nonupgraded else SUBSCRIPTION_PRICE_TON
+        description = "Подписка на неулучшенные подарки" if is_nonupgraded else "Premium подписка - Gift Parser"
+        external_prefix = "nonupgraded_premium" if is_nonupgraded else "premium"
+        
         payload = {
-            "amount": SUBSCRIPTION_PRICE_TON,
+            "amount": price,
             "currency": "TON",
-            "description": "Premium подписка - Gift Parser",
-            "externalId": f"premium_{user_id}",
+            "description": description,
+            "externalId": f"{external_prefix}_{user_id}",
             "successUrl": "https://t.me/your_bot",
             "failUrl": "https://t.me/your_bot"
         }
