@@ -338,13 +338,19 @@ async def peek_gift_info(gift_id: int, model: str) -> dict:
     """Обёртка для получения информации о подарке"""
     gift = await api.get_gift(model, gift_id)
     if gift:
+        username = gift.get('username', '').replace('t.me/', '').lstrip('@')
+        
+        # Правильное определение видимости:
+        # Если username пустой - подарок скрыт в профиле
+        is_actually_visible = bool(username)
+        
         return {
             'found': True,
             'giftNumber': gift.get('giftNumber', gift_id),
-            'username': gift.get('username', '').replace('t.me/', '').lstrip('@'),
+            'username': username,
             'owner': gift.get('owner'),
             'user_id': gift.get('userId'),  # ID владельца
-            'is_visible': gift.get('isVisible', True),
+            'is_visible': is_actually_visible,  # Реальная видимость!
             'is_upgraded': gift.get('isUpgraded', False),  # Улучшен ли
             'rarity': f"{gift.get('rarityModel', 0)}%",
             'attributes': gift,
@@ -356,16 +362,21 @@ async def peek_gift_info(gift_id: int, model: str) -> dict:
             'found': False
         }
 
-def format_summary(gifts: list, model: str) -> str:
-    """Форматирует итоговый список найденных подарков"""
+def format_summary(gifts: list, model: str) -> list:
+    """
+    Форматирует итоговый список найденных подарков
+    Возвращает список строк (для разбиения длинных списков на несколько сообщений)
+    """
     if not gifts:
-        return "Подарки не найдены."
+        return ["Подарки не найдены."]
     
-    lines = [
-        "📋 <b>ИТОГОВЫЙ СПИСОК НАЙДЕННЫХ ПОДАРКОВ</b>",
-        f"🎁 Модель: <b>{model}</b>",
-        "━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-    ]
+    messages = []
+    current_message = (
+        "📋 <b>ИТОГОВЫЙ СПИСОК НАЙДЕННЫХ ПОДАРКОВ</b>\n"
+        f"🎁 Модель: <b>{model}</b>\n"
+        f"✅ Найдено: <b>{len(gifts)}</b>\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+    )
     
     for i, gift_data in enumerate(gifts, 1):
         number = gift_data.get("giftNumber", "?")
@@ -386,13 +397,28 @@ def format_summary(gifts: list, model: str) -> str:
         safe_name = model.replace(" ", "")
         gift_link = f"https://t.me/nft/{quote(safe_name)}-{number}"
         
-        lines.append(f"{i}. 🎁 <b>{model}</b> #{number}")
-        lines.append(f"   👤 {owner_text}")
-        lines.append(f"   🔗 {profile_link}")
-        lines.append(f"   {visibility_status}")
-        lines.append(f"   🎁 {gift_link}\n")
+        gift_text = (
+            f"{i}. 🎁 <b>{model}</b> #{number}\n"
+            f"   👤 {owner_text}\n"
+            f"   🔗 {profile_link}\n"
+            f"   {visibility_status}\n"
+            f"   🎁 {gift_link}\n\n"
+        )
+        
+        # Проверка лимита Telegram (4096 символов)
+        # Оставляем запас для финальной статистики
+        if len(current_message + gift_text) > 3800:
+            messages.append(current_message)
+            current_message = f"📋 <b>Продолжение ({len(messages) + 1})</b>\n\n" + gift_text
+        else:
+            current_message += gift_text
     
-    lines.append(f"━━━━━━━━━━━━━━━━━━━━━━━━━━")
-    lines.append(f"<b>Всего найдено:</b> {len(gifts)}")
+    # Добавить последнее сообщение
+    if current_message:
+        messages.append(current_message)
     
-    return "\n".join(lines)
+    # Добавить финальную статистику к последнему сообщению
+    if messages:
+        messages[-1] += f"━━━━━━━━━━━━━━━━━━━━━━━━━━\n<b>Всего найдено:</b> {len(gifts)}"
+    
+    return messages

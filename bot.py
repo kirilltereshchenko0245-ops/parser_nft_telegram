@@ -305,10 +305,11 @@ async def search_range_entered(message: Message, state: FSMContext):
         reply_markup=search_filter_keyboard()
     )
 
-async def start_parsing(message: Message, user_id: int, model: str, start: int, end: int, search_id: int):
+async def start_parsing(message: Message, user_id: int, model: str, start: int, end: int, search_id: int, only_nonupgraded: bool = False):
     """Основной процесс парсинга"""
     found_gifts = []
     total_checked = 0
+    skipped_upgraded = 0
     
     progress_msg = await message.answer("⏳ <b>Прогресс:</b> 0%")
     
@@ -332,6 +333,11 @@ async def start_parsing(message: Message, user_id: int, model: str, start: int, 
         total_checked += 1
         
         if gift_data['found']:
+            # Фильтр неулучшенных
+            if only_nonupgraded and gift_data.get('is_upgraded'):
+                skipped_upgraded += 1
+                continue
+            
             found_gifts.append(gift_data)
             
             # Сохраняем в БД
@@ -384,36 +390,70 @@ async def start_parsing(message: Message, user_id: int, model: str, start: int, 
         progress_percent = int((total_checked / total_range) * 100)
         if total_checked % max(1, total_range // 10) == 0:
             try:
-                await progress_msg.edit_text(
+                progress_text = (
                     f"⏳ <b>Прогресс:</b> {progress_percent}%\n"
                     f"Проверено: {total_checked}/{total_range}\n"
                     f"Найдено: {len(found_gifts)}"
                 )
+                if only_nonupgraded and skipped_upgraded > 0:
+                    progress_text += f"\n⏭️ Пропущено улучшенных: {skipped_upgraded}"
+                
+                await progress_msg.edit_text(progress_text)
             except:
                 pass
         
         # Задержка 7 секунд (против нагрузки на API)
-        await asyncio.sleep(7)
+        # Проверяем флаг остановки каждую секунду во время задержки
+        for _ in range(7):
+            if db.should_stop_parsing(user_id):
+                await progress_msg.edit_text(
+                    "⏹️ <b>Парсинг остановлен!</b>\n\n"
+                    f"Проверено: {total_checked}/{total_range}\n"
+                    f"Найдено: {len(found_gifts)}",
+                    reply_markup=continue_parsing_keyboard()
+                )
+                db.update_last_search(user_id, model, gift_id + 1, end)
+                
+                # Главное меню
+                user = db.get_user(user_id)
+                is_admin = (user_id == OWNER_ID)
+                await message.answer(
+                    "Выберите действие:",
+                    reply_markup=main_menu_keyboard(is_admin=is_admin, is_premium=user['is_premium'], is_nonupgraded_premium=user.get('is_nonupgraded_premium', False))
+                )
+                return
+            await asyncio.sleep(1)
     
     # Завершение
     await progress_msg.delete()
     
-    # Итоговый список
+    # Итоговый список (может быть несколько сообщений)
     if found_gifts:
-        summary_text = format_summary(found_gifts, model)
-        await message.answer(summary_text)
+        summary_messages = format_summary(found_gifts, model)
         
-        await message.answer(
-            f"✅ <b>Поиск завершён!</b>\n\n"
-            f"📊 Проверено: {total_checked}\n"
-            f"✅ Найдено: {len(found_gifts)}\n"
-        )
+        # Отправляем все части итогового списка
+        for summary_part in summary_messages:
+            await message.answer(summary_part)
+        
+        result_text = f"✅ <b>Поиск завершён!</b>\n\n"
+        result_text += f"📊 Проверено: {total_checked}\n"
+        result_text += f"✅ Найдено: {len(found_gifts)}\n"
+        
+        if only_nonupgraded and skipped_upgraded > 0:
+            result_text += f"⏭️ Пропущено улучшенных: {skipped_upgraded}\n"
+        
+        await message.answer(result_text)
     else:
-        await message.answer(
-            f"❌ <b>Поиск завершён</b>\n\n"
-            f"📊 Проверено: {total_checked}\n"
-            f"❌ Ничего не найдено"
-        )
+        result_text = f"❌ <b>Поиск завершён</b>\n\n"
+        result_text += f"📊 Проверено: {total_checked}\n"
+        
+        if only_nonupgraded and skipped_upgraded > 0:
+            result_text += f"⏭️ Пропущено улучшенных: {skipped_upgraded}\n"
+            result_text += f"❌ Неулучшенных не найдено\n"
+        else:
+            result_text += f"❌ Ничего не найдено"
+        
+        await message.answer(result_text)
     
     # Очистить флаг остановки
     db.clear_stop_flag(user_id)
@@ -531,18 +571,40 @@ async def search_by_id_process(message: Message, state: FSMContext):
 # === СПИСОК ПОДАРКОВ ===
 @dp.message(F.text == "📋 Список подарков")
 async def models_list_command(message: Message):
-    """Показать список моделей"""
+    """Показать список моделей с ценами"""
     text = "📋 <b>Доступные модели подарков:</b>\n\n"
     
-    for i, model in enumerate(AVAILABLE_MODELS, 1):
-        text += f"{i}. <code>{model}</code>\n"
+    text += "💎 <b>Топ дорогие:</b>\n"
+    text += "• <code>DurovsCap</code> - ~500-1000 TON | 50 шт\n"
+    text += "• <code>HeroicHelmet</code> - ~200-500 TON | 100 шт\n"
+    text += "• <code>MightyArm</code> - ~150-300 TON | 200 шт\n\n"
     
-    text += (
-        "\n💡 <b>Подсказка:</b>\n"
-        "Можно писать с пробелами или без:\n"
-        "• Evil Eye = EvilEye\n"
-        "• Eternal Rose = EternalRose"
-    )
+    text += "🔥 <b>Редкие:</b>\n"
+    text += "• <code>PreciousPeach</code> - ~50-100 TON | 500 шт\n"
+    text += "• <code>PlushPepe</code> - ~30-80 TON | 1000 шт\n"
+    text += "• <code>IonGem</code> - ~20-50 TON | 2000 шт\n\n"
+    
+    text += "⭐ <b>Средние:</b>\n"
+    text += "• <code>EvilEye</code> - ~5-15 TON | 5000 шт\n"
+    text += "• <code>GenieLamp</code> - ~5-15 TON | 5000 шт\n"
+    text += "• <code>SignetRing</code> - ~3-10 TON | 10000 шт\n\n"
+    
+    text += "🎁 <b>Обычные:</b>\n"
+    text += "• <code>ToyBear</code> - ~1-3 TON | 20000 шт\n"
+    text += "• <code>IceCream</code> - ~1-3 TON | 20000 шт\n"
+    text += "• <code>SnowGlobe</code> - ~1-2 TON | 50000 шт\n\n"
+    
+    text += "📦 <b>Массовые:</b>\n"
+    text += "• <code>FreshSocks</code> - ~0.1-0.5 TON | 100k+ шт\n"
+    text += "• <code>BerryBox</code> - ~0.1-0.5 TON | 100k+ шт\n"
+    text += "• <code>GingerCookie</code> - ~0.1-0.3 TON | 200k+ шт\n\n"
+    
+    text += f"<b>Всего моделей:</b> {len(AVAILABLE_MODELS)}\n\n"
+    
+    text += "💡 <b>Подсказка:</b>\n"
+    text += "Можно писать с пробелами или без:\n"
+    text += "• evil eye = EvilEye ✅\n"
+    text += "• precious peach = PreciousPeach ✅"
     
     await message.answer(text)
 
@@ -633,6 +695,8 @@ async def callback_filter_all(callback: CallbackQuery, state: FSMContext):
     
     await state.clear()
     
+    await callback.answer()  # Ответ сразу!
+    
     # Начинаем парсинг
     await callback.message.edit_text(
         f"🔍 <b>Начинаю поиск...</b>\n\n"
@@ -651,7 +715,6 @@ async def callback_filter_all(callback: CallbackQuery, state: FSMContext):
     
     # Запускаем парсинг
     await start_parsing(callback.message, user_id, model, start, end, search_id, only_nonupgraded=False)
-    await callback.answer()
 
 @dp.callback_query(F.data == "filter_nonupgraded")
 async def callback_filter_nonupgraded(callback: CallbackQuery, state: FSMContext):
@@ -731,6 +794,8 @@ async def callback_filter_nonupgraded(callback: CallbackQuery, state: FSMContext
     
     await state.clear()
     
+    await callback.answer()  # Ответ сразу!
+    
     # Начинаем парсинг
     await callback.message.edit_text(
         f"🔍 <b>Начинаю поиск...</b>\n\n"
@@ -749,7 +814,6 @@ async def callback_filter_nonupgraded(callback: CallbackQuery, state: FSMContext
     
     # Запускаем парсинг с фильтром
     await start_parsing(callback.message, user_id, model, start, end, search_id, only_nonupgraded=True)
-    await callback.answer()
 
 # === CALLBACK: Продолжить парсинг ===
 @dp.callback_query(F.data == "continue_parsing")
