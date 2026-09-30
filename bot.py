@@ -81,6 +81,32 @@ async def check_access_middleware(handler, event: Message, data: dict):
     return await handler(event, data)
 
 # === КОМАНДЫ ===
+@dp.message(F.text == "❌ Отмена")
+async def cancel_handler(message: Message, state: FSMContext):
+    """Универсальный обработчик отмены"""
+    current_state = await state.get_state()
+    
+    if current_state is None:
+        return
+    
+    await state.clear()
+    
+    user = db.get_user(message.from_user.id)
+    is_admin = (message.from_user.id == OWNER_ID)
+    
+    # Если были в админке - возвращаем в админку
+    if "Admin" in str(current_state):
+        await message.answer(
+            "❌ Отменено",
+            reply_markup=admin_menu_keyboard()
+        )
+    else:
+        # Иначе в главное меню
+        await message.answer(
+            "❌ Отменено",
+            reply_markup=main_menu_keyboard(is_admin=is_admin, is_premium=user['is_premium'])
+        )
+
 @dp.message(Command("start"))
 async def start_command(message: Message):
     """Начало работы"""
@@ -318,13 +344,27 @@ async def start_parsing(message: Message, user_id: int, model: str, start: int, 
             
             # Отправляем уведомление
             visibility = "👁️ Открыт" if gift_data.get('is_visible') else "🔒 Скрыт"
+            upgraded = "⭐ Улучшен" if gift_data.get('is_upgraded') else "🎁 Обычный"
             
             result_text = (
                 f"✅ <b>Найден подарок #{gift_id}</b>\n\n"
                 f"🎁 Модель: <code>{model}</code>\n"
-                f"👤 Владелец: @{gift_data.get('username', 'Unknown')}\n"
-                f"👁️ Видимость: {visibility}\n"
+                f"� Статус: {upgraded}\n"
             )
+            
+            # Информация о владельце
+            username = gift_data.get('username')
+            user_id = gift_data.get('user_id')
+            
+            if username:
+                result_text += f"👤 Владелец: @{username}\n"
+            
+            if user_id:
+                result_text += f"🆔 ID владельца: <code>{user_id}</code>\n"
+            elif not username:
+                result_text += f"👤 Владелец: Неизвестен\n"
+            
+            result_text += f"👁️ Видимость: {visibility}\n"
             
             if 'rarity' in gift_data:
                 result_text += f"💎 Редкость: <b>{gift_data['rarity']}</b>\n"
@@ -435,13 +475,27 @@ async def search_by_id_process(message: Message, state: FSMContext):
     
     if gift_data['found']:
         visibility = "👁️ Открыт" if gift_data.get('is_visible') else "🔒 Скрыт"
+        upgraded = "⭐ Улучшен" if gift_data.get('is_upgraded') else "🎁 Обычный"
         
         result_text = (
             f"✅ <b>Подарок найден!</b>\n\n"
             f"🎁 ID: <code>{model}-{gift_id}</code>\n"
-            f"👤 Владелец: @{gift_data.get('username', 'Unknown')}\n"
-            f"👁️ Видимость: {visibility}\n"
+            f"� Статус: {upgraded}\n"
         )
+        
+        # Информация о владельце
+        username = gift_data.get('username')
+        user_id = gift_data.get('user_id')
+        
+        if username:
+            result_text += f"👤 Владелец: @{username}\n"
+        
+        if user_id:
+            result_text += f"🆔 ID владельца: <code>{user_id}</code>\n"
+        elif not username:
+            result_text += f"👤 Владелец: Неизвестен\n"
+        
+        result_text += f"👁️ Видимость: {visibility}\n"
         
         if 'rarity' in gift_data:
             result_text += f"💎 Редкость: <b>{gift_data['rarity']}</b>\n"
@@ -488,6 +542,11 @@ async def profile_command(message: Message):
     """Показать профиль пользователя"""
     user_id = message.from_user.id
     user = db.get_user(user_id)
+    
+    if not user:
+        await message.answer("❌ Ошибка: пользователь не найден")
+        return
+    
     user_stats = db.get_user_stats(user_id)
     
     premium_status = "⭐ Premium" if user['is_premium'] else f"🎫 Trial ({user['trial_searches_left']}/25)"
@@ -496,7 +555,7 @@ async def profile_command(message: Message):
         f"👤 <b>Профиль</b>\n\n"
         f"🆔 ID: <code>{user_id}</code>\n"
         f"👤 Username: @{user.get('username', 'не указан')}\n"
-        f"📅 Регистрация: {user['created_at'][:10]}\n"
+        f"📅 Регистрация: {user['registration_date'][:10]}\n"
         f"💎 Статус: {premium_status}\n\n"
         f"📊 <b>Статистика:</b>\n"
         f"🔍 Всего поисков: <b>{user_stats['total_searches']}</b>\n"
@@ -509,7 +568,7 @@ async def profile_command(message: Message):
         text += (
             f"\n🔄 <b>Последний поиск:</b>\n"
             f"🎁 {last_search['model']}\n"
-            f"📊 {last_search['range_start']}-{last_search['range_end']}\n"
+            f"📊 {last_search['start_id']}-{last_search['end_id']}\n"
             f"✅ Найдено: {last_search['found_count']}\n"
         )
     

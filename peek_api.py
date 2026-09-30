@@ -366,7 +366,9 @@ async def peek_gift_info(gift_id: int, model: str) -> dict:
             'giftNumber': gift.get('giftNumber', gift_id),
             'username': gift.get('username', '').replace('t.me/', '').lstrip('@'),
             'owner': gift.get('owner'),
+            'user_id': gift.get('userId'),  # ID владельца
             'is_visible': gift.get('isVisible', True),
+            'is_upgraded': gift.get('isUpgraded', False),  # Улучшен ли
             'rarity': f"{gift.get('rarityModel', 0)}%",
             'attributes': gift,
             'giftName': gift.get('giftName', model),
