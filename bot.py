@@ -1,614 +1,897 @@
 import asyncio
 import logging
 import os
-import re
-from datetime import datetime
 from aiogram import Bot, Dispatcher, F
-from aiogram.client.default import DefaultBotProperties
-from aiogram.client.session.aiohttp import AiohttpSession
-from aiogram.enums import ParseMode
-from aiogram.filters import CommandStart, Command
-from aiogram.types import Message, CallbackQuery
+from aiogram.filters import Command, StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
+from aiogram.types import Message, CallbackQuery, InlineKeyboardButton
+from aiogram.enums import ParseMode
 from dotenv import load_dotenv
 
-try:
-    from aiohttp_socks import ProxyConnector
-    import aiohttp
-    PROXY_SUPPORT = True
-except ImportError:
-    PROXY_SUPPORT = False
-
-from peek_api import PeekAPI
 from database import Database
-from keyboards import *
+from peek_api import peek_gift_info, AVAILABLE_MODELS, format_summary
+from keyboards import (
+    main_menu_keyboard, admin_menu_keyboard, cancel_keyboard,
+    gift_result_keyboard, models_list_keyboard, payment_method_keyboard,
+    stop_parsing_keyboard, continue_parsing_keyboard, profile_keyboard,
+    ban_user_keyboard, admin_settings_keyboard
+)
+from payments import PaymentManager
+from logger_channel import ChannelLogger
 
+# Загрузка переменных окружения
 load_dotenv()
 
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-OWNER_ID = int(os.getenv("OWNER_ID", "0"))
+# Настройка логирования
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
 
+# Токен бота
+BOT_TOKEN = os.getenv("BOT_TOKEN")
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN не указан в .env")
 
-logging.basicConfig(level=logging.INFO)
+# ID владельца (ваш Telegram ID)
+OWNER_ID = 6969906545  # Замените на ваш реальный ID
 
+# Инициализация
+bot = Bot(token=BOT_TOKEN, parse_mode=ParseMode.HTML)
+storage = MemoryStorage()
+dp = Dispatcher(storage=storage)
 db = Database()
-dp = Dispatcher(storage=MemoryStorage())
+payment_manager = PaymentManager()
+channel_logger = ChannelLogger(bot)
 
-class SearchForm(StatesGroup):
-    model = State()
-    range_input = State()
+# FSM States
+class SearchStates(StatesGroup):
+    waiting_for_model = State()
+    waiting_for_range = State()
+    waiting_for_id = State()
 
-class AdminForm(StatesGroup):
-    ban_user = State()
-    unban_user = State()
+class AdminStates(StatesGroup):
+    waiting_for_user_id = State()
 
+# === MIDDLEWARE: Проверка бана и доступа ===
 @dp.message.middleware()
 async def check_access_middleware(handler, event: Message, data: dict):
     """Проверка доступа к боту"""
     user_id = event.from_user.id
-    
     user = db.get_user(user_id)
-    if not user:
-        db.create_user(
-            user_id=user_id,
-            username=event.from_user.username,
-            first_name=event.from_user.first_name
-        )
-        user = db.get_user(user_id)
-    else:
-        db.update_user_activity(user_id)
     
-    if user['is_banned']:
-        await event.answer(
-            "❌ <b>Доступ запрещён</b>\n\n"
-            "Вы были заблокированы администратором.\n"
-            "Для разблокировки обратитесь: @kod30"
-        )
+    # Проверка бана
+    if user and user['is_banned']:
+        await event.answer("❌ Вы заблокированы в боте.")
         return
     
-    bot_mode = db.get_setting('bot_mode', 'all')
-    if bot_mode == 'owner_only' and user_id != OWNER_ID:
-        await event.answer(
-            "🔒 <b>Бот временно недоступен</b>\n\n"
-            "Бот находится в режиме обслуживания.\n"
-            "Для получения доступа: @kod30"
-        )
+    # Проверка режима доступа
+    settings = db.get_bot_settings()
+    if settings['access_mode'] == 'owner_only' and user_id != OWNER_ID:
+        await event.answer("🔒 Бот доступен только для владельца.")
         return
-    
-    data['db_user'] = user
-    data['is_admin'] = (user_id == OWNER_ID)
     
     return await handler(event, data)
 
-@dp.message(CommandStart())
-async def start_command(message: Message, db_user: dict, is_admin: bool):
-    """Команда /start"""
-    user_name = message.from_user.first_name
-    
-    welcome_text = (
-        f"👋 Привет, <b>{user_name}</b>!\n\n"
-        "🎁 <b>Telegram Gift Parser</b>\n"
-        "Я помогу найти владельцев NFT-подарков Telegram.\n\n"
-    )
-    
-    if db_user['is_premium']:
-        welcome_text += "⭐ У вас <b>Premium</b> - безлимитный доступ!\n\n"
-    else:
-        welcome_text += f"🎫 Пробных поисков осталось: <b>{db_user['trial_searches_left']}</b>\n\n"
-    
-    welcome_text += (
-        "Выберите действие из меню ниже:\n"
-        "🔍 <b>Начать поиск</b> - найти подарки\n"
-        "📊 <b>Профиль</b> - ваша статистика\n"
-        "📜 <b>История</b> - история поисков\n"
-        "⏭️ <b>Продолжить</b> - продолжить последний поиск\n"
-    )
-    
-    if not db_user['is_premium']:
-        welcome_text += "\n💎 Для полного доступа: @kod30"
-    
-    await message.answer(
-        welcome_text,
-        reply_markup=main_menu_keyboard(is_admin)
-    )
-
-@dp.message(F.text == "📊 Профиль")
-async def profile_command(message: Message, db_user: dict):
-    """Показать профиль пользователя"""
+# === КОМАНДЫ ===
+@dp.message(Command("start"))
+async def start_command(message: Message):
+    """Начало работы"""
     user_id = message.from_user.id
+    username = message.from_user.username
+    first_name = message.from_user.first_name
     
-    status = "⭐ Premium" if db_user['is_premium'] else f"🎫 Пробный ({db_user['trial_searches_left']} поисков)"
-    
-    profile_text = (
-        "👤 <b>Ваш профиль</b>\n\n"
-        f"🆔 ID: <code>{user_id}</code>\n"
-        f"📝 Статус: {status}\n"
-        f"📅 Регистрация: {db_user['registration_date'][:10]}\n\n"
-        f"📊 <b>Статистика:</b>\n"
-        f"🔍 Всего поисков: <b>{db_user['total_searches']}</b>\n"
-        f"🎁 Найдено подарков: <b>{db_user['total_found']}</b>\n\n"
-    )
-    
-    if not db_user['is_premium']:
-        profile_text += "💎 Хотите безлимит? Напишите @kod30"
-    
-    await message.answer(profile_text, reply_markup=profile_keyboard())
-
-@dp.message(F.text == "📜 История")
-@dp.callback_query(F.data.startswith("history_page_"))
-async def history_command(event, db_user: dict):
-    """Показать историю поисков"""
-    user_id = db_user['user_id']
-    
-    if isinstance(event, CallbackQuery):
-        page = int(event.data.split("_")[-1])
-        await event.answer()
+    # Регистрация или обновление пользователя
+    user = db.get_user(user_id)
+    if not user:
+        db.add_user(user_id, username, first_name)
+        await channel_logger.log_registration(user_id, username, first_name)
     else:
-        page = 1
+        db.update_user_info(user_id, username, first_name)
     
-    per_page = 5
-    offset = (page - 1) * per_page
-    
-    searches = db.get_user_searches(user_id, limit=per_page, offset=offset)
-    total_count = db.count_user_searches(user_id)
-    total_pages = (total_count + per_page - 1) // per_page
-    
-    if not searches:
-        text = "📜 <b>История поисков</b>\n\nУ вас пока нет поисков."
-        if isinstance(event, CallbackQuery):
-            await event.message.edit_text(text)
-        else:
-            await event.answer(text)
-        return
-    
-    text = f"📜 <b>История поисков</b> (стр. {page}/{total_pages})\n\n"
-    
-    for search in searches:
-        status_emoji = "✅" if search['status'] == 'completed' else "⏸️"
-        text += (
-            f"{status_emoji} <b>{search['model']}</b>\n"
-            f"🆔 Диапазон: {search['start_id']} - {search['end_id']}\n"
-            f"📊 Проверено: {search['checked_count']} | Найдено: {search['found_count']}\n"
-            f"📅 {search['started_at'][:16]}\n\n"
-        )
-    
-    keyboard = history_pagination_keyboard(
-        page=page,
-        total_pages=total_pages,
-        has_prev=(page > 1),
-        has_next=(page < total_pages)
-    )
-    
-    if isinstance(event, CallbackQuery):
-        await event.message.edit_text(text, reply_markup=keyboard)
-    else:
-        await event.answer(text, reply_markup=keyboard)
-
-@dp.message(F.text == "⏭️ Продолжить")
-async def continue_command(message: Message, db_user: dict):
-    """Продолжить последний незавершённый поиск"""
-    last_search = db.get_last_search(db_user['user_id'])
-    
-    if not last_search:
-        await message.answer(
-            "❌ Нет незавершённых поисков.\n\n"
-            "Нажмите <b>🔍 Начать поиск</b> для нового парсинга."
-        )
-        return
+    # Проверка прав
+    is_admin = (user_id == OWNER_ID)
+    user_data = db.get_user(user_id)
+    is_premium = user_data['is_premium'] if user_data else False
     
     text = (
-        "⏸️ <b>Найден незавершённый поиск</b>\n\n"
-        f"🎁 Модель: <code>{last_search['model']}</code>\n"
-        f"🆔 Диапазон: {last_search['start_id']} - {last_search['end_id']}\n"
-        f"📊 Проверено: {last_search['checked_count']}\n"
-        f"✅ Найдено: {last_search['found_count']}\n"
-        f"🔄 Последний ID: {last_search['last_checked_id']}\n\n"
-        "Продолжить этот поиск?"
+        f"👋 Привет, <b>{first_name}</b>!\n\n"
+        "🎁 <b>Gift Parser</b> - поиск NFT подарков в Telegram\n\n"
+        "<b>Возможности:</b>\n"
+        "🔍 Поиск по диапазону ID\n"
+        "🔎 Поиск конкретного подарка\n"
+        "📋 Список всех моделей\n"
+        "📊 Статистика поисков\n\n"
     )
     
-    await message.answer(text, reply_markup=continue_search_keyboard())
-
-@dp.callback_query(F.data == "continue_yes")
-async def continue_yes(callback: CallbackQuery, state: FSMContext, db_user: dict):
-    """Подтверждение продолжения поиска"""
-    await callback.answer()
-    
-    last_search = db.get_last_search(db_user['user_id'])
-    if not last_search:
-        await callback.message.edit_text("❌ Поиск не найден.")
-        return
-    
-    await callback.message.edit_text("🔍 Продолжаю поиск...")
-    await start_parsing(
-        callback.message,
-        search_id=last_search['id'],
-        model=last_search['model'],
-        start_id=last_search['last_checked_id'] + 1,
-        end_id=last_search['end_id'],
-        db_user=db_user,
-        is_continue=True
-    )
-
-@dp.callback_query(F.data == "continue_no")
-async def continue_no(callback: CallbackQuery, state: FSMContext):
-    """Отмена продолжения, начать новый поиск"""
-    await callback.answer()
-    await callback.message.edit_text("Отменено. Нажмите <b>🔍 Начать поиск</b> для нового парсинга.")
-
-@dp.message(F.text == "🔍 Начать поиск")
-async def start_search_command(message: Message, state: FSMContext, db_user: dict):
-    """Начать новый поиск"""
-    if not db_user['is_premium'] and db_user['trial_searches_left'] <= 0:
-        await message.answer(
-            "❌ <b>Пробный период закончился</b>\n\n"
-            "🎫 У вас больше нет пробных поисков.\n\n"
-            "💎 Для получения полного доступа: @kod30"
-        )
-        return
-    
-    await state.set_state(SearchForm.model)
-    await message.answer(
-        "🎁 <b>Начинаем поиск подарков</b>\n\n"
-        "1️⃣ Введите название модели подарка:\n"
-        "Например: <code>EternalRose</code>, <code>Delicious</code>, <code>BlueStar</code>",
-        reply_markup=cancel_keyboard()
-    )
-
-@dp.message(SearchForm.model)
-async def search_model_received(message: Message, state: FSMContext):
-    """Получена модель подарка"""
-    if message.text == "❌ Отмена":
-        await state.clear()
-        await message.answer("Отменено.", reply_markup=main_menu_keyboard())
-        return
-    
-    model = message.text.strip()
-    if not model:
-        await message.answer("Модель не может быть пустой.")
-        return
-    
-    await state.update_data(model=model)
-    await state.set_state(SearchForm.range_input)
-    
-    await message.answer(
-        "2️⃣ Введите диапазон ID через тире:\n\n"
-        "Примеры:\n"
-        "• <code>10-20</code> (проверит ID с 10 по 20)\n"
-        "• <code>13000-13100</code>\n"
-        "• <code>1-50</code> (для пробных пользователей макс. 50 ID)\n\n"
-        "❗ Важно: пробным пользователям доступно макс. 50 ID за раз.",
-        reply_markup=cancel_keyboard()
-    )
-
-@dp.message(SearchForm.range_input)
-async def search_range_received(message: Message, state: FSMContext, db_user: dict, is_admin: bool):
-    """Получен диапазон ID"""
-    if message.text == "❌ Отмена":
-        await state.clear()
-        await message.answer("Отменено.", reply_markup=main_menu_keyboard(is_admin))
-        return
-    
-    match = re.match(r'^(\d+)-(\d+)$', message.text.strip())
-    if not match:
-        await message.answer(
-            "❌ Неверный формат!\n\n"
-            "Используйте формат: <code>начало-конец</code>\n"
-            "Например: <code>10-20</code>"
-        )
-        return
-    
-    start_id = int(match.group(1))
-    end_id = int(match.group(2))
-    
-    if start_id >= end_id:
-        await message.answer("❌ Начальный ID должен быть меньше конечного!")
-        return
-    
-    range_size = end_id - start_id + 1
-    
-    if not db_user['is_premium']:
-        if range_size > 50:
-            await message.answer(
-                f"❌ Для пробных пользователей максимум <b>50</b> ID за раз!\n\n"
-                f"Ваш диапазон: {range_size} ID\n\n"
-                "💎 Для безлимитного доступа: @kod30"
-            )
-            return
-        
-        if not db.use_trial_search(db_user['user_id']):
-            await message.answer(
-                "❌ <b>Пробный период закончился</b>\n\n"
-                "💎 Для продолжения: @kod30"
-            )
-            return
-    
-    data = await state.get_data()
-    model = data['model']
-    await state.clear()
-    
-    search_id = db.create_search(db_user['user_id'], model, start_id, end_id)
-    
-    await message.answer(
-        f"🔎 <b>Начинаю поиск...</b>\n\n"
-        f"🎁 Модель: <code>{model}</code>\n"
-        f"🆔 Диапазон: <code>{start_id}-{end_id}</code> ({range_size} ID)\n\n"
-        f"⏱️ Примерное время: ~{range_size * 5} сек",
-        reply_markup=main_menu_keyboard(is_admin)
-    )
-    
-    await start_parsing(message, search_id, model, start_id, end_id, db_user)
-
-async def start_parsing(message: Message, search_id: int, model: str, start_id: int, end_id: int, db_user: dict, is_continue: bool = False):
-    """Основная функция парсинга"""
-    api = PeekAPI()
-    user_id = db_user['user_id']
-    
-    found = 0
-    checked = 0
-    last_progress_update = 0
-    
-    status_msg = await message.answer(
-        f"🔎 <b>Идёт поиск...</b>\n\n"
-        f"🎁 Модель: <code>{model}</code>\n"
-        f"📊 Проверено: <b>0</b> / {end_id - start_id + 1}\n"
-        f"✅ Найдено: <b>0</b>\n"
-        f"⏱️ Прогресс: ▱▱▱▱▱▱▱▱▱▱ 0%"
-    )
-    
-    try:
-        for gift_number in range(start_id, end_id + 1):
-            checked += 1
-            
-            try:
-                gift = await api.get_gift(model, gift_number)
-            except Exception as e:
-                logging.error(f"Gift {gift_number} error: {type(e).__name__}: {str(e)}")
-                logging.exception(f"Full traceback for gift {gift_number}:")
-                await asyncio.sleep(2)
-                try:
-                    gift = await api.get_gift(model, gift_number)
-                except Exception as e2:
-                    logging.error(f"Gift {gift_number} retry failed: {type(e2).__name__}: {str(e2)}")
-                    gift = None
-            
-            if gift:
-                found += 1
-                db.save_found_gift(search_id, user_id, gift)
-                await send_gift_result(message, gift)
-            
-            db.update_search_progress(search_id, gift_number, checked, found)
-            
-            if checked - last_progress_update >= 10 or checked == (end_id - start_id + 1):
-                last_progress_update = checked
-                total = end_id - start_id + 1
-                progress = int((checked / total) * 100)
-                progress_bar = "█" * (progress // 10) + "▱" * (10 - progress // 10)
-                
-                try:
-                    await status_msg.edit_text(
-                        f"🔎 <b>Идёт поиск...</b>\n\n"
-                        f"🎁 Модель: <code>{model}</code>\n"
-                        f"📊 Проверено: <b>{checked}</b> / {total}\n"
-                        f"✅ Найдено: <b>{found}</b>\n"
-                        f"⏱️ Прогресс: {progress_bar} {progress}%"
-                    )
-                except:
-                    pass
-            
-            await asyncio.sleep(5)
-        
-        db.complete_search(search_id)
-        db.increment_user_stats(user_id, found)
-        
-        await status_msg.edit_text(
-            f"✅ <b>Поиск завершён!</b>\n\n"
-            f"🎁 Модель: <code>{model}</code>\n"
-            f"🆔 Диапазон: <code>{start_id}-{end_id}</code>\n"
-            f"📊 Проверено: <b>{checked}</b>\n"
-            f"🎁 Найдено владельцев: <b>{found}</b>\n\n"
-            f"{'🎉 Отличный результат!' if found > 0 else '😔 В этом диапазоне владельцы не найдены'}"
-        )
-        
-    finally:
-        await api.close()
-
-async def send_gift_result(message: Message, gift: dict):
-    """Отправить красиво оформленный результат о подарке"""
-    number = gift.get("giftNumber", "?")
-    username = gift.get("username", "").replace("t.me/", "").lstrip("@")
-    owner = gift.get("owner", "Неизвестно")
-    model = gift.get("model", "?")
-    pattern = gift.get("pattern", "?")
-    backdrop = gift.get("backdrop", "?")
-    gift_name = gift.get("giftName", gift.get("title", "?"))
-    
-    rarity_model = gift.get("rarityModel", 0)
-    rarity_pattern = gift.get("rarityPattern", 0)
-    rarity_backdrop = gift.get("rarityBackdrop", 0)
-    
-    market = gift.get("market") or {}
-    price = market.get("price")
-    
-    text = (
-        "🎉 <b>НАЙДЕН ПОДАРОК!</b>\n"
-        "━━━━━━━━━━━━━━━━\n\n"
-        f"🎁 <b>{gift_name}</b>\n"
-        f"🆔 ID: <code>{number}</code>\n\n"
-        f"✨ Модель: <code>{model}</code>\n"
-        f"   └ Редкость: {rarity_model}%\n\n"
-        f"🌸 Узор: <code>{pattern}</code>\n"
-        f"   └ Редкость: {rarity_pattern}%\n\n"
-        f"🌈 Фон: <code>{backdrop}</code>\n"
-        f"   └ Редкость: {rarity_backdrop}%\n\n"
-    )
-    
-    if username:
-        text += f"👤 Владелец: @{username}\n"
+    if not is_premium:
+        trials_left = user_data['trial_searches_left'] if user_data else 25
+        text += f"🎫 <b>Пробных поисков:</b> {trials_left}/25\n\n"
     else:
-        text += f"👤 Владелец: <code>{owner}</code>\n"
+        text += "⭐ <b>Premium подписка активна!</b>\n\n"
     
-    if price:
-        text += f"💰 Цена: <b>{price} TON</b>\n"
-    
-    text += "\n━━━━━━━━━━━━━━━━"
+    text += "💬 <b>Поддержка:</b> @kod30"
     
     await message.answer(
         text,
-        reply_markup=gift_result_keyboard(number, username, gift_name)
+        reply_markup=main_menu_keyboard(is_admin=is_admin, is_premium=is_premium)
     )
 
-@dp.message(F.text == "ℹ️ Помощь")
+@dp.message(Command("stop"))
+async def stop_command(message: Message):
+    """Остановить текущий парсинг"""
+    user_id = message.from_user.id
+    db.set_stop_flag(user_id, True)
+    
+    await message.answer(
+        "⏹️ <b>Парсинг будет остановлен</b>\n\n"
+        "Нажмите <b>▶️ Продолжить</b> чтобы возобновить:",
+        reply_markup=continue_parsing_keyboard()
+    )
+
+@dp.message(Command("help"))
 async def help_command(message: Message):
     """Помощь"""
     text = (
         "ℹ️ <b>Помощь</b>\n\n"
         "<b>Как пользоваться:</b>\n"
         "1. Нажмите <b>🔍 Начать поиск</b>\n"
-        "2. Введите модель подарка (например: EternalRose)\n"
-        "3. Введите диапазон ID через тире (например: 10-50)\n"
-        "4. Ожидайте результаты!\n\n"
-        "<b>Доступные кнопки:</b>\n"
-        "🔍 Начать поиск - новый парсинг\n"
-        "📊 Профиль - ваша статистика\n"
-        "📜 История - все ваши поиски\n"
-        "⏭️ Продолжить - продолжить последний поиск\n\n"
-        "<b>Лимиты:</b>\n"
-        "🎫 Пробный период: 50 поисков по 50 ID\n"
-        "⭐ Premium: безлимитно\n\n"
-        "💬 Связь с разработчиком: @kod30"
+        "2. Введите модель (например: Eternal Rose или EternalRose)\n"
+        "3. Введите диапазон через тире (10-50)\n"
+        "4. Дождитесь результатов!\n\n"
+        "<b>Регистр и пробелы:</b>\n"
+        "✅ eternal rose = EternalRose\n"
+        "✅ evil eye = EvilEye\n"
+        "✅ blue star = BlueStar\n\n"
+        "<b>Команды:</b>\n"
+        "/start - главное меню\n"
+        "/stop - остановить парсинг\n"
+        "/help - эта справка\n\n"
+        "💬 <b>Поддержка:</b> @kod30"
     )
     await message.answer(text)
 
+# === НАЧАТЬ ПОИСК ===
+@dp.message(F.text == "🔍 Начать поиск")
+async def search_start(message: Message, state: FSMContext):
+    """Начало поиска"""
+    user_id = message.from_user.id
+    user = db.get_user(user_id)
+    
+    # Проверка лимитов
+    if not user['is_premium'] and user['trial_searches_left'] <= 0:
+        await message.answer(
+            "❌ <b>Пробные поиски закончились!</b>\n\n"
+            f"💎 Осталось: {user['trial_searches_left']}/25\n\n"
+            "Для продолжения работы оформите <b>Premium подписку</b>:\n"
+            f"💰 Стоимость: <b>5 TON</b>\n\n"
+            "Выберите способ оплаты:",
+            reply_markup=payment_method_keyboard()
+        )
+        return
+    
+    await state.set_state(SearchStates.waiting_for_model)
+    await message.answer(
+        "🎁 <b>Введите модель подарка</b>\n\n"
+        "Например: <code>Eternal Rose</code> или <code>Evil Eye</code>\n\n"
+        "📋 Список доступных: /models",
+        reply_markup=cancel_keyboard()
+    )
+
+@dp.message(SearchStates.waiting_for_model)
+async def search_model_entered(message: Message, state: FSMContext):
+    """Обработка введённой модели"""
+    if message.text == "❌ Отмена":
+        await state.clear()
+        user = db.get_user(message.from_user.id)
+        is_admin = (message.from_user.id == OWNER_ID)
+        await message.answer(
+            "❌ Поиск отменён",
+            reply_markup=main_menu_keyboard(is_admin=is_admin, is_premium=user['is_premium'])
+        )
+        return
+    
+    # Нормализация названия (убрать пробелы, привести к Title Case)
+    model_name = message.text.strip().replace(" ", "").title()
+    
+    await state.update_data(model=model_name)
+    await state.set_state(SearchStates.waiting_for_range)
+    
+    await message.answer(
+        f"✅ Модель: <b>{model_name}</b>\n\n"
+        "📊 <b>Введите диапазон ID</b>\n\n"
+        "Формат: <code>начало-конец</code>\n"
+        "Пример: <code>1-100</code>",
+        reply_markup=cancel_keyboard()
+    )
+
+@dp.message(SearchStates.waiting_for_range)
+async def search_range_entered(message: Message, state: FSMContext):
+    """Обработка диапазона и начало парсинга"""
+    if message.text == "❌ Отмена":
+        await state.clear()
+        user = db.get_user(message.from_user.id)
+        is_admin = (message.from_user.id == OWNER_ID)
+        await message.answer(
+            "❌ Поиск отменён",
+            reply_markup=main_menu_keyboard(is_admin=is_admin, is_premium=user['is_premium'])
+        )
+        return
+    
+    # Парсинг диапазона
+    try:
+        range_text = message.text.strip()
+        start, end = map(int, range_text.split("-"))
+        
+        if start >= end or start < 1:
+            await message.answer("❌ Некорректный диапазон! Попробуйте снова (например: 1-100)")
+            return
+        
+        if end - start > 10000:
+            await message.answer("❌ Максимальный диапазон: 10000 ID")
+            return
+        
+    except ValueError:
+        await message.answer("❌ Неверный формат! Используйте: начало-конец (например: 1-100)")
+        return
+    
+    # Получаем данные
+    data = await state.get_data()
+    model = data['model']
+    user_id = message.from_user.id
+    username = message.from_user.username
+    
+    # Очистить флаг остановки
+    db.clear_stop_flag(user_id)
+    
+    # Логирование начала поиска
+    await channel_logger.log_search(user_id, username, model, start, end)
+    
+    # Сохраняем поиск в историю
+    search_id = db.add_search(user_id, model, start, end)
+    
+    # Уменьшаем количество пробных поисков
+    user = db.get_user(user_id)
+    if not user['is_premium']:
+        db.update_trial_searches(user_id, user['trial_searches_left'] - 1)
+    
+    await state.clear()
+    
+    # Начинаем парсинг
+    await message.answer(
+        f"🔍 <b>Начинаю поиск...</b>\n\n"
+        f"🎁 Модель: <code>{model}</code>\n"
+        f"📊 Диапазон: <code>{start}-{end}</code>\n\n"
+        f"⏱️ Это может занять некоторое время...\n"
+        f"Для остановки: /stop",
+        reply_markup=stop_parsing_keyboard()
+    )
+    
+    # Запускаем парсинг
+    await start_parsing(message, user_id, model, start, end, search_id)
+
+async def start_parsing(message: Message, user_id: int, model: str, start: int, end: int, search_id: int):
+    """Основной процесс парсинга"""
+    found_gifts = []
+    total_checked = 0
+    
+    progress_msg = await message.answer("⏳ <b>Прогресс:</b> 0%")
+    
+    total_range = end - start + 1
+    
+    for gift_id in range(start, end + 1):
+        # Проверка флага остановки
+        if db.should_stop_parsing(user_id):
+            await progress_msg.edit_text(
+                "⏹️ <b>Парсинг остановлен!</b>\n\n"
+                f"Проверено: {total_checked}/{total_range}\n"
+                f"Найдено: {len(found_gifts)}",
+                reply_markup=continue_parsing_keyboard()
+            )
+            # Сохраняем состояние для продолжения
+            db.update_last_search(user_id, model, gift_id, end)
+            return
+        
+        # Проверка подарка
+        gift_data = await peek_gift_info(gift_id, model)
+        total_checked += 1
+        
+        if gift_data['found']:
+            found_gifts.append(gift_data)
+            
+            # Сохраняем в БД
+            db.add_found_gift(
+                search_id=search_id,
+                gift_number=gift_id,
+                model=model,
+                owner_username=gift_data.get('username', 'Unknown'),
+                is_visible=gift_data.get('is_visible', True),
+                attributes=str(gift_data.get('attributes', {}))
+            )
+            
+            # Отправляем уведомление
+            visibility = "👁️ Открыт" if gift_data.get('is_visible') else "🔒 Скрыт"
+            
+            result_text = (
+                f"✅ <b>Найден подарок #{gift_id}</b>\n\n"
+                f"🎁 Модель: <code>{model}</code>\n"
+                f"👤 Владелец: @{gift_data.get('username', 'Unknown')}\n"
+                f"👁️ Видимость: {visibility}\n"
+            )
+            
+            if 'rarity' in gift_data:
+                result_text += f"💎 Редкость: <b>{gift_data['rarity']}</b>\n"
+            
+            await message.answer(
+                result_text,
+                reply_markup=gift_result_keyboard(
+                    gift_id,
+                    gift_data.get('username'),
+                    model
+                )
+            )
+        
+        # Обновление прогресса каждые 10%
+        progress_percent = int((total_checked / total_range) * 100)
+        if total_checked % max(1, total_range // 10) == 0:
+            try:
+                await progress_msg.edit_text(
+                    f"⏳ <b>Прогресс:</b> {progress_percent}%\n"
+                    f"Проверено: {total_checked}/{total_range}\n"
+                    f"Найдено: {len(found_gifts)}"
+                )
+            except:
+                pass
+        
+        # Задержка 5 секунд
+        await asyncio.sleep(5)
+    
+    # Завершение
+    await progress_msg.delete()
+    
+    # Итоговый список
+    if found_gifts:
+        summary_text = format_summary(found_gifts, model)
+        await message.answer(summary_text)
+        
+        await message.answer(
+            f"✅ <b>Поиск завершён!</b>\n\n"
+            f"📊 Проверено: {total_checked}\n"
+            f"✅ Найдено: {len(found_gifts)}\n"
+        )
+    else:
+        await message.answer(
+            f"❌ <b>Поиск завершён</b>\n\n"
+            f"📊 Проверено: {total_checked}\n"
+            f"❌ Ничего не найдено"
+        )
+    
+    # Очистить флаг остановки
+    db.clear_stop_flag(user_id)
+    
+    # Главное меню
+    user = db.get_user(user_id)
+    is_admin = (user_id == OWNER_ID)
+    await message.answer(
+        "Выберите действие:",
+        reply_markup=main_menu_keyboard(is_admin=is_admin, is_premium=user['is_premium'])
+    )
+
+# === ПОИСК ПО ID ===
+@dp.message(F.text == "🔎 Поиск по ID")
+async def search_by_id_start(message: Message, state: FSMContext):
+    """Поиск конкретного подарка по ID"""
+    await state.set_state(SearchStates.waiting_for_id)
+    await message.answer(
+        "🔎 <b>Поиск по ID</b>\n\n"
+        "Введите в формате: <code>модель-номер</code>\n"
+        "Пример: <code>EternalRose-13000</code>",
+        reply_markup=cancel_keyboard()
+    )
+
+@dp.message(SearchStates.waiting_for_id)
+async def search_by_id_process(message: Message, state: FSMContext):
+    """Обработка поиска по ID"""
+    if message.text == "❌ Отмена":
+        await state.clear()
+        user = db.get_user(message.from_user.id)
+        is_admin = (message.from_user.id == OWNER_ID)
+        await message.answer(
+            "❌ Поиск отменён",
+            reply_markup=main_menu_keyboard(is_admin=is_admin, is_premium=user['is_premium'])
+        )
+        return
+    
+    try:
+        # Парсинг
+        parts = message.text.strip().split("-")
+        if len(parts) != 2:
+            raise ValueError()
+        
+        model = parts[0].strip().replace(" ", "").title()
+        gift_id = int(parts[1])
+        
+        if gift_id < 1:
+            raise ValueError()
+        
+    except ValueError:
+        await message.answer("❌ Неверный формат! Используйте: модель-номер (например: EternalRose-100)")
+        return
+    
+    await state.clear()
+    
+    # Поиск
+    msg = await message.answer(f"🔍 Ищу подарок <code>{model}-{gift_id}</code>...")
+    
+    gift_data = await peek_gift_info(gift_id, model)
+    
+    if gift_data['found']:
+        visibility = "👁️ Открыт" if gift_data.get('is_visible') else "🔒 Скрыт"
+        
+        result_text = (
+            f"✅ <b>Подарок найден!</b>\n\n"
+            f"🎁 ID: <code>{model}-{gift_id}</code>\n"
+            f"👤 Владелец: @{gift_data.get('username', 'Unknown')}\n"
+            f"👁️ Видимость: {visibility}\n"
+        )
+        
+        if 'rarity' in gift_data:
+            result_text += f"💎 Редкость: <b>{gift_data['rarity']}</b>\n"
+        
+        await msg.edit_text(
+            result_text,
+            reply_markup=gift_result_keyboard(
+                gift_id,
+                gift_data.get('username'),
+                model
+            )
+        )
+    else:
+        await msg.edit_text(
+            f"❌ <b>Подарок не найден</b>\n\n"
+            f"🎁 ID: <code>{model}-{gift_id}</code>\n\n"
+            "Возможные причины:\n"
+            "• Подарок не существует\n"
+            "• Неверное название модели\n"
+            "• Технические проблемы API"
+        )
+
+# === СПИСОК ПОДАРКОВ ===
+@dp.message(F.text == "📋 Список подарков")
+async def models_list_command(message: Message):
+    """Показать список моделей"""
+    text = "📋 <b>Доступные модели подарков:</b>\n\n"
+    
+    for i, model in enumerate(AVAILABLE_MODELS, 1):
+        text += f"{i}. <code>{model}</code>\n"
+    
+    text += (
+        "\n💡 <b>Подсказка:</b>\n"
+        "Можно писать с пробелами или без:\n"
+        "• Evil Eye = EvilEye\n"
+        "• Eternal Rose = EternalRose"
+    )
+    
+    await message.answer(text)
+
+# === ПРОФИЛЬ ===
+@dp.message(F.text == "📊 Профиль")
+async def profile_command(message: Message):
+    """Показать профиль пользователя"""
+    user_id = message.from_user.id
+    user = db.get_user(user_id)
+    user_stats = db.get_user_stats(user_id)
+    
+    premium_status = "⭐ Premium" if user['is_premium'] else f"🎫 Trial ({user['trial_searches_left']}/25)"
+    
+    text = (
+        f"👤 <b>Профиль</b>\n\n"
+        f"🆔 ID: <code>{user_id}</code>\n"
+        f"👤 Username: @{user.get('username', 'не указан')}\n"
+        f"📅 Регистрация: {user['created_at'][:10]}\n"
+        f"💎 Статус: {premium_status}\n\n"
+        f"📊 <b>Статистика:</b>\n"
+        f"🔍 Всего поисков: <b>{user_stats['total_searches']}</b>\n"
+        f"✅ Найдено подарков: <b>{user_stats['total_gifts_found']}</b>\n"
+    )
+    
+    # Последний поиск
+    last_search = db.get_last_search(user_id)
+    if last_search:
+        text += (
+            f"\n🔄 <b>Последний поиск:</b>\n"
+            f"🎁 {last_search['model']}\n"
+            f"📊 {last_search['range_start']}-{last_search['range_end']}\n"
+            f"✅ Найдено: {last_search['found_count']}\n"
+        )
+    
+    await message.answer(text, reply_markup=profile_keyboard())
+
+# === ПРОДОЛЖИТЬ ===
+@dp.message(F.text == "⏭️ Продолжить")
+async def continue_last_search(message: Message):
+    """Продолжить последний поиск"""
+    user_id = message.from_user.id
+    last_search = db.get_last_search(user_id)
+    
+    if not last_search:
+        await message.answer("❌ Нет предыдущих поисков для продолжения")
+        return
+    
+    await message.answer(
+        f"🔄 <b>Продолжить поиск?</b>\n\n"
+        f"🎁 Модель: <code>{last_search['model']}</code>\n"
+        f"📊 Диапазон: {last_search['range_start']}-{last_search['range_end']}\n"
+        f"✅ Найдено: {last_search['found_count']}",
+        reply_markup=continue_parsing_keyboard()
+    )
+
+# === CALLBACK: Продолжить парсинг ===
+@dp.callback_query(F.data == "continue_parsing")
+async def callback_continue_parsing(callback: CallbackQuery):
+    """Продолжить остановленный парсинг"""
+    user_id = callback.from_user.id
+    last = db.get_last_search_state(user_id)
+    
+    if not last:
+        await callback.answer("❌ Нет данных для продолжения", show_alert=True)
+        return
+    
+    db.clear_stop_flag(user_id)
+    
+    await callback.message.answer(
+        f"▶️ <b>Продолжаю поиск...</b>\n\n"
+        f"🎁 Модель: <code>{last['model']}</code>\n"
+        f"📊 С ID {last['current_id']} по {last['end_id']}",
+        reply_markup=stop_parsing_keyboard()
+    )
+    
+    # Продолжаем парсинг
+    await start_parsing(
+        callback.message,
+        user_id,
+        last['model'],
+        last['current_id'],
+        last['end_id'],
+        last['search_id']
+    )
+    
+    await callback.answer()
+
+# === CALLBACK: Остановить парсинг ===
+@dp.callback_query(F.data == "stop_parsing")
+async def callback_stop_parsing(callback: CallbackQuery):
+    """Остановить текущий парсинг"""
+    user_id = callback.from_user.id
+    db.set_stop_flag(user_id, True)
+    await callback.answer("⏹️ Остановка...", show_alert=True)
+
+# === CALLBACK: В меню ===
+@dp.callback_query(F.data == "back_to_menu")
+async def callback_back_to_menu(callback: CallbackQuery):
+    """Вернуться в главное меню"""
+    user_id = callback.from_user.id
+    user = db.get_user(user_id)
+    is_admin = (user_id == OWNER_ID)
+    
+    await callback.message.edit_text("🏠 Главное меню:")
+    await callback.message.answer(
+        "Выберите действие:",
+        reply_markup=main_menu_keyboard(is_admin=is_admin, is_premium=user['is_premium'])
+    )
+    await callback.answer()
+
+# === ПЛАТЕЖИ ===
+@dp.message(F.text == "⭐ Купить Premium")
+async def buy_premium_command(message: Message):
+    """Показать варианты оплаты"""
+    text = (
+        "⭐ <b>Premium подписка</b>\n\n"
+        "💎 <b>Преимущества:</b>\n"
+        "✅ Безлимитные поиски\n"
+        "✅ Приоритетная поддержка\n"
+        "✅ Ранний доступ к новым функциям\n\n"
+        f"💰 <b>Стоимость:</b> 5 TON\n\n"
+        "Выберите способ оплаты:"
+    )
+    
+    await message.answer(text, reply_markup=payment_method_keyboard())
+
+@dp.callback_query(F.data == "pay_cryptobot")
+async def callback_pay_cryptobot(callback: CallbackQuery):
+    """Оплата через CryptoBot"""
+    user_id = callback.from_user.id
+    username = callback.from_user.username
+    
+    invoice_url = await payment_manager.create_cryptobot_invoice(user_id, username)
+    
+    if invoice_url:
+        from aiogram.utils.keyboard import InlineKeyboardBuilder
+        builder = InlineKeyboardBuilder()
+        builder.row(InlineKeyboardButton(text="💳 Оплатить", url=invoice_url))
+        
+        await callback.message.edit_text(
+            "💎 <b>CryptoBot Payment</b>\n\n"
+            "Нажмите кнопку ниже для оплаты.\n"
+            "После оплаты Premium активируется автоматически!",
+            reply_markup=builder.as_markup()
+        )
+    else:
+        await callback.answer("❌ Ошибка создания счёта", show_alert=True)
+    
+    await callback.answer()
+
+@dp.callback_query(F.data == "pay_xrocket")
+async def callback_pay_xrocket(callback: CallbackQuery):
+    """Оплата через XRocket"""
+    user_id = callback.from_user.id
+    
+    invoice_url = await payment_manager.create_xrocket_invoice(user_id)
+    
+    if invoice_url:
+        from aiogram.utils.keyboard import InlineKeyboardBuilder
+        from aiogram.types import InlineKeyboardButton
+        builder = InlineKeyboardBuilder()
+        builder.row(InlineKeyboardButton(text="🚀 Оплатить", url=invoice_url))
+        
+        await callback.message.edit_text(
+            "🚀 <b>XRocket Payment</b>\n\n"
+            "Нажмите кнопку ниже для оплаты.\n"
+            "После оплаты Premium активируется автоматически!",
+            reply_markup=builder.as_markup()
+        )
+    else:
+        await callback.answer("❌ Ошибка создания счёта", show_alert=True)
+    
+    await callback.answer()
+
+# === ПОМОЩЬ ===
+@dp.message(F.text == "ℹ️ Помощь")
+async def help_button_handler(message: Message):
+    """Помощь через кнопку"""
+    await help_command(message)
+
+# === АДМИНКА ===
 @dp.message(F.text == "⚙️ Админка")
-async def admin_panel(message: Message, is_admin: bool):
-    """Админ-панель"""
-    if not is_admin:
+async def admin_panel(message: Message):
+    """Панель администратора"""
+    if message.from_user.id != OWNER_ID:
+        await message.answer("❌ У вас нет доступа к админке")
         return
     
     stats = db.get_total_stats()
-    bot_mode = db.get_setting('bot_mode', 'all')
     
     text = (
-        "⚙️ <b>Админ-панель</b>\n\n"
-        f"📊 <b>Статистика:</b>\n"
-        f"👥 Всего пользователей: {stats['total_users']}\n"
-        f"⭐ Premium: {stats['premium_users']}\n"
-        f"🔍 Всего поисков: {stats['total_searches']}\n"
-        f"🎁 Найдено подарков: {stats['total_gifts_found']}\n\n"
-        f"🔧 <b>Режим бота:</b> {'🔒 Только владелец' if bot_mode == 'owner_only' else '🌍 Все пользователи'}"
+        "⚙️ <b>Админ панель</b>\n\n"
+        f"👥 Всего пользователей: <b>{stats['total_users']}</b>\n"
+        f"⭐ Premium: <b>{stats['premium_users']}</b>\n"
+        f"🔍 Всего поисков: <b>{stats['total_searches']}</b>\n"
+        f"✅ Найдено подарков: <b>{stats['total_gifts_found']}</b>\n"
     )
     
     await message.answer(text, reply_markup=admin_menu_keyboard())
 
-@dp.message(F.text == "🔧 Настройки")
-async def admin_settings(message: Message, is_admin: bool):
-    """Настройки бота"""
-    if not is_admin:
+@dp.message(F.text == "👥 Пользователи")
+async def admin_users(message: Message, state: FSMContext):
+    """Управление пользователями"""
+    if message.from_user.id != OWNER_ID:
         return
     
-    bot_mode = db.get_setting('bot_mode', 'all')
-    
-    text = (
-        "🔧 <b>Настройки доступа</b>\n\n"
-        "Выберите режим работы бота:"
+    await state.set_state(AdminStates.waiting_for_user_id)
+    await message.answer(
+        "👥 <b>Управление пользователями</b>\n\n"
+        "Введите ID или @username пользователя:",
+        reply_markup=cancel_keyboard()
     )
-    
-    await message.answer(text, reply_markup=admin_settings_keyboard(bot_mode))
 
-@dp.callback_query(F.data.startswith("settings_"))
-async def admin_settings_callback(callback: CallbackQuery, is_admin: bool):
-    """Изменение настроек"""
-    if not is_admin:
+@dp.message(AdminStates.waiting_for_user_id)
+async def admin_user_entered(message: Message, state: FSMContext):
+    """Обработка введённого ID пользователя"""
+    if message.text == "❌ Отмена":
+        await state.clear()
+        await message.answer("❌ Отменено", reply_markup=admin_menu_keyboard())
         return
-    
-    mode = callback.data.split("_", 1)[1]
-    db.set_setting('bot_mode', mode)
-    
-    await callback.answer("✅ Настройка сохранена!")
-    
-    text = (
-        "🔧 <b>Настройки доступа</b>\n\n"
-        "Выберите режим работы бота:"
-    )
-    
-    await callback.message.edit_text(text, reply_markup=admin_settings_keyboard(mode))
-
-@dp.message(F.text == "🔙 Назад")
-async def back_to_main(message: Message, is_admin: bool):
-    """Вернуться в главное меню"""
-    await message.answer("Главное меню:", reply_markup=main_menu_keyboard(is_admin))
-
-async def main():
-    proxy_url = os.getenv("PROXY_URL")
-    api_server = os.getenv("API_SERVER")
-    
-    bot_session = None
-    aiohttp_session = None
-    
-    if proxy_url and PROXY_SUPPORT:
-        logging.info(f"Используется прокси: {proxy_url}")
-        connector = ProxyConnector.from_url(proxy_url, rdns=True)
-        aiohttp_session = aiohttp.ClientSession(connector=connector)
-        
-        class ProxyAiohttpSession(AiohttpSession):
-            def __init__(self, session, *args, **kwargs):
-                super().__init__(*args, **kwargs)
-                self._custom_session = session
-                
-            async def create_session(self) -> aiohttp.ClientSession:
-                return self._custom_session
-        
-        bot_session = ProxyAiohttpSession(aiohttp_session)
-    elif proxy_url and not PROXY_SUPPORT:
-        logging.warning("PROXY_URL указан, но библиотека aiohttp-socks не установлена")
-    
-    bot_kwargs = {
-        "token": BOT_TOKEN,
-        "default": DefaultBotProperties(parse_mode=ParseMode.HTML)
-    }
-    
-    if bot_session:
-        bot_kwargs["session"] = bot_session
-    
-    if api_server:
-        logging.info(f"Используется локальный Bot API: {api_server}")
-        from aiogram.client.telegram import TelegramAPIServer
-        if proxy_url and PROXY_SUPPORT:
-            connector = ProxyConnector.from_url(proxy_url, rdns=True)
-            aiohttp_session = aiohttp.ClientSession(connector=connector)
-            
-            class ProxyAiohttpSession(AiohttpSession):
-                def __init__(self, session, *args, **kwargs):
-                    super().__init__(*args, **kwargs)
-                    self._custom_session = session
-                    
-                async def create_session(self) -> aiohttp.ClientSession:
-                    return self._custom_session
-            
-            bot_session = ProxyAiohttpSession(
-                aiohttp_session,
-                api=TelegramAPIServer.from_base(api_server)
-            )
-            bot_kwargs["session"] = bot_session
-        else:
-            bot_kwargs["session"] = AiohttpSession(
-                api=TelegramAPIServer.from_base(api_server)
-            )
-    
-    bot = Bot(**bot_kwargs)
     
     try:
-        await bot.delete_webhook(drop_pending_updates=True)
-        logging.info("Webhook удалён (если был)")
+        # Попытка получить user_id
+        if message.text.startswith("@"):
+            username = message.text[1:]
+            user = db.get_user_by_username(username)
+            if not user:
+                await message.answer("❌ Пользователь не найден")
+                return
+            target_user_id = user['user_id']
+        else:
+            target_user_id = int(message.text)
+            user = db.get_user(target_user_id)
+            if not user:
+                await message.answer("❌ Пользователь не найден")
+                return
         
-        logging.info("Бот запущен!")
-        await dp.start_polling(bot)
-    finally:
-        await bot.session.close()
+        await state.clear()
+        
+        ban_status = "🚫 Забанен" if user['is_banned'] else "✅ Активен"
+        premium_status = "⭐ Premium" if user['is_premium'] else "🎫 Trial"
+        
+        text = (
+            f"👤 <b>Пользователь</b>\n\n"
+            f"🆔 ID: <code>{user['user_id']}</code>\n"
+            f"👤 Username: @{user.get('username', 'не указан')}\n"
+            f"📅 Регистрация: {user['created_at'][:10]}\n"
+            f"💎 Статус: {premium_status}\n"
+            f"🔒 Бан: {ban_status}\n"
+        )
+        
+        await message.answer(text, reply_markup=ban_user_keyboard(target_user_id))
+        
+    except ValueError:
+        await message.answer("❌ Неверный формат! Введите ID (число) или @username")
+
+@dp.callback_query(F.data.startswith("ban_"))
+async def callback_ban_user(callback: CallbackQuery):
+    """Забанить пользователя"""
+    if callback.from_user.id != OWNER_ID:
+        await callback.answer("❌ Нет доступа", show_alert=True)
+        return
+    
+    user_id = int(callback.data.split("_")[1])
+    db.ban_user(user_id)
+    
+    await callback.answer("🚫 Пользователь забанен", show_alert=True)
+    await callback.message.edit_text(
+        f"🚫 Пользователь {user_id} забанен",
+        reply_markup=ban_user_keyboard(user_id)
+    )
+
+@dp.callback_query(F.data.startswith("unban_"))
+async def callback_unban_user(callback: CallbackQuery):
+    """Разбанить пользователя"""
+    if callback.from_user.id != OWNER_ID:
+        await callback.answer("❌ Нет доступа", show_alert=True)
+        return
+    
+    user_id = int(callback.data.split("_")[1])
+    db.unban_user(user_id)
+    
+    await callback.answer("✅ Пользователь разбанен", show_alert=True)
+    await callback.message.edit_text(
+        f"✅ Пользователь {user_id} разбанен",
+        reply_markup=ban_user_keyboard(user_id)
+    )
+
+@dp.callback_query(F.data.startswith("premium_give_"))
+async def callback_give_premium(callback: CallbackQuery):
+    """Выдать Premium"""
+    if callback.from_user.id != OWNER_ID:
+        await callback.answer("❌ Нет доступа", show_alert=True)
+        return
+    
+    user_id = int(callback.data.split("_")[2])
+    db.set_premium(user_id, True)
+    
+    user = db.get_user(user_id)
+    await channel_logger.log_premium_activated(user_id, user.get('username'))
+    
+    await callback.answer("⭐ Premium выдан", show_alert=True)
+    await callback.message.edit_text(
+        f"⭐ Premium выдан пользователю {user_id}",
+        reply_markup=ban_user_keyboard(user_id)
+    )
+
+@dp.callback_query(F.data.startswith("premium_remove_"))
+async def callback_remove_premium(callback: CallbackQuery):
+    """Забрать Premium"""
+    if callback.from_user.id != OWNER_ID:
+        await callback.answer("❌ Нет доступа", show_alert=True)
+        return
+    
+    user_id = int(callback.data.split("_")[2])
+    db.set_premium(user_id, False)
+    
+    await callback.answer("❌ Premium удалён", show_alert=True)
+    await callback.message.edit_text(
+        f"❌ Premium удалён у пользователя {user_id}",
+        reply_markup=ban_user_keyboard(user_id)
+    )
+
+@dp.message(F.text == "📈 Статистика")
+async def admin_stats(message: Message):
+    """Статистика бота"""
+    if message.from_user.id != OWNER_ID:
+        return
+    
+    stats = db.get_total_stats()
+    
+    text = (
+        "📈 <b>Статистика бота</b>\n\n"
+        f"👥 Всего пользователей: <b>{stats['total_users']}</b>\n"
+        f"⭐ Premium подписок: <b>{stats['premium_users']}</b>\n"
+        f"🔍 Всего поисков: <b>{stats['total_searches']}</b>\n"
+        f"✅ Найдено подарков: <b>{stats['total_gifts_found']}</b>\n"
+    )
+    
+    await message.answer(text)
+
+@dp.message(F.text == "🔧 Настройки")
+async def admin_settings(message: Message):
+    """Настройки доступа"""
+    if message.from_user.id != OWNER_ID:
+        return
+    
+    settings = db.get_bot_settings()
+    mode = settings['access_mode']
+    
+    mode_text = "Только владелец" if mode == 'owner_only' else "Все пользователи"
+    
+    text = (
+        "🔧 <b>Настройки бота</b>\n\n"
+        f"🔒 Режим доступа: <b>{mode_text}</b>\n\n"
+        "Выберите режим:"
+    )
+    
+    await message.answer(text, reply_markup=admin_settings_keyboard(mode))
+
+@dp.callback_query(F.data == "settings_owner_only")
+async def callback_settings_owner_only(callback: CallbackQuery):
+    """Установить режим "только владелец" """
+    if callback.from_user.id != OWNER_ID:
+        await callback.answer("❌ Нет доступа", show_alert=True)
+        return
+    
+    db.update_bot_settings(access_mode='owner_only')
+    
+    await callback.answer("✅ Режим изменён", show_alert=True)
+    await callback.message.edit_text(
+        "🔧 <b>Настройки бота</b>\n\n"
+        "🔒 Режим доступа: <b>Только владелец</b>\n\n"
+        "Выберите режим:",
+        reply_markup=admin_settings_keyboard('owner_only')
+    )
+
+@dp.callback_query(F.data == "settings_all")
+async def callback_settings_all(callback: CallbackQuery):
+    """Установить режим "все пользователи" """
+    if callback.from_user.id != OWNER_ID:
+        await callback.answer("❌ Нет доступа", show_alert=True)
+        return
+    
+    db.update_bot_settings(access_mode='all')
+    
+    await callback.answer("✅ Режим изменён", show_alert=True)
+    await callback.message.edit_text(
+        "🔧 <b>Настройки бота</b>\n\n"
+        "🔒 Режим доступа: <b>Все пользователи</b>\n\n"
+        "Выберите режим:",
+        reply_markup=admin_settings_keyboard('all')
+    )
+
+@dp.message(F.text == "🔙 Назад")
+async def admin_back(message: Message):
+    """Назад из админки"""
+    if message.from_user.id != OWNER_ID:
+        return
+    
+    user = db.get_user(message.from_user.id)
+    await message.answer(
+        "🏠 Главное меню",
+        reply_markup=main_menu_keyboard(is_admin=True, is_premium=user['is_premium'])
+    )
+
+# === ЗАПУСК БОТА ===
+async def main():
+    """Запуск бота"""
+    logging.info("Бот запускается...")
+    
+    # Удаление webhook (если был)
+    await bot.delete_webhook(drop_pending_updates=True)
+    
+    logging.info("Polling запущен")
+    await dp.start_polling(bot)
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        logging.info("Бот остановлен")

@@ -7,6 +7,7 @@ import os
 class Database:
     def __init__(self, db_path: str = "bot_database.db"):
         self.db_path = db_path
+        self.stop_parsing_flags = {}  # {user_id: True/False}
         self.init_db()
     
     def get_connection(self):
@@ -28,7 +29,7 @@ class Database:
                 first_name TEXT,
                 is_banned BOOLEAN DEFAULT 0,
                 is_premium BOOLEAN DEFAULT 0,
-                trial_searches_left INTEGER DEFAULT 50,
+                trial_searches_left INTEGER DEFAULT 25,
                 total_searches INTEGER DEFAULT 0,
                 total_found INTEGER DEFAULT 0,
                 registration_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
@@ -344,3 +345,132 @@ class Database:
             'total_searches': total_searches,
             'total_gifts_found': total_gifts_found
         }
+    
+    def set_stop_flag(self, user_id: int, stop: bool = True):
+        """Установить флаг остановки парсинга"""
+        self.stop_parsing_flags[user_id] = stop
+    
+    def should_stop_parsing(self, user_id: int) -> bool:
+        """Проверить нужно ли остановить парсинг"""
+        return self.stop_parsing_flags.get(user_id, False)
+    
+    def clear_stop_flag(self, user_id: int):
+        """Очистить флаг остановки"""
+        self.stop_parsing_flags.pop(user_id, None)
+    
+    def add_user(self, user_id: int, username: str = None, first_name: str = None):
+        """Добавить нового пользователя (alias для create_user)"""
+        self.create_user(user_id, username, first_name)
+    
+    def update_user_info(self, user_id: int, username: str = None, first_name: str = None):
+        """Обновить информацию о пользователе"""
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        cursor.execute("""
+            UPDATE users 
+            SET username = ?, first_name = ?, last_activity = CURRENT_TIMESTAMP
+            WHERE user_id = ?
+        """, (username, first_name, user_id))
+        conn.commit()
+        conn.close()
+    
+    def get_user_by_username(self, username: str) -> Optional[Dict]:
+        """Получить пользователя по username"""
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        cursor.execute("SELECT * FROM users WHERE username = ?", (username,))
+        row = cursor.fetchone()
+        conn.close()
+        return dict(row) if row else None
+    
+    def add_search(self, user_id: int, model: str, start: int, end: int) -> int:
+        """Добавить поиск (alias для create_search)"""
+        return self.create_search(user_id, model, start, end)
+    
+    def update_trial_searches(self, user_id: int, new_value: int):
+        """Обновить количество пробных поисков"""
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        cursor.execute("""
+            UPDATE users SET trial_searches_left = ?
+            WHERE user_id = ?
+        """, (new_value, user_id))
+        conn.commit()
+        conn.close()
+    
+    def add_found_gift(self, search_id: int, gift_number: int, model: str, 
+                      owner_username: str, is_visible: bool, attributes: str):
+        """Добавить найденный подарок"""
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        
+        # Получаем user_id из search_id
+        cursor.execute("SELECT user_id FROM search_history WHERE id = ?", (search_id,))
+        row = cursor.fetchone()
+        user_id = row[0] if row else None
+        
+        cursor.execute("""
+            INSERT INTO found_gifts 
+            (search_id, user_id, gift_number, model, username)
+            VALUES (?, ?, ?, ?, ?)
+        """, (search_id, user_id, gift_number, model, owner_username))
+        
+        conn.commit()
+        conn.close()
+    
+    def get_user_stats(self, user_id: int) -> Dict:
+        """Получить статистику пользователя"""
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        
+        cursor.execute("SELECT COUNT(*) FROM search_history WHERE user_id = ?", (user_id,))
+        total_searches = cursor.fetchone()[0]
+        
+        cursor.execute("SELECT COUNT(*) FROM found_gifts WHERE user_id = ?", (user_id,))
+        total_gifts_found = cursor.fetchone()[0]
+        
+        conn.close()
+        
+        return {
+            'total_searches': total_searches,
+            'total_gifts_found': total_gifts_found
+        }
+    
+    def update_last_search(self, user_id: int, model: str, current_id: int, end_id: int):
+        """Обновить состояние последнего поиска для продолжения"""
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        cursor.execute("""
+            UPDATE search_history
+            SET last_checked_id = ?
+            WHERE user_id = ? AND model = ? AND end_id = ? AND status = 'in_progress'
+            ORDER BY started_at DESC
+            LIMIT 1
+        """, (current_id, user_id, model, end_id))
+        conn.commit()
+        conn.close()
+    
+    def get_last_search_state(self, user_id: int) -> Optional[Dict]:
+        """Получить состояние для продолжения последнего поиска"""
+        search = self.get_last_search(user_id)
+        if not search:
+            return None
+        
+        return {
+            'search_id': search['id'],
+            'model': search['model'],
+            'current_id': search['last_checked_id'] + 1,
+            'end_id': search['end_id']
+        }
+    
+    def get_bot_settings(self) -> Dict:
+        """Получить настройки бота"""
+        access_mode = self.get_setting('access_mode', 'all')
+        return {
+            'access_mode': access_mode
+        }
+    
+    def update_bot_settings(self, access_mode: str = None):
+        """Обновить настройки бота"""
+        if access_mode:
+            self.set_setting('access_mode', access_mode)

@@ -6,6 +6,16 @@ import os
 
 PEEK_URL = "https://server.peek.tg/api/nft/gifts/search"
 
+# Актуальный список моделей подарков (обновляется вручную)
+AVAILABLE_MODELS = [
+    "EternalRose", "Evil Eye", "Blue Star", "Delicious",
+    "Red Packet", "Gold Bar", "Tiger", "Rabbit",
+    "Dragon", "Snake", "Horse", "Goat",
+    "Monkey", "Rooster", "Dog", "Pig",
+    "Green Star", "Purple Star", "Pink Star", "Aqua Star",
+    "Birthday Cake", "Valentine Bouquet", "Happy New Year"
+]
+
 class PeekAPI:
     def __init__(self):
         # Получаем настройки прокси из переменных окружения
@@ -43,8 +53,12 @@ class PeekAPI:
         
         import logging
         
+        # Нормализуем название модели - убираем пробелы для API
+        # API принимает слитные названия: EvilEye, BlueStar
+        model_for_api = model.replace(" ", "")
+        
         params = {
-            "name": model,
+            "name": model_for_api,
             "page": 1,
             "sortOrder": "asc",
             "giftNumber": gift_number,
@@ -183,3 +197,117 @@ class PeekAPI:
     async def close(self):
         if self.session and not self.session.closed:
             await self.session.close()
+    
+    @staticmethod
+    def format_summary(gifts: list) -> str:
+        """Форматирует итоговый список найденных подарков"""
+        if not gifts:
+            return "Подарки не найдены."
+        
+        lines = [
+            "📋 <b>ИТОГОВЫЙ СПИСОК НАЙДЕННЫХ ПОДАРКОВ</b>",
+            "━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        ]
+        
+        for i, gift in enumerate(gifts, 1):
+            number = gift.get("giftNumber", "?")
+            username = gift.get("username", "").replace("t.me/", "").lstrip("@")
+            owner = gift.get("owner", "Неизвестно")
+            gift_name = gift.get("giftName", gift.get("title", "?"))
+            
+            # Проверяем скрыт ли подарок
+            # Если есть previousOwner, значит был передан/продан
+            previous_owner = gift.get("previousOwner")
+            is_visible = gift.get("isVisible", True)  # По умолчанию видим
+            
+            visibility_status = "👁️ Открыт" if is_visible else "🔒 Скрыт"
+            
+            # Ссылка на профиль
+            if username:
+                profile_link = f"https://t.me/{username}"
+                owner_text = f"@{username}"
+            else:
+                profile_link = f"tg://user?id={gift.get('userId', '')}" if gift.get('userId') else None
+                owner_text = owner
+            
+            # Ссылка на подарок
+            from urllib.parse import quote
+            safe_name = str(gift_name).replace(" ", "")
+            gift_link = f"https://t.me/nft/{quote(safe_name)}-{number}"
+            
+            lines.append(f"{i}. 🎁 <b>{gift_name}</b> #{number}")
+            lines.append(f"   👤 {owner_text}")
+            if profile_link:
+                lines.append(f"   🔗 {profile_link}")
+            lines.append(f"   {visibility_status}")
+            lines.append(f"   🎁 {gift_link}\n")
+        
+        lines.append(f"━━━━━━━━━━━━━━━━━━━━━━━━━━")
+        lines.append(f"<b>Всего найдено:</b> {len(gifts)}")
+        
+        return "\n".join(lines)
+
+
+# Глобальный экземпляр API
+api = PeekAPI()
+
+async def peek_gift_info(gift_id: int, model: str) -> dict:
+    """Обёртка для получения информации о подарке"""
+    gift = await api.get_gift(model, gift_id)
+    if gift:
+        return {
+            'found': True,
+            'giftNumber': gift.get('giftNumber', gift_id),
+            'username': gift.get('username', '').replace('t.me/', '').lstrip('@'),
+            'owner': gift.get('owner'),
+            'is_visible': gift.get('isVisible', True),
+            'rarity': f"{gift.get('rarityModel', 0)}%",
+            'attributes': gift,
+            'giftName': gift.get('giftName', model),
+            'title': gift.get('title', model)
+        }
+    else:
+        return {
+            'found': False
+        }
+
+def format_summary(gifts: list, model: str) -> str:
+    """Форматирует итоговый список найденных подарков"""
+    if not gifts:
+        return "Подарки не найдены."
+    
+    lines = [
+        "📋 <b>ИТОГОВЫЙ СПИСОК НАЙДЕННЫХ ПОДАРКОВ</b>",
+        f"🎁 Модель: <b>{model}</b>",
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+    ]
+    
+    for i, gift_data in enumerate(gifts, 1):
+        number = gift_data.get("giftNumber", "?")
+        username = gift_data.get("username", "")
+        
+        visibility_status = "👁️ Открыт" if gift_data.get('is_visible', True) else "🔒 Скрыт"
+        
+        # Ссылка на профиль
+        if username:
+            profile_link = f"https://t.me/{username}"
+            owner_text = f"@{username}"
+        else:
+            profile_link = "-"
+            owner_text = "Неизвестно"
+        
+        # Ссылка на подарок
+        from urllib.parse import quote
+        safe_name = model.replace(" ", "")
+        gift_link = f"https://t.me/nft/{quote(safe_name)}-{number}"
+        
+        lines.append(f"{i}. 🎁 <b>{model}</b> #{number}")
+        lines.append(f"   👤 {owner_text}")
+        lines.append(f"   🔗 {profile_link}")
+        lines.append(f"   {visibility_status}")
+        lines.append(f"   🎁 {gift_link}\n")
+    
+    lines.append(f"━━━━━━━━━━━━━━━━━━━━━━━━━━")
+    lines.append(f"<b>Всего найдено:</b> {len(gifts)}")
+    
+    return "\n".join(lines)

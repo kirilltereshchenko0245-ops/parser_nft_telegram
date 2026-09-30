@@ -3,21 +3,25 @@ from aiogram.utils.keyboard import ReplyKeyboardBuilder, InlineKeyboardBuilder
 
 # === ГЛАВНОЕ МЕНЮ ===
 
-def main_menu_keyboard(is_admin: bool = False):
+def main_menu_keyboard(is_admin: bool = False, is_premium: bool = False):
     """Главное меню бота"""
     builder = ReplyKeyboardBuilder()
     
     builder.row(
         KeyboardButton(text="🔍 Начать поиск"),
+        KeyboardButton(text="🔎 Поиск по ID")
+    )
+    builder.row(
+        KeyboardButton(text="📋 Список подарков"),
         KeyboardButton(text="📊 Профиль")
     )
     builder.row(
-        KeyboardButton(text="📜 История"),
-        KeyboardButton(text="⏭️ Продолжить")
-    )
-    builder.row(
+        KeyboardButton(text="⏭️ Продолжить"),
         KeyboardButton(text="ℹ️ Помощь")
     )
+    
+    if not is_premium:
+        builder.row(KeyboardButton(text="⭐ Купить Premium"))
     
     if is_admin:
         builder.row(KeyboardButton(text="⚙️ Админка"))
@@ -115,38 +119,6 @@ def gift_result_keyboard(gift_number: int, username: str = None, gift_name: str 
     
     return builder.as_markup()
 
-# === ИСТОРИЯ ===
-
-def history_pagination_keyboard(page: int, total_pages: int, has_prev: bool, has_next: bool):
-    """Пагинация для истории"""
-    builder = InlineKeyboardBuilder()
-    
-    buttons = []
-    if has_prev:
-        buttons.append(InlineKeyboardButton(text="⬅️", callback_data=f"history_page_{page-1}"))
-    
-    buttons.append(InlineKeyboardButton(text=f"{page}/{total_pages}", callback_data="history_current"))
-    
-    if has_next:
-        buttons.append(InlineKeyboardButton(text="➡️", callback_data=f"history_page_{page+1}"))
-    
-    builder.row(*buttons)
-    
-    return builder.as_markup()
-
-def search_detail_keyboard(search_id: int):
-    """Кнопки для детальной информации о поиске"""
-    builder = InlineKeyboardBuilder()
-    
-    builder.row(
-        InlineKeyboardButton(text="📋 Показать найденные", callback_data=f"show_gifts_{search_id}")
-    )
-    builder.row(
-        InlineKeyboardButton(text="🔙 К истории", callback_data="back_to_history")
-    )
-    
-    return builder.as_markup()
-
 # === ПРОФИЛЬ ===
 
 def profile_keyboard():
@@ -154,11 +126,28 @@ def profile_keyboard():
     builder = InlineKeyboardBuilder()
     
     builder.row(
-        InlineKeyboardButton(text="📜 История поисков", callback_data="show_history")
-    )
-    builder.row(
         InlineKeyboardButton(text="💬 Связаться с разработчиком", url="https://t.me/kod30")
     )
+    
+    return builder.as_markup()
+
+def models_list_keyboard(page: int = 1, per_page: int = 10, total: int = 0):
+    """Клавиатура для списка моделей с пагинацией"""
+    builder = InlineKeyboardBuilder()
+    
+    total_pages = (total + per_page - 1) // per_page
+    
+    buttons = []
+    if page > 1:
+        buttons.append(InlineKeyboardButton(text="⬅️", callback_data=f"models_page_{page-1}"))
+    
+    buttons.append(InlineKeyboardButton(text=f"{page}/{total_pages}", callback_data="models_current"))
+    
+    if page < total_pages:
+        buttons.append(InlineKeyboardButton(text="➡️", callback_data=f"models_page_{page+1}"))
+    
+    if buttons:
+        builder.row(*buttons)
     
     return builder.as_markup()
 
@@ -171,6 +160,47 @@ def continue_search_keyboard():
     builder.row(
         InlineKeyboardButton(text="✅ Продолжить", callback_data="continue_yes"),
         InlineKeyboardButton(text="❌ Новый поиск", callback_data="continue_no")
+    )
+    
+    return builder.as_markup()
+
+# === ПЛАТЕЖИ ===
+
+def payment_method_keyboard():
+    """Выбор метода оплаты"""
+    builder = InlineKeyboardBuilder()
+    
+    builder.row(
+        InlineKeyboardButton(text="💎 CryptoBot", callback_data="pay_cryptobot")
+    )
+    builder.row(
+        InlineKeyboardButton(text="🚀 XRocket", callback_data="pay_xrocket")
+    )
+    builder.row(
+        InlineKeyboardButton(text="💬 Связаться с поддержкой", url="https://t.me/kod30")
+    )
+    
+    return builder.as_markup()
+
+def stop_parsing_keyboard():
+    """Кнопка остановки парсинга"""
+    builder = InlineKeyboardBuilder()
+    
+    builder.row(
+        InlineKeyboardButton(text="⏹️ Остановить", callback_data="stop_parsing")
+    )
+    
+    return builder.as_markup()
+
+def continue_parsing_keyboard():
+    """Продолжить парсинг после остановки"""
+    builder = InlineKeyboardBuilder()
+    
+    builder.row(
+        InlineKeyboardButton(text="▶️ Продолжить", callback_data="continue_parsing")
+    )
+    builder.row(
+        InlineKeyboardButton(text="🔙 В меню", callback_data="back_to_menu")
     )
     
     return builder.as_markup()
