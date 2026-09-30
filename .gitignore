@@ -4,6 +4,7 @@ __pycache__/
 *.session
 *.session-journal
 parser.db
+bot_database.db
 venv/
 *.log
 .vscode/
