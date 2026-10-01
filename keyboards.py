@@ -12,11 +12,14 @@ def main_menu_keyboard(is_admin: bool = False, is_premium: bool = False, is_nonu
         KeyboardButton(text="🔎 Поиск по ID")
     )
     builder.row(
-        KeyboardButton(text="📋 Список подарков"),
-        KeyboardButton(text="📊 Профиль")
+        KeyboardButton(text="🎲 Случайные подарки"),
+        KeyboardButton(text="📋 Список подарков")
     )
     builder.row(
-        KeyboardButton(text="⏭️ Продолжить"),
+        KeyboardButton(text="📊 Профиль"),
+        KeyboardButton(text="⏭️ Продолжить")
+    )
+    builder.row(
         KeyboardButton(text="ℹ️ Помощь")
     )
     

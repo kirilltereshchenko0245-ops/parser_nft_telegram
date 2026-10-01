@@ -6,7 +6,7 @@ import os
 
 PEEK_URL = "https://server.peek.tg/api/nft/gifts/search"
 
-# Актуальный список моделей подарков (из Telegram)
+# Актуальный список моделей подарков (из Telegram) - ПОЛНЫЙ СПИСОК 55 шт
 AVAILABLE_MODELS = [
     "PreciousPeach", "PlushPepe", "HeroicHelmet", "MightyArm", "IonGem",
     "DurovsCap", "NailBracelet", "PerfumeBottle", "MagicPotion", "MiniOscar",
@@ -18,7 +18,9 @@ AVAILABLE_MODELS = [
     "PetSnake", "GingerCookie", "FreshSocks", "BerryBox", "InputKey",
     "VictoryMedal", "HypnoLollipop", "SnoopCigar", "EvilEye", "SpringBasket",
     "ValentineBox", "LushBouquet", "RecordPlayer", "InstantRamen", "HexPot",
-    "SnakeBox", "IonicDryer", "HomemadeCake", "SpicedWine", "SantaHat"
+    "SnakeBox", "IonicDryer", "HomemadeCake", "SpicedWine", "SantaHat",
+    # Добавлены недостающие:
+    "EternalRose", "MoneyPot", "BlueStar", "RedRibbon", "GoldenTrophy"
 ]
 
 # Функция для правильной капитализации (каждое слово с большой буквы, без пробелов)
@@ -338,11 +340,17 @@ async def peek_gift_info(gift_id: int, model: str) -> dict:
     """Обёртка для получения информации о подарке"""
     gift = await api.get_gift(model, gift_id)
     if gift:
+        import logging
+        
         username = gift.get('username', '').replace('t.me/', '').lstrip('@')
         
         # Правильное определение видимости:
         # Если username пустой - подарок скрыт в профиле
         is_actually_visible = bool(username)
+        
+        # DEBUG: Логирование isUpgraded из API
+        is_upgraded_raw = gift.get('isUpgraded', False)
+        logging.info(f"API Response for gift {gift_id}: isUpgraded={is_upgraded_raw}, type={type(is_upgraded_raw)}")
         
         return {
             'found': True,
@@ -351,7 +359,7 @@ async def peek_gift_info(gift_id: int, model: str) -> dict:
             'owner': gift.get('owner'),
             'user_id': gift.get('userId'),  # ID владельца
             'is_visible': is_actually_visible,  # Реальная видимость!
-            'is_upgraded': gift.get('isUpgraded', False),  # Улучшен ли
+            'is_upgraded': is_upgraded_raw,  # Улучшен ли
             'rarity': f"{gift.get('rarityModel', 0)}%",
             'attributes': gift,
             'giftName': gift.get('giftName', model),
@@ -420,5 +428,88 @@ def format_summary(gifts: list, model: str) -> list:
     # Добавить финальную статистику к последнему сообщению
     if messages:
         messages[-1] += f"━━━━━━━━━━━━━━━━━━━━━━━━━━\n<b>Всего найдено:</b> {len(gifts)}"
+    
+    return messages
+
+
+def format_random_summary(gifts: list, requested_count: int) -> list:
+    """
+    Форматирует итоговый список случайно найденных подарков
+    Группирует по моделям
+    """
+    if not gifts:
+        return ["Подарки не найдены."]
+    
+    # Группируем по моделям
+    by_model = {}
+    for gift in gifts:
+        model = gift.get('giftName') or gift.get('title', 'Unknown')
+        if model not in by_model:
+            by_model[model] = []
+        by_model[model].append(gift)
+    
+    messages = []
+    current_message = (
+        "📋 <b>СЛУЧАЙНЫЕ НАЙДЕННЫЕ ПОДАРКИ</b>\n"
+        f"🎲 Запрошено: <b>{requested_count}</b>\n"
+        f"✅ Найдено: <b>{len(gifts)}</b>\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+    )
+    
+    gift_index = 1
+    for model, model_gifts in by_model.items():
+        model_header = f"🎁 <b>{model}</b> ({len(model_gifts)} шт.)\n\n"
+        
+        if len(current_message + model_header) > 3800:
+            messages.append(current_message)
+            current_message = f"📋 <b>Продолжение ({len(messages) + 1})</b>\n\n" + model_header
+        else:
+            current_message += model_header
+        
+        for gift_data in model_gifts:
+            number = gift_data.get("giftNumber", "?")
+            username = gift_data.get("username", "")
+            
+            visibility_status = "👁️ Открыт" if gift_data.get('is_visible', True) else "🔒 Скрыт"
+            
+            # Ссылка на профиль
+            if username:
+                profile_link = f"https://t.me/{username}"
+                owner_text = f"@{username}"
+            else:
+                profile_link = "-"
+                owner_text = "Неизвестно"
+            
+            # Ссылка на подарок
+            from urllib.parse import quote
+            safe_name = model.replace(" ", "")
+            gift_link = f"https://t.me/nft/{quote(safe_name)}-{number}"
+            
+            gift_text = (
+                f"{gift_index}. #{number}\n"
+                f"   👤 {owner_text}\n"
+                f"   🔗 {profile_link}\n"
+                f"   {visibility_status}\n"
+                f"   🎁 {gift_link}\n\n"
+            )
+            
+            # Проверка лимита
+            if len(current_message + gift_text) > 3800:
+                messages.append(current_message)
+                current_message = f"📋 <b>Продолжение ({len(messages) + 1})</b>\n\n" + gift_text
+            else:
+                current_message += gift_text
+            
+            gift_index += 1
+        
+        current_message += "\n"
+    
+    # Добавить последнее сообщение
+    if current_message:
+        messages.append(current_message)
+    
+    # Добавить финальную статистику
+    if messages:
+        messages[-1] += f"━━━━━━━━━━━━━━━━━━━━━━━━━━\n<b>Всего найдено:</b> {len(gifts)} из {requested_count}"
     
     return messages
