@@ -24,7 +24,7 @@ AVAILABLE_MODELS = [
     'JoyfulBundle', 'EasterEgg', 'JellyBunny', 'RestlessJar', 'PrettyPosy', 'SwagBag', 'StellarRocket',
     'PetSnake', 'GingerCookie', 'FreshSocks', 'BerryBox', 'InputKey', 'VictoryMedal', 'HypnoLollipop',
     'SnoopCigar', 'EvilEye', 'SpringBasket', 'ValentineBox', 'LushBouquet', 'RecordPlayer', 'InstantRamen',
-    'HexPot', 'SnakeBox', 'IonicDryer', 'HomemadeCake', 'SpicedWine', 'SantaHat',
+    'HexPot', 'SnakeBox', 'IonicDryer', 'HomemadeCake', 'SpicedWine', 'SantaHat', 'EternalRose',
 ]
 
 
