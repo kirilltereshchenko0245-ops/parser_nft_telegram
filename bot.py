@@ -37,7 +37,7 @@ EDIT_INTERVAL = 1.5       # не чаще раза в N секунд обнов�
 
 bot = Bot(TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 dp = Dispatcher(storage=MemoryStorage())
-db = Database()
+db = Database(os.getenv('DATABASE_PATH', 'bot_database.db'))
 api = PeekAPI(CONCURRENCY)
 ACTIVE: set[int] = set()  # пользователи с запущенным поиском
 
@@ -320,12 +320,15 @@ async def run_search(chat: Message, uid: int, model: str, start: int, end: int, 
                 results.update(zip(failed, again))
                 failed = [n for n, r in results.items() if isinstance(r, Exception)]
 
-            # ── весь пакет упал: не «сжигаем» ID, ждём и пробуем снова
-            if len(failed) == len(nums):
+            # Не продвигаем checkpoint, если хотя бы один ID не удалось проверить.
+            # Иначе при resume этот ID был бы навсегда пропущен как «не найденный».
+            if failed:
                 fail_streak += 1
-                log.warning('Batch %s-%s failed (%s/3): %s', nums[0], nums[-1], fail_streak, results[nums[0]])
+                sample = results[failed[0]]
+                log.warning('Batch %s-%s has %s failed IDs (%s/3): %s',
+                            nums[0], nums[-1], len(failed), fail_streak, sample)
                 if fail_streak >= 3:
-                    raise RuntimeError('Peek не отвечает')
+                    raise RuntimeError(f'Peek не отвечает; не проверен ID #{failed[0]}')
                 await asyncio.sleep(5 * fail_streak)
                 continue
             fail_streak = 0
@@ -392,16 +395,26 @@ async def id_number(m: Message, state: FSMContext):
     if not text.isdigit() or int(text) <= 0:
         return await m.answer('❌ Номер должен быть положительным числом.')
     n = int(text)
+    uid = m.from_user.id
+    if not allowed(uid, 1):
+        return await m.answer('🆓 <b>Лимит Trial закончился.</b>\n\n💎 Подключите Premium для продолжения.')
+    if uid in ACTIVE:
+        return await m.answer('⏳ Сначала завершите или остановите текущую проверку.')
     model = (await state.get_data())['model']
     await state.clear()
-    await m.answer('🔎 Проверяю…', reply_markup=user_menu(m.from_user.id))
+    ACTIVE.add(uid)
+    await m.answer('🔎 Проверяю…', reply_markup=user_menu(uid))
     try:
         g = await api.get_gift(model, n)
+        if not is_unlimited(uid):
+            db.consume_trial(uid, 1)
+        if not g:
+            return await m.answer(f'🔎 {ui.esc(ui.pretty(model))} <code>#{n}</code> — не найден.')
+        await send_card(m, uid, g, large=True)
     except RuntimeError as e:
-        return await m.answer(f'⚠️ {ui.esc(e)}')
-    if not g:
-        return await m.answer(f'🔎 {ui.esc(ui.pretty(model))} <code>#{n}</code> — не найден.')
-    await send_card(m, m.from_user.id, g, large=True)
+        await m.answer(f'⚠️ {ui.esc(e)}\nПроверка не засчитана в Trial.')
+    finally:
+        ACTIVE.discard(uid)
 
 
 # ───────────────────────── случайный поиск ─────────────────────────
@@ -424,21 +437,40 @@ async def random_count(m: Message, state: FSMContext):
         return await m.answer(f'🆓 Недостаточно проверок: осталось <b>{trial_left(uid)}</b>.')
     await state.clear()
 
+    if uid in ACTIVE:
+        return await m.answer('⏳ У вас уже идёт проверка. Дождитесь её завершения или остановите.')
     model = random.choice(AVAILABLE_MODELS)
     numbers = random.sample(range(1, 100_000), count)
+    ACTIVE.add(uid)
+    db.clear_stop(uid)
     status = await m.answer(f'🎲 <b>{ui.esc(ui.pretty(model))}</b>\n🔢 Проверяю {count} случайных ID…',
-                            reply_markup=user_menu(uid))
-    results = await asyncio.gather(*(api.get_gift(model, n) for n in numbers), return_exceptions=True)
-    found = 0
-    for r in results:
-        if isinstance(r, dict):
-            found += 1
-            await send_card(m, uid, r)
-    if not is_unlimited(uid):
-        db.consume_trial(uid, count)
-    errors = sum(isinstance(r, Exception) for r in results)
-    tail = f'\n⚠️ Ошибок сети: {errors}' if errors else ''
-    await edit(status, f'🎲 <b>Готово</b>\n{ui.block(ui.kv("🎁", "Модель", ui.esc(ui.pretty(model))), ui.kv("✨", "Найдено", f"{found} из {count}"))}{tail}')
+                            reply_markup=kb.running_kb())
+    found = checked = errors = 0
+    stopped = False
+    try:
+        for n in numbers:
+            if db.should_stop(uid):
+                stopped = True
+                break
+            try:
+                gift = await api.get_gift(model, n)
+            except Exception as exc:
+                errors += 1
+                log.warning('Random lookup failed for #%s: %s', n, exc)
+            else:
+                checked += 1
+                if gift:
+                    found += 1
+                    await send_card(m, uid, gift)
+            if not is_unlimited(uid):
+                db.consume_trial(uid, 1)
+        tail = f'\n⚠️ Ошибок сети: {errors}' if errors else ''
+        state_label = '⏹ <b>Остановлено</b>' if stopped else '🎲 <b>Готово</b>'
+        processed = checked + errors
+        await edit(status, f'{state_label}\n{ui.block(ui.kv("🎁", "Модель", ui.esc(ui.pretty(model))), ui.kv("🔢", "Проверено", f"{processed} из {count}"), ui.kv("✨", "Найдено", found))}{tail}', user_menu(uid))
+    finally:
+        ACTIVE.discard(uid)
+        db.clear_stop(uid)
 
 
 # ───────────────────────── карточки / избранное ─────────────────────────

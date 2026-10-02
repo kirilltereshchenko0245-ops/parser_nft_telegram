@@ -11,7 +11,7 @@ import re
 
 from peek_api import gift_url
 
-VERSION = '5.1'
+VERSION = '5.2'
 TRIAL_DEFAULT = 25
 
 # ───────────────────────── «шрифты» ─────────────────────────

@@ -1,11 +1,7 @@
 .env
+.venv/
 __pycache__/
-*.pyc
-*.session
-*.session-journal
-parser.db
+*.py[cod]
 bot_database.db
-venv/
-*.log
-.vscode/
-.idea/
+bot_database.db-shm
+bot_database.db-wal

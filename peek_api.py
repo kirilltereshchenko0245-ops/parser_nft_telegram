@@ -138,7 +138,7 @@ class PeekAPI:
             connector = ProxyConnector.from_url(self.proxy_url, rdns=True)
         self.session = aiohttp.ClientSession(
             connector=connector, timeout=self.timeout,
-            headers={'User-Agent': 'GiftParser/5.1', 'Accept': 'application/json, text/plain, */*',
+            headers={'User-Agent': 'GiftParser/5.2', 'Accept': 'application/json, text/plain, */*',
                      'Origin': 'https://peek.tg', 'Referer': 'https://peek.tg/'})
 
     async def get_gift(self, model, number, retries=4):

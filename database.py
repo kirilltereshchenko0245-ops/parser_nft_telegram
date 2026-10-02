@@ -1,4 +1,5 @@
 import json
+import os
 import sqlite3
 from contextlib import contextmanager
 
@@ -8,6 +9,8 @@ class Database:
 
     def __init__(self, path='bot_database.db'):
         self.path = path
+        parent = os.path.dirname(os.path.abspath(path))
+        os.makedirs(parent, exist_ok=True)
         self.stop_flags = set()
         self._init()
 
@@ -103,7 +106,8 @@ class Database:
 
     def set_ban(self, uid, value):
         with self._db() as c:
-            c.execute('UPDATE users SET is_banned=? WHERE user_id=?', (int(value), uid))
+            cur = c.execute('UPDATE users SET is_banned=? WHERE user_id=?', (int(value), uid))
+            return cur.rowcount > 0
 
     def set_premium(self, uid, value):
         with self._db() as c:
