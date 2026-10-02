@@ -1,63 +1,27 @@
-# 🎁 Telegram NFT Gift Parser Bot v2.1
+# GiftParser 5.0
 
-## 🚀 Быстрый старт
+Telegram NFT gift parser powered by Peek.tg.
 
-### 1. Локальный запуск:
-```powershell
-cd c:\parser\parser_nft_telegram
-python -m venv venv
-.\venv\Scripts\Activate.ps1
-pip install -r requirements.txt
-python bot.py
-```
+## Запуск
+1. Установить Python 3.11+.
+2. `pip install -r requirements.txt`
+3. Скопировать `.env.example` в `.env`.
+4. Заполнить `BOT_TOKEN` и `OWNER_ID`.
+5. `python bot.py`
 
-### 2. Деплой на Railway/Render:
-```powershell
-git add .
-git commit -m "v2.1: Full rewrite with payments"
-git push
-```
+V5 автоматически использует существующий `bot_database.db` и добавляет недостающие таблицы/поля. Секреты не хранятся в исходниках.
 
-## ✨ Основные функции:
-
-- 🔍 **Поиск по диапазону** - парсинг подарков
-- 🔎 **Поиск по ID** - найти конкретный подарок
-- 📋 **Список моделей** - все доступные подарки
-- ⏹️ **/stop** - остановка парсинга
-- ⭐ **Premium** - безлимитные поиски (5 TON)
-- ⚙️ **Админка** - управление пользователями
-- 📊 **Логи** - все действия в канал
-
-## 🎫 Лимиты:
-
-- **Trial:** 25 поисков бесплатно
-- **Premium:** безлимитно (5 TON)
-
-## 🔑 Настройка:
-
-1. Создать `.env`:
-```env
-BOT_TOKEN=ваш_токен_бота
-```
-
-2. В `bot.py` изменить `OWNER_ID` на ваш Telegram ID
-
-3. Запустить: `python bot.py`
-
-## 📋 API:
-
-- **CryptoBot:** 629296:AAw96aFWy4zy2Wz6t96lZU2HcccHN3CVyI5
-- **XRocket:** JWT токен (в payments.py)
-- **Логи:** -1003864916255
-
-## 🛠️ Техподдержка:
-
-- @kod30
-
-## 📝 Подробнее:
-
-См. `UPDATE_V2.1.md`
-
----
-
-**v2.1** | 2026-09-30 | @kod30
+## Основные возможности
+- поиск по модели и диапазону;
+- поиск конкретного ID;
+- продолжение остановленного поиска;
+- параллельные запросы к Peek;
+- retry / 403 / 429 / 5xx обработка;
+- история;
+- избранное;
+- случайный поиск;
+- каталог моделей;
+- экспорт результатов в TXT;
+- профиль и статистика;
+- админская статистика и бан;
+- аккуратные Telegram-карточки без ASCII-рамок.

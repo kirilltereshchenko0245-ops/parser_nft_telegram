@@ -1,240 +1,37 @@
-from aiogram.types import ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardMarkup, InlineKeyboardButton
-from aiogram.utils.keyboard import ReplyKeyboardBuilder, InlineKeyboardBuilder
+from aiogram.utils.keyboard import ReplyKeyboardBuilder,InlineKeyboardBuilder
+from aiogram.types import KeyboardButton,InlineKeyboardButton
+from urllib.parse import quote
 
-# === ГЛАВНОЕ МЕНЮ ===
-
-def main_menu_keyboard(is_admin: bool = False, is_premium: bool = False, is_nonupgraded_premium: bool = False):
-    """Главное меню бота"""
-    builder = ReplyKeyboardBuilder()
-    
-    builder.row(
-        KeyboardButton(text="🔍 Начать поиск"),
-        KeyboardButton(text="🔎 Поиск по ID")
-    )
-    builder.row(
-        KeyboardButton(text="🎲 Случайные подарки"),
-        KeyboardButton(text="📋 Список подарков")
-    )
-    builder.row(
-        KeyboardButton(text="📊 Профиль"),
-        KeyboardButton(text="⏭️ Продолжить")
-    )
-    builder.row(
-        KeyboardButton(text="ℹ️ Помощь")
-    )
-    
-    if not is_premium:
-        builder.row(KeyboardButton(text="⭐ Купить Premium"))
-    
-    if is_premium and not is_nonupgraded_premium:
-        builder.row(KeyboardButton(text="💎 Купить подписку на неулучшенные"))
-    
-    if is_admin:
-        builder.row(KeyboardButton(text="⚙️ Админка"))
-    
-    return builder.as_markup(resize_keyboard=True)
-
-# === АДМИНКА ===
-
-def admin_menu_keyboard():
-    """Меню админки"""
-    builder = ReplyKeyboardBuilder()
-    
-    builder.row(
-        KeyboardButton(text="👥 Пользователи"),
-        KeyboardButton(text="📈 Статистика")
-    )
-    builder.row(
-        KeyboardButton(text="🔧 Настройки"),
-        KeyboardButton(text="🚫 Баны")
-    )
-    builder.row(
-        KeyboardButton(text="🔙 Назад")
-    )
-    
-    return builder.as_markup(resize_keyboard=True)
-
-def admin_settings_keyboard(mode: str):
-    """Настройки доступа к боту"""
-    builder = InlineKeyboardBuilder()
-    
-    builder.row(
-        InlineKeyboardButton(
-            text=f"{'✅' if mode == 'owner_only' else '⬜'} Только владелец",
-            callback_data="settings_owner_only"
-        )
-    )
-    builder.row(
-        InlineKeyboardButton(
-            text=f"{'✅' if mode == 'all' else '⬜'} Все пользователи",
-            callback_data="settings_all"
-        )
-    )
-    
-    return builder.as_markup()
-
-def ban_user_keyboard(user_id: int):
-    """Кнопки для управления пользователем"""
-    builder = InlineKeyboardBuilder()
-    
-    builder.row(
-        InlineKeyboardButton(text="🚫 Забанить", callback_data=f"ban_{user_id}"),
-        InlineKeyboardButton(text="✅ Разбанить", callback_data=f"unban_{user_id}")
-    )
-    builder.row(
-        InlineKeyboardButton(text="⭐ Дать Premium", callback_data=f"premium_give_{user_id}"),
-        InlineKeyboardButton(text="❌ Забрать Premium", callback_data=f"premium_remove_{user_id}")
-    )
-    builder.row(
-        InlineKeyboardButton(text="🎫 +10 поисков", callback_data=f"trials_add10_{user_id}"),
-        InlineKeyboardButton(text="🎫 +25 поисков", callback_data=f"trials_add25_{user_id}")
-    )
-    builder.row(
-        InlineKeyboardButton(text="🎫 Установить поиски", callback_data=f"trials_set_{user_id}")
-    )
-    
-    return builder.as_markup()
-
-# === ПОИСК ===
-
-def cancel_keyboard():
-    """Кнопка отмены"""
-    builder = ReplyKeyboardBuilder()
-    builder.row(KeyboardButton(text="❌ Отмена"))
-    return builder.as_markup(resize_keyboard=True)
-
-def stop_search_keyboard():
-    """Кнопка остановки поиска"""
-    builder = ReplyKeyboardBuilder()
-    builder.row(KeyboardButton(text="⏹️ Стоп"))
-    return builder.as_markup(resize_keyboard=True)
-
-# === РЕЗУЛЬТАТЫ ПОИСКА ===
-
-def gift_result_keyboard(gift_number: int, username: str = None, gift_name: str = None):
-    """Кнопки для найденного подарка"""
-    builder = InlineKeyboardBuilder()
-    
-    # Кнопка перехода к владельцу
-    if username:
-        clean_username = username.replace('t.me/', '').lstrip('@')
-        builder.row(
-            InlineKeyboardButton(
-                text="👤 Перейти к владельцу",
-                url=f"https://t.me/{clean_username}"
-            )
-        )
-    
-    # Кнопка просмотра подарка
-    if gift_name and gift_number:
-        from urllib.parse import quote
-        safe_name = str(gift_name).replace(" ", "")
-        builder.row(
-            InlineKeyboardButton(
-                text="🎁 Посмотреть подарок",
-                url=f"https://t.me/nft/{quote(safe_name)}-{gift_number}"
-            )
-        )
-    
-    return builder.as_markup()
-
-# === ПРОФИЛЬ ===
-
-def profile_keyboard():
-    """Кнопки в профиле"""
-    builder = InlineKeyboardBuilder()
-    
-    builder.row(
-        InlineKeyboardButton(text="💬 Связаться с разработчиком", url="https://t.me/kod30")
-    )
-    
-    return builder.as_markup()
-
-def models_list_keyboard(page: int = 1, per_page: int = 10, total: int = 0):
-    """Клавиатура для списка моделей с пагинацией"""
-    builder = InlineKeyboardBuilder()
-    
-    total_pages = (total + per_page - 1) // per_page
-    
-    buttons = []
-    if page > 1:
-        buttons.append(InlineKeyboardButton(text="⬅️", callback_data=f"models_page_{page-1}"))
-    
-    buttons.append(InlineKeyboardButton(text=f"{page}/{total_pages}", callback_data="models_current"))
-    
-    if page < total_pages:
-        buttons.append(InlineKeyboardButton(text="➡️", callback_data=f"models_page_{page+1}"))
-    
-    if buttons:
-        builder.row(*buttons)
-    
-    return builder.as_markup()
-
-# === ПРОДОЛЖЕНИЕ ПОИСКА ===
-
-def continue_search_keyboard():
-    """Продолжить последний поиск"""
-    builder = InlineKeyboardBuilder()
-    
-    builder.row(
-        InlineKeyboardButton(text="✅ Продолжить", callback_data="continue_yes"),
-        InlineKeyboardButton(text="❌ Новый поиск", callback_data="continue_no")
-    )
-    
-    return builder.as_markup()
-
-# === ПЛАТЕЖИ ===
-
-def payment_method_keyboard(is_nonupgraded: bool = False):
-    """Выбор метода оплаты"""
-    builder = InlineKeyboardBuilder()
-    
-    callback_prefix = "pay_nonupgraded" if is_nonupgraded else "pay"
-    
-    builder.row(
-        InlineKeyboardButton(text="💎 CryptoBot", callback_data=f"{callback_prefix}_cryptobot")
-    )
-    builder.row(
-        InlineKeyboardButton(text="🚀 XRocket", callback_data=f"{callback_prefix}_xrocket")
-    )
-    builder.row(
-        InlineKeyboardButton(text="💬 Связаться с поддержкой", url="https://t.me/kod30")
-    )
-    
-    return builder.as_markup()
-
-def stop_parsing_keyboard():
-    """Кнопка остановки парсинга"""
-    builder = InlineKeyboardBuilder()
-    
-    builder.row(
-        InlineKeyboardButton(text="⏹️ Остановить", callback_data="stop_parsing")
-    )
-    
-    return builder.as_markup()
-
-def continue_parsing_keyboard():
-    """Продолжить парсинг после остановки"""
-    builder = InlineKeyboardBuilder()
-    
-    builder.row(
-        InlineKeyboardButton(text="▶️ Продолжить", callback_data="continue_parsing")
-    )
-    builder.row(
-        InlineKeyboardButton(text="🔙 В меню", callback_data="back_to_menu")
-    )
-    
-    return builder.as_markup()
-
-def search_filter_keyboard():
-    """Выбор фильтра поиска"""
-    builder = InlineKeyboardBuilder()
-    
-    builder.row(
-        InlineKeyboardButton(text="🎁 Все подарки", callback_data="filter_all")
-    )
-    builder.row(
-        InlineKeyboardButton(text="💎 Только неулучшенные", callback_data="filter_nonupgraded")
-    )
-    
-    return builder.as_markup()
+def main_menu(admin=False,premium=False):
+    b=ReplyKeyboardBuilder();
+    b.row(KeyboardButton(text='🔎 Новый поиск'),KeyboardButton(text='🆔 Поиск по ID'))
+    b.row(KeyboardButton(text='🎲 Случайный'),KeyboardButton(text='📚 История'))
+    b.row(KeyboardButton(text='⭐ Избранное'),KeyboardButton(text='🎁 Модели'))
+    b.row(KeyboardButton(text='📊 Профиль'),KeyboardButton(text='❓ Помощь'))
+    if not premium:b.row(KeyboardButton(text='💎 Premium'))
+    if admin:b.row(KeyboardButton(text='⚙️ Админка'))
+    return b.as_markup(resize_keyboard=True,input_field_placeholder='Выберите действие…')
+def cancel():
+    b=ReplyKeyboardBuilder();b.add(KeyboardButton(text='✖️ Отмена'));return b.as_markup(resize_keyboard=True)
+def stop():
+    b=ReplyKeyboardBuilder();b.add(KeyboardButton(text='⏹ Остановить'));return b.as_markup(resize_keyboard=True)
+def gift_card(g,favorite=False):
+    b=InlineKeyboardBuilder();n=g.get('giftNumber');name=(g.get('giftName') or g.get('model') or '').replace(' ','')
+    row=[]
+    if g.get('username'):row.append(InlineKeyboardButton(text='👤 Владелец',url=f'https://t.me/{g["username"]}'))
+    if name and n is not None:row.append(InlineKeyboardButton(text='🎁 Открыть',url=f'https://t.me/nft/{quote(name)}-{n}'))
+    if row:b.row(*row)
+    if n is not None:b.row(InlineKeyboardButton(text='★ Убрать из избранного' if favorite else '☆ В избранное',callback_data=f'fav:{n}:{quote(g.get("model") or "")}'))
+    return b.as_markup()
+def history_item(sid,status):
+    b=InlineKeyboardBuilder();b.row(InlineKeyboardButton(text='📋 Результаты',callback_data=f'hist:{sid}'))
+    if status in ('stopped','error'):b.row(InlineKeyboardButton(text='▶️ Продолжить',callback_data=f'resume:{sid}'))
+    return b.as_markup()
+def models_nav(page,total,per_page=8):
+    b=InlineKeyboardBuilder();pages=max(1,(total+per_page-1)//per_page);row=[]
+    if page>1:row.append(InlineKeyboardButton(text='‹',callback_data=f'models:{page-1}'))
+    row.append(InlineKeyboardButton(text=f'{page}/{pages}',callback_data='noop'))
+    if page<pages:row.append(InlineKeyboardButton(text='›',callback_data=f'models:{page+1}'))
+    b.row(*row);return b.as_markup()
+def admin_menu():
+    b=InlineKeyboardBuilder();b.row(InlineKeyboardButton(text='📈 Статистика',callback_data='adm:stats'));b.row(InlineKeyboardButton(text='👥 Пользователи',callback_data='adm:users'));return b.as_markup()

@@ -1,1053 +1,250 @@
-"""
-🎁 Telegram NFT Gift Parser v3.0 CLEAN
-Без неулучшенных подарков, красивый дизайн
-"""
-
-import asyncio
-import logging
-import os
-from datetime import datetime
-
-from aiogram import Bot, Dispatcher, F
-from aiogram.filters import Command
-from aiogram.fsm.context import FSMContext
-from aiogram.fsm.state import State, StatesGroup
-from aiogram.fsm.storage.memory import MemoryStorage
-from aiogram.types import Message, CallbackQuery, ReplyKeyboardMarkup, KeyboardButton
-from aiogram.utils.keyboard import ReplyKeyboardBuilder, InlineKeyboardBuilder
-from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+import asyncio, html, logging, os, random, time
+from aiogram import Bot,Dispatcher,F
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
+from aiogram.filters import Command
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State,StatesGroup
+from aiogram.fsm.storage.memory import MemoryStorage
+from aiogram.types import Message,CallbackQuery,BufferedInputFile
 from dotenv import load_dotenv
-
 from database import Database
-from peek_api import peek_gift_info, AVAILABLE_MODELS, normalize_model_name
-from logger_channel import ChannelLogger
+from peek_api import PeekAPI,AVAILABLE_MODELS,normalize_model_name
+from keyboards import main_menu,cancel,stop,gift_card,history_item,models_nav,admin_menu
 
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# ⚙️ НАСТРОЙКИ
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+load_dotenv(); logging.basicConfig(level=logging.INFO,format='%(asctime)s | %(levelname)s | %(message)s'); log=logging.getLogger('giftparser')
+TOKEN=os.getenv('BOT_TOKEN'); OWNER_ID=int(os.getenv('OWNER_ID','0')); CONCURRENCY=int(os.getenv('PEEK_CONCURRENCY','5'))
+if not TOKEN: raise RuntimeError('BOT_TOKEN не указан в .env')
+bot=Bot(TOKEN,default=DefaultBotProperties(parse_mode=ParseMode.HTML)); dp=Dispatcher(storage=MemoryStorage()); db=Database(); api=PeekAPI(CONCURRENCY)
 
-load_dotenv()
+class S(StatesGroup): model=State(); range=State(); id_model=State(); id_number=State(); random_count=State()
+def is_admin(uid): return uid==OWNER_ID
+def user_menu(uid):
+    u=db.get_user(uid) or {};return main_menu(is_admin(uid),bool(u.get('is_premium')))
 
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-OWNER_ID = int(os.getenv("OWNER_ID", "0"))
-LOG_CHANNEL_ID = int(os.getenv("LOG_CHANNEL_ID", "-1003864916255"))
+def gift_card_text(g):
+    name=html.escape(str(g.get('giftName') or g.get('model') or 'Telegram Gift'))
+    lines=[f'🎁 <b>{name}</b>',f'🆔 <code>#{g.get("giftNumber")}</code>']
+    for icon,label,key in [('✨','Модель','model'),('🌸','Узор','pattern'),('🌈','Фон','backdrop')]:
+        if g.get(key):lines.append(f'{icon} {label}: <code>{html.escape(str(g[key]))}</code>')
+    if g.get('username'):lines.append(f'👤 Владелец: <b>@{html.escape(str(g["username"]))}</b>')
+    elif g.get('userId'):lines.append(f'👤 Telegram ID: <code>{g["userId"]}</code>')
+    return '\n'.join(lines)
 
-if not BOT_TOKEN:
-    raise RuntimeError("❌ BOT_TOKEN не указан в .env")
+def parse_range(text):
+    t=text.strip().replace(' ','').replace('—','-').replace('–','-')
+    parts=t.split('-')
+    if len(parts)!=2:raise ValueError
+    a,b=map(int,parts)
+    if a<1 or b<a or b-a+1>10000:raise ValueError
+    return a,b
 
-# Логирование
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s'
-)
-logger = logging.getLogger(__name__)
+def progress_bar(done,total,width=12):
+    filled=int(width*done/total) if total else 0;return '█'*filled+'░'*(width-filled)
 
-# Инициализация
-bot = Bot(
-    token=BOT_TOKEN,
-    default=DefaultBotProperties(parse_mode=ParseMode.HTML)
-)
-storage = MemoryStorage()
-dp = Dispatcher(storage=storage)
-db = Database()
-channel_logger = ChannelLogger(bot)
-
-print("✅ Бот инициализирован")
-
-
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# 🎯 FSM СОСТОЯНИЯ
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-class SearchStates(StatesGroup):
-    waiting_for_model = State()
-    waiting_for_range = State()
-    waiting_for_id = State()
-    waiting_for_random_count = State()
-
-class AdminStates(StatesGroup):
-    waiting_for_user_id = State()
-    waiting_for_trials_count = State()
-
-
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# ⌨️ КЛАВИАТУРЫ
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-def main_menu(is_admin: bool = False, is_premium: bool = False) -> ReplyKeyboardMarkup:
-    """Главное меню"""
-    builder = ReplyKeyboardBuilder()
-    
-    builder.row(
-        KeyboardButton(text="🔍 Начать поиск"),
-        KeyboardButton(text="🎲 Случайный поиск")
-    )
-    builder.row(
-        KeyboardButton(text="🔎 Поиск по ID"),
-        KeyboardButton(text="📋 Список моделей")
-    )
-    builder.row(
-        KeyboardButton(text="📊 Профиль"),
-        KeyboardButton(text="ℹ️ Помощь")
-    )
-    
-    if not is_premium and not is_admin:
-        builder.row(KeyboardButton(text="⭐ Купить Premium"))
-    
-    if is_admin:
-        builder.row(KeyboardButton(text="⚙️ Админка"))
-    
-    return builder.as_markup(resize_keyboard=True)
-
-def cancel_keyboard() -> ReplyKeyboardMarkup:
-    """Кнопка отмены"""
-    builder = ReplyKeyboardBuilder()
-    builder.row(KeyboardButton(text="❌ Отмена"))
-    return builder.as_markup(resize_keyboard=True)
-
-def stop_keyboard() -> ReplyKeyboardMarkup:
-    """Кнопка остановки"""
-    builder = ReplyKeyboardBuilder()
-    builder.row(KeyboardButton(text="⏹️ Стоп"))
-    return builder.as_markup(resize_keyboard=True)
-
-def gift_inline_keyboard(gift_id: int, username: str = None, model: str = None) -> InlineKeyboardMarkup:
-    """Inline кнопки для подарка"""
-    builder = InlineKeyboardBuilder()
-    
-    if username:
-        builder.row(
-            InlineKeyboardButton(text="👤 Профиль", url=f"https://t.me/{username}")
-        )
-    
-    if model and gift_id:
-        safe_name = model.replace(" ", "")
-        builder.row(
-            InlineKeyboardButton(text="🎁 Открыть подарок", url=f"https://t.me/nft/{safe_name}-{gift_id}")
-        )
-    
-    return builder.as_markup()
-
-
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# 🛡️ MIDDLEWARE
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+def pretty_time(sec):
+    sec=max(0,int(sec));
+    if sec<60:return f'{sec}с'
+    return f'{sec//60}м {sec%60}с'
 
 @dp.message.middleware()
-async def check_access(handler, event: Message, data: dict):
-    """Проверка доступа к боту"""
-    user_id = event.from_user.id
-    username = event.from_user.username or "NoUsername"
-    
-    # Проверка бана
-    if db.is_banned(user_id):
-        await event.answer("🚫 <b>Вы заблокированы</b>")
-        return
-    
-    # Регистрация нового пользователя
-    user = db.get_user(user_id)
-    if not user:
-        db.add_user(user_id, username)
-        await channel_logger.log_action(user_id, username, "🆕 Новый пользователь")
-        logger.info(f"Новый пользователь: {user_id} (@{username})")
-    
-    return await handler(event, data)
+async def access(handler,event:Message,data):
+    if not event.from_user:return await handler(event,data)
+    uid=event.from_user.id;db.upsert_user(uid,event.from_user.username,event.from_user.first_name)
+    if db.is_banned(uid):await event.answer('🚫 <b>Доступ ограничен.</b>');return
+    return await handler(event,data)
 
+@dp.message(Command('start'))
+async def start(m:Message,state:FSMContext):
+    await state.clear();u=db.get_user(m.from_user.id) or {}; trial=u.get('trial_searches_left',25)
+    status='💎 Premium' if u.get('is_premium') else f'🆓 Trial · {trial} ID'
+    await m.answer(f'🎁 <b>GiftParser</b> <code>V5.0</code>\n\nБыстрый поиск Telegram NFT-подарков через Peek.tg.\n\n{status}\n\nВыберите действие 👇',reply_markup=user_menu(m.from_user.id))
 
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# 🏠 КОМАНДЫ
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+@dp.message(Command('stop'))
+@dp.message(F.text=='⏹ Остановить')
+async def stop_search(m:Message): db.stop(m.from_user.id);await m.answer('⏹ <b>Остановка запрошена.</b> Текущие запросы завершатся и прогресс сохранится.')
 
-@dp.message(Command("start"))
-async def cmd_start(message: Message, state: FSMContext):
-    """Старт бота"""
-    await state.clear()
-    
-    user_id = message.from_user.id
-    user = db.get_user(user_id)
-    is_admin = (user_id == OWNER_ID)
-    first_name = message.from_user.first_name or "друг"
-    
-    # Красивое приветствие как на скрине
-    welcome_text = (
-        f"<i>Привет, {first_name}!</i>\n\n"
-        "Рады видеть тебя в Gift Parser\n\n"
-        "<b>Бот предназначен для поиска любых NFT подарков</b>\n\n"
-        "<blockquote>Твой статус:\n"
-    )
-    
-    if is_admin:
-        welcome_text += "Твои лимиты:</blockquote>"
-        welcome_text += "\n\n👑 <b>Администратор (безлимит)</b>"
-    elif user and user['is_premium']:
-        welcome_text += "Твои лимиты:</blockquote>"
-        welcome_text += "\n\n⭐ <b>Premium (безлимит)</b>"
+@dp.message(F.text=='✖️ Отмена')
+async def cancel_action(m:Message,state:FSMContext):await state.clear();await m.answer('↩️ Действие отменено.',reply_markup=user_menu(m.from_user.id))
+
+async def allowed(uid,count):
+    u=db.get_user(uid) or {}
+    return is_admin(uid) or bool(u.get('is_premium')) or count<=int(u.get('trial_searches_left',0))
+
+@dp.message(F.text=='🔎 Новый поиск')
+async def new_search(m:Message,state:FSMContext):
+    if not await allowed(m.from_user.id,1):return await m.answer('🆓 Лимит Trial закончился.\n\n💎 Подключите Premium для продолжения.')
+    await state.set_state(S.model);await m.answer('🔎 <b>Новый поиск</b>\n\nВведите модель.\nНапример: <code>Eternal Rose</code>',reply_markup=cancel())
+
+@dp.message(S.model)
+async def model_step(m:Message,state:FSMContext):
+    name=normalize_model_name(m.text or '')
+    if len(name)<2:return await m.answer('❌ Введите название модели.')
+    await state.update_data(model=name);await state.set_state(S.range);await m.answer(f'🎁 Модель: <b>{html.escape(name)}</b>\n\nВведите диапазон, например <code>13000-13500</code>.\nМаксимум: 10 000 ID.',reply_markup=cancel())
+
+@dp.message(S.range)
+async def range_step(m:Message,state:FSMContext):
+    try:a,b=parse_range(m.text or '')
+    except ValueError:return await m.answer('❌ Формат: <code>начало-конец</code>. Максимум 10 000 ID.')
+    count=b-a+1
+    if not await allowed(m.from_user.id,count):
+        u=db.get_user(m.from_user.id) or {};return await m.answer(f'🆓 Осталось <b>{u.get("trial_searches_left",0)}</b> проверок, а диапазон содержит <b>{count}</b> ID.')
+    data=await state.get_data();await state.clear();await run_search(m,data['model'],a,b)
+
+async def run_search(m,model,start,end,existing_sid=None):
+    uid=m.from_user.id;db.clear_stop(uid);total=end-start+1
+    if existing_sid is None:sid=db.create_search(uid,model,start,end);checked=0;found=0;next_id=start
     else:
-        trials = user['trial_searches_left'] if user else 25
-        welcome_text += f"Твои лимиты:</blockquote>"
-        welcome_text += f"\n\n🆓 Пробная версия: <b>{trials}/25</b> поисков"
-    
-    welcome_text += "\n\nВыбери действие в меню 👇"
-    
-    await message.answer(
-        welcome_text,
-        reply_markup=main_menu(
-            is_admin=is_admin,
-            is_premium=user['is_premium'] if user else False
-        )
-    )
-
-@dp.message(Command("stop"))
-async def cmd_stop(message: Message):
-    """Остановить парсинг"""
-    user_id = message.from_user.id
-    db.set_stop_flag(user_id, True)
-    
-    await message.answer(
-        "⏹️ <b>Останавливаю парсинг...</b>\n\n"
-        "Подожди несколько секунд"
-    )
-
-@dp.message(F.text == "⏹️ Стоп")
-async def btn_stop(message: Message):
-    """Кнопка Стоп"""
-    await cmd_stop(message)
-
-
-@dp.message(Command("help"))
-@dp.message(F.text == "ℹ️ Помощь")
-async def cmd_help(message: Message):
-    """Помощь"""
-    help_text = (
-        "╔═══════════════════════════╗\n"
-        "║      ℹ️ <b>ИНСТРУКЦИЯ</b>      ║\n"
-        "╚═══════════════════════════╝\n\n"
-        "<b>🔍 Поиск по модели:</b>\n"
-        "1️⃣ Нажми «🔍 Начать поиск»\n"
-        "2️⃣ Введи название (eternal rose)\n"
-        "3️⃣ Введи диапазон (100-200)\n"
-        "4️⃣ Получи результаты!\n\n"
-        "<b>🎲 Случайный поиск:</b>\n"
-        "• Бот сам выбирает модели\n"
-        "• Укажи количество подарков\n"
-        "• Быстро найдёшь что-то интересное\n\n"
-        "<b>🔎 Поиск по ID:</b>\n"
-        "• Проверь конкретный ID\n"
-        "• Введи ID и модель\n\n"
-        "<b>💡 Регистр не важен:</b>\n"
-        "✅ eternal rose = EternalRose\n"
-        "✅ evil eye = EvilEye\n\n"
-        "<b>📊 Лимиты:</b>\n"
-        "• 🆓 Пробная: 25 поисков\n"
-        "• ⭐ Premium: безлимит (5 TON)\n\n"
-        "💬 <b>Поддержка:</b> @kod30"
-    )
-    
-    await message.answer(help_text)
-
-@dp.message(F.text == "📊 Профиль")
-async def btn_profile(message: Message):
-    """Профиль"""
-    user_id = message.from_user.id
-    user = db.get_user(user_id)
-    is_admin = (user_id == OWNER_ID)
-    username = message.from_user.username or "NoUsername"
-    
-    profile_text = (
-        "╔═══════════════════════════╗\n"
-        "║     📊 <b>МОЙ ПРОФИЛЬ</b>     ║\n"
-        "╚═══════════════════════════╝\n\n"
-        f"👤 <b>Пользователь:</b> @{username}\n"
-        f"🆔 <b>ID:</b> <code>{user_id}</code>\n\n"
-    )
-    
-    if is_admin:
-        profile_text += "💎 <b>Статус:</b> 👑 <b>Администратор</b>\n"
-    elif user and user['is_premium']:
-        profile_text += "💎 <b>Статус:</b> ⭐ <b>Premium</b>\n"
-    else:
-        trials = user['trial_searches_left'] if user else 25
-        profile_text += (
-            "💎 <b>Статус:</b> 🆓 Пробная версия\n"
-            f"📊 <b>Осталось поисков:</b> {trials}/25\n"
-        )
-    
-    # Последние поиски
-    searches = db.get_user_searches(user_id, limit=5)
-    if searches:
-        profile_text += "\n📜 <b>Последние поиски:</b>\n"
-        for s in searches[:5]:
-            profile_text += f"  • {s['model']} ({s['range_start']}-{s['range_end']})\n"
-    
-    await message.answer(profile_text)
-
-
-@dp.message(F.text == "📋 Список моделей")
-async def btn_models_list(message: Message):
-    """Список моделей"""
-    models_text = (
-        "╔═══════════════════════════╗\n"
-        "║   📋 <b>ДОСТУПНЫЕ МОДЕЛИ</b>  ║\n"
-        "╚═══════════════════════════╝\n\n"
-        "<b>💎 Легендарные:</b>\n"
-        "• DurovsCap (~500-1000 TON)\n"
-        "• HeroicHelmet (~200-500 TON)\n"
-        "• MightyArm (~150-300 TON)\n\n"
-        "<b>🔥 Редкие:</b>\n"
-        "• PreciousPeach, PlushPepe\n"
-        "• IonGem, EvilEye, GenieLamp\n\n"
-        "<b>⭐ Обычные:</b>\n"
-        "• EternalRose, BlueStar\n"
-        "• ToyBear, IceCream, SnowGlobe\n\n"
-        "<b>📦 Массовые:</b>\n"
-        "• FreshSocks, BerryBox\n"
-        "• GingerCookie, MoneyPot\n\n"
-        f"<b>Всего моделей:</b> {len(AVAILABLE_MODELS)}\n\n"
-        "💡 <i>Регистр не важен при вводе</i>"
-    )
-    
-    await message.answer(models_text)
-
-@dp.message(F.text == "❌ Отмена")
-async def btn_cancel(message: Message, state: FSMContext):
-    """Отмена"""
-    await state.clear()
-    
-    user_id = message.from_user.id
-    user = db.get_user(user_id)
-    is_admin = (user_id == OWNER_ID)
-    
-    await message.answer(
-        "❌ <b>Отменено</b>",
-        reply_markup=main_menu(
-            is_admin=is_admin,
-            is_premium=user['is_premium'] if user else False
-        )
-    )
-
-
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# 🔍 ПОИСК ПО МОДЕЛИ
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-@dp.message(F.text == "🔍 Начать поиск")
-async def btn_search_start(message: Message, state: FSMContext):
-    """Начать поиск"""
-    user_id = message.from_user.id
-    user = db.get_user(user_id)
-    is_admin = (user_id == OWNER_ID)
-    
-    # Проверка лимитов (админ = безлимит)
-    if not is_admin and user and not user['is_premium'] and user['trial_searches_left'] <= 0:
-        await message.answer(
-            "❌ <b>Пробные поиски закончились!</b>\n\n"
-            "💎 Осталось: 0/25\n\n"
-            "Оформи <b>Premium</b> для безлимитного доступа:\n"
-            "💰 Всего <b>5 TON</b>"
-        )
-        return
-    
-    await state.set_state(SearchStates.waiting_for_model)
-    
-    # Текст как на скрине 1
-    await message.answer(
-        "Поиск подарков по модели\n\n"
-        "<blockquote><b>Введите название подарка:</b></blockquote>",
-        reply_markup=cancel_keyboard()
-    )
-
-@dp.message(SearchStates.waiting_for_model)
-async def process_model(message: Message, state: FSMContext):
-    """Обработка модели"""
-    model_input = message.text.strip()
-    model_name = normalize_model_name(model_input)
-    
-    await state.update_data(model=model_name)
-    await state.set_state(SearchStates.waiting_for_range)
-    
-    await message.answer(
-        f"✅ <b>Модель:</b> <code>{model_name}</code>\n\n"
-        "📊 <b>Введи диапазон ID:</b>\n\n"
-        "<i>Формат:</i> <code>начало-конец</code>\n\n"
-        "<i>Примеры:</i>\n"
-        "• <code>1-100</code>\n"
-        "• <code>500-600</code>\n"
-        "• <code>13000-13050</code>",
-        reply_markup=cancel_keyboard()
-    )
-
-@dp.message(SearchStates.waiting_for_range)
-async def process_range(message: Message, state: FSMContext):
-    """Обработка диапазона"""
-    range_text = message.text.strip()
-    
+        x=db.get_search(existing_sid,uid);sid=existing_sid;checked=x['checked_count'];found=x['found_count'];next_id=x['last_checked_id']+1
+        if next_id>end:return await m.answer('✅ Этот поиск уже полностью обработан.')
+    t0=time.monotonic(); msg=await m.answer(f'🔎 <b>Поиск запущен</b>\n\n🎁 {html.escape(model)}\n🆔 <code>{next_id} → {end}</code>\n\n{progress_bar(checked,total)}  <b>{int(checked/total*100)}%</b>\n📦 Проверено: <b>{checked}</b>\n✨ Найдено: <b>{found}</b>',reply_markup=stop())
+    pending=[]; batch_size=max(5,CONCURRENCY*3); current=next_id
     try:
-        start, end = map(int, range_text.split('-'))
-        
-        if start < 1 or end < start:
-            await message.answer("❌ Неправильный диапазон! Попробуй ещё раз:")
-            return
-        
-        user_id = message.from_user.id
-        user = db.get_user(user_id)
-        is_admin = (user_id == OWNER_ID)
-        
-        actual_range = end - start + 1
-        
-        # Проверка лимитов (админ = безлимит)
-        if not is_admin and user and not user['is_premium']:
-            max_range = user['trial_searches_left']
-            
-            if actual_range > max_range:
-                await message.answer(
-                    f"❌ <b>Превышен лимит!</b>\n\n"
-                    f"📊 Запрошено: {actual_range}\n"
-                    f"💎 Доступно: {max_range}\n\n"
-                    f"Макс. диапазон: <code>{start}-{start + max_range - 1}</code>"
-                )
-                return
-        
-        data = await state.get_data()
-        model = data['model']
-        
-        await state.clear()
-        
-        # Начинаем парсинг
-        await start_parsing(message, user_id, model, start, end)
-        
-    except ValueError:
-        await message.answer(
-            "❌ <b>Неправильный формат!</b>\n\n"
-            "Используй: <code>начало-конец</code>\n"
-            "Например: <code>1-100</code>"
-        )
+        while current<=end:
+            if db.should_stop(uid):
+                db.update_search(sid,current-1,checked,found,'stopped');await msg.edit_text(f'⏹ <b>Поиск остановлен</b>\n\n🎁 {html.escape(model)}\n📦 Проверено: <b>{checked}</b> / {total}\n✨ Найдено: <b>{found}</b>\n\n▶️ Продолжить можно из раздела «📚 История».',reply_markup=user_menu(uid));return
+            nums=list(range(current,min(end+1,current+batch_size))); results=await asyncio.gather(*(api.get_gift(model,n) for n in nums),return_exceptions=True)
+            for n,g in zip(nums,results):
+                checked+=1
+                if isinstance(g,Exception):log.warning('Peek %s #%s: %s',model,n,g);continue
+                if g:
+                    found+=1;db.add_gift(sid,uid,g);await m.answer(gift_card_text(g),reply_markup=gift_card(g,db.is_favorite(uid,g.get('giftNumber'),g.get('model'))))
+            last=nums[-1];db.update_search(sid,last,checked,found);current=last+1
+            elapsed=time.monotonic()-t0;rate=checked/elapsed if elapsed else 0;eta=(total-checked)/rate if rate else 0
+            try:await msg.edit_text(f'🔎 <b>Поиск идёт</b>\n\n🎁 {html.escape(model)}\n{progress_bar(checked,total)}  <b>{int(checked/total*100)}%</b>\n\n📦 Проверено: <b>{checked}</b> / {total}\n✨ Найдено: <b>{found}</b>\n⚡ Скорость: <b>{rate:.1f} ID/с</b>\n⏱ Осталось: <b>~{pretty_time(eta)}</b>',reply_markup=stop())
+            except Exception:pass
+        db.update_search(sid,end,checked,found,'completed')
+        u=db.get_user(uid) or {}
+        if not is_admin(uid) and not u.get('is_premium'):db.consume_trial(uid,checked)
+        elapsed=time.monotonic()-t0
+        await msg.edit_text(f'✅ <b>Поиск завершён</b>\n\n🎁 {html.escape(model)}\n📦 Проверено: <b>{checked}</b>\n✨ Найдено: <b>{found}</b>\n⚡ Скорость: <b>{checked/elapsed:.1f} ID/с</b>\n⏱ Время: <b>{pretty_time(elapsed)}</b>\n\n📚 Результаты сохранены в истории.',reply_markup=user_menu(uid))
+    except Exception:
+        log.exception('Search failed uid=%s sid=%s',uid,sid);db.update_search(sid,max(start-1,current-1),checked,found,'error')
+        await msg.edit_text(f'⚠️ <b>Поиск прерван из-за ошибки</b>\n\n📦 Прогресс сохранён: {checked}/{total}\n✨ Найдено: {found}\n\nОткройте «📚 История» и продолжите позже.',reply_markup=user_menu(uid))
 
+@dp.message(F.text=='🆔 Поиск по ID')
+async def id_search(m:Message,state:FSMContext):await state.set_state(S.id_model);await m.answer('🆔 <b>Поиск по ID</b>\n\nВведите модель:',reply_markup=cancel())
+@dp.message(S.id_model)
+async def id_model(m:Message,state:FSMContext):
+    name=normalize_model_name(m.text or '');await state.update_data(model=name);await state.set_state(S.id_number);await m.answer(f'🎁 <b>{html.escape(name)}</b>\n\nВведите ID:',reply_markup=cancel())
+@dp.message(S.id_number)
+async def id_number(m:Message,state:FSMContext):
+    try:n=int((m.text or '').strip());assert n>0
+    except:return await m.answer('❌ ID должен быть положительным числом.')
+    data=await state.get_data();await state.clear();g=await api.get_gift(data['model'],n)
+    if not g:return await m.answer(f'🔎 <code>#{n}</code> не найден.',reply_markup=user_menu(m.from_user.id))
+    await m.answer(gift_card_text(g),reply_markup=gift_card(g,db.is_favorite(m.from_user.id,n,g.get('model'))));await m.answer('Готово 👌',reply_markup=user_menu(m.from_user.id))
 
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# ⚙️ ФУНКЦИЯ ПАРСИНГА
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+@dp.message(F.text=='🎲 Случайный')
+async def random_search(m:Message,state:FSMContext):
+    if not await allowed(m.from_user.id,1):return await m.answer('🆓 Лимит Trial закончился.')
+    await state.set_state(S.random_count);await m.answer('🎲 <b>Случайный поиск</b>\n\nСколько подарков проверить? <code>1-20</code>',reply_markup=cancel())
+@dp.message(S.random_count)
+async def random_count(m:Message,state:FSMContext):
+    try:c=int(m.text);assert 1<=c<=20
+    except:return await m.answer('❌ Введите число от 1 до 20.')
+    if not await allowed(m.from_user.id,c):return await m.answer('🆓 Недостаточно Trial-проверок.')
+    await state.clear();model=random.choice(AVAILABLE_MODELS);nums=random.sample(range(1,100000),c);await m.answer(f'🎲 Модель: <b>{model}</b>\n🔢 Проверяю {c} случайных ID…')
+    found=0
+    for n in nums:
+        g=await api.get_gift(model,n)
+        if g:found+=1;await m.answer(gift_card_text(g),reply_markup=gift_card(g))
+    u=db.get_user(m.from_user.id) or {}
+    if not is_admin(m.from_user.id) and not u.get('is_premium'):db.consume_trial(m.from_user.id,c)
+    await m.answer(f'🎲 Готово. Найдено: <b>{found}</b> из {c}.',reply_markup=user_menu(m.from_user.id))
 
-async def start_parsing(message: Message, user_id: int, model: str, start: int, end: int):
-    """Основной процесс парсинга"""
-    username = message.from_user.username or "NoUsername"
-    user = db.get_user(user_id)
-    is_admin = (user_id == OWNER_ID)
-    
-    # Очистить флаг остановки
-    db.clear_stop_flag(user_id)
-    
-    # Логирование
-    await channel_logger.log_search(user_id, username, model, start, end)
-    
-    # Сохраняем поиск
-    search_id = db.add_search(user_id, model, start, end)
-    
-    # Уменьшаем лимит (админ не расходует)
-    if not is_admin and user and not user['is_premium']:
-        checked_ids = end - start + 1
-        new_value = user['trial_searches_left'] - checked_ids
-        db.update_trial_searches(user_id, max(0, new_value))
-    
-    # Начало поиска
-    progress_msg = await message.answer(
-        "╔═══════════════════════════╗\n"
-        "║   🔍 <b>ПОИСК ЗАПУЩЕН</b>    ║\n"
-        "╚═══════════════════════════╝\n\n"
-        f"🎁 <b>Модель:</b> <code>{model}</code>\n"
-        f"📊 <b>Диапазон:</b> <code>{start}-{end}</code>\n\n"
-        "⏳ <b>Прогресс:</b> 0%",
-        reply_markup=stop_keyboard()
-    )
-    
-    found_gifts = []
-    total_checked = 0
-    total_range = end - start + 1
-    last_found_id = None
-    
-    for gift_id in range(start, end + 1):
-        # Проверка остановки
-        if db.should_stop_parsing(user_id):
-            await progress_msg.delete()
-            
-            stopped_text = (
-                "⏹️ <b>ПАРСИНГ ОСТАНОВЛЕН</b>\n\n"
-                f"📊 Проверено: {total_checked}/{total_range}\n"
-                f"✅ Найдено: {len(found_gifts)}\n"
-            )
-            
-            if last_found_id:
-                stopped_text += f"\n📌 <b>Последний найденный:</b> #{last_found_id}"
-            
-            await message.answer(
-                stopped_text,
-                reply_markup=main_menu(is_admin=is_admin, is_premium=user['is_premium'] if user else False)
-            )
-            
-            # Сохраняем для продолжения
-            db.update_last_search(user_id, model, gift_id, end)
-            return
-        
-        # Проверка подарка
-        gift_data = await peek_gift_info(gift_id, model)
-        total_checked += 1
-        
-        if gift_data['found']:
-            last_found_id = gift_id
-            found_gifts.append(gift_data)
-            
-            # Сохраняем в БД
-            db.add_found_gift(
-                search_id=search_id,
-                gift_number=gift_id,
-                model=model,
-                owner_username=gift_data.get('username', 'Unknown'),
-                is_visible=gift_data.get('is_visible', True),
-                attributes=str(gift_data.get('attributes', {}))
-            )
-            
-            # Уведомление о находке с красивым оформлением
-            visibility = "👁️ Открыт" if gift_data.get('is_visible') else "🔒 Скрыт"
-            owner = gift_data.get('username')
-            owner_id = gift_data.get('user_id')
-            
-            gift_text = (
-                "┏━━━━━━━━━━━━━━━━━━━━━━━┓\n"
-                f"┃  ✅ <b>НАЙДЕН #{gift_id}</b>\n"
-                "┗━━━━━━━━━━━━━━━━━━━━━━━┛\n\n"
-                f"🎁 <b>Модель:</b> <code>{model}</code>\n"
-            )
-            
-            if owner:
-                gift_text += f"👤 <b>Владелец:</b> @{owner}\n"
-            
-            if owner_id:
-                gift_text += f"🆔 <b>ID:</b> <code>{owner_id}</code>\n"
-            
-            gift_text += f"👁️ <b>Видимость:</b> {visibility}\n"
-            
-            await message.answer(
-                gift_text,
-                reply_markup=gift_inline_keyboard(gift_id, owner, model)
-            )
-        
-        # Обновление прогресса
-        progress_percent = int((total_checked / total_range) * 100)
-        if total_checked % max(1, total_range // 10) == 0:
-            try:
-                await progress_msg.edit_text(
-                    "╔═══════════════════════════╗\n"
-                    "║   🔍 <b>ПОИСК ЗАПУЩЕН</b>    ║\n"
-                    "╚═══════════════════════════╝\n\n"
-                    f"🎁 <b>Модель:</b> <code>{model}</code>\n"
-                    f"📊 <b>Диапазон:</b> <code>{start}-{end}</code>\n\n"
-                    f"⏳ <b>Прогресс:</b> {progress_percent}%\n"
-                    f"✅ <b>Найдено:</b> {len(found_gifts)}",
-                    reply_markup=stop_keyboard()
-                )
-            except:
-                pass  # Игнорируем ошибки редактирования
-        
-        # Задержка с проверкой остановки (7 секунд)
-        for _ in range(7):
-            if db.should_stop_parsing(user_id):
-                break
-            await asyncio.sleep(1)
-    
-    # Завершение - удаляем кнопку Стоп
-    try:
-        await progress_msg.delete()
-    except:
-        pass
-    
-    # Итоговое сообщение
-    if found_gifts:
-        summary = format_gift_summary(found_gifts, model, start, end)
-        for part in summary:
-            await message.answer(part)
-    
-    result_text = (
-        "╔═══════════════════════════╗\n"
-        "║   ✅ <b>ПОИСК ЗАВЕРШЁН</b>   ║\n"
-        "╚═══════════════════════════╝\n\n"
-        f"📊 <b>Проверено:</b> {total_checked}\n"
-        f"✅ <b>Найдено:</b> {len(found_gifts)}\n"
-    )
-    
-    if last_found_id:
-        result_text += f"\n📌 <b>Последний найденный:</b> #{last_found_id}"
-    
-    await message.answer(
-        result_text,
-        reply_markup=main_menu(is_admin=is_admin, is_premium=user['is_premium'] if user else False)
-    )
+@dp.callback_query(F.data.startswith('fav:'))
+async def favorite(c:CallbackQuery):
+    parts=c.data.split(':',2);n=int(parts[1]);model=parts[2]
+    from urllib.parse import unquote
+    model=unquote(model)
+    if db.is_favorite(c.from_user.id,n,model):db.remove_favorite(c.from_user.id,n,model);await c.answer('☆ Убрано из избранного')
+    else:db.add_favorite(c.from_user.id,n,model,None);await c.answer('⭐ Добавлено в избранное')
 
-def format_gift_summary(gifts: list, model: str, start: int, end: int) -> list:
-    """Форматирование итогового списка"""
-    if not gifts:
-        return ["Подарки не найдены."]
-    
-    messages = []
-    current_msg = (
-        "╔═══════════════════════════╗\n"
-        "║   📋 <b>ИТОГОВЫЙ СПИСОК</b>  ║\n"
-        "╚═══════════════════════════╝\n\n"
-        f"🎁 <b>Модель:</b> <code>{model}</code>\n"
-        f"📊 <b>Диапазон:</b> {start}-{end}\n"
-        f"✅ <b>Найдено:</b> {len(gifts)}\n\n"
-        "━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-    )
-    
-    for i, gift in enumerate(gifts, 1):
-        num = gift.get('giftNumber', '?')
-        owner = gift.get('username', '')
-        visible = "👁️" if gift.get('is_visible') else "🔒"
-        
-        owner_text = f"@{owner}" if owner else "Скрыт"
-        
-        gift_line = f"{i}. <b>#{num}</b> | {owner_text} {visible}\n"
-        
-        # Проверка лимита Telegram (4096 символов)
-        if len(current_msg + gift_line) > 3800:
-            messages.append(current_msg)
-            current_msg = f"📋 <b>Продолжение ({len(messages) + 1})</b>\n\n" + gift_line
-        else:
-            current_msg += gift_line
-    
-    if current_msg:
-        messages.append(current_msg)
-    
-    if messages:
-        messages[-1] += f"\n━━━━━━━━━━━━━━━━━━━━━━━━━━\n<b>Всего:</b> {len(gifts)}"
-    
-    return messages
+@dp.message(F.text=='⭐ Избранное')
+async def favorites(m:Message):
+    rows=db.favorites(m.from_user.id)
+    if not rows:return await m.answer('⭐ <b>Избранное пусто</b>\n\nНажимай «☆ В избранное» под найденными подарками.')
+    await m.answer(f'⭐ <b>Избранное</b> · {len(rows)}')
+    for r in rows:
+        g={'giftNumber':r['gift_number'],'model':r['model'],'giftName':r['model'],'username':r['username']}
+        await m.answer(gift_card_text(g),reply_markup=gift_card(g,True))
 
+@dp.message(F.text=='📚 История')
+async def history(m:Message):
+    rows=db.history(m.from_user.id)
+    if not rows:return await m.answer('📚 <b>История пуста</b>\n\nЗапусти первый поиск.')
+    for x in rows:
+        total=x['end_id']-x['start_id']+1;p=int(x['checked_count']/total*100) if total else 0
+        status={'completed':'✅ завершён','stopped':'⏹ остановлен','error':'⚠️ ошибка','in_progress':'🔎 выполняется'}.get(x['status'],x['status'])
+        await m.answer(f'📌 <b>Поиск #{x["id"]}</b>\n🎁 {html.escape(x["model"])}\n🆔 {x["start_id"]}–{x["end_id"]}\n📊 {p}% · {x["checked_count"]}/{total}\n✨ Найдено: <b>{x["found_count"]}</b>\n{status}',reply_markup=history_item(x['id'],x['status']))
 
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# 🎲 СЛУЧАЙНЫЙ ПОИСК
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+@dp.callback_query(F.data.startswith('hist:'))
+async def history_open(c:CallbackQuery):
+    sid=int(c.data.split(':')[1]);x=db.get_search(sid,c.from_user.id)
+    if not x:return await c.answer('Поиск не найден',show_alert=True)
+    gs=db.get_gifts(sid);await c.answer(f'Найдено: {len(gs)}')
+    for r in gs:
+        g={'giftNumber':r['gift_number'],'model':r['model'],'giftName':r['model'],'pattern':r['pattern'],'backdrop':r['backdrop'],'username':r['username'],'userId':r['user_id_owner']}
+        await c.message.answer(gift_card_text(g),reply_markup=gift_card(g,db.is_favorite(c.from_user.id,r['gift_number'],r['model'])))
+    if not gs:await c.message.answer('Пока нет сохранённых находок.')
 
-@dp.message(F.text == "🎲 Случайный поиск")
-async def btn_random_search(message: Message, state: FSMContext):
-    """Случайный поиск"""
-    user_id = message.from_user.id
-    user = db.get_user(user_id)
-    is_admin = (user_id == OWNER_ID)
-    
-    # Проверка лимитов
-    if not is_admin and user and not user['is_premium'] and user['trial_searches_left'] <= 0:
-        await message.answer(
-            "❌ <b>Пробные поиски закончились!</b>\n\n"
-            "Оформи Premium для продолжения"
-        )
-        return
-    
-    await state.set_state(SearchStates.waiting_for_random_count)
-    
-    max_count = user['trial_searches_left'] if (user and not is_admin and not user['is_premium']) else 1000
-    
-    await message.answer(
-        "╔═══════════════════════════╗\n"
-        "║   🎲 <b>СЛУЧАЙНЫЙ ПОИСК</b>   ║\n"
-        "╚═══════════════════════════╝\n\n"
-        "🎁 <b>Сколько подарков найти?</b>\n\n"
-        f"💎 Доступно: до <b>{max_count}</b>\n\n"
-        "<i>Введи число:</i>\n"
-        "• <code>10</code> - найти 10 подарков\n"
-        "• <code>50</code> - найти 50 подарков",
-        reply_markup=cancel_keyboard()
-    )
+@dp.callback_query(F.data.startswith('resume:'))
+async def resume(c:CallbackQuery):
+    sid=int(c.data.split(':')[1]);x=db.get_search(sid,c.from_user.id)
+    if not x:return await c.answer('Поиск не найден',show_alert=True)
+    if x['status'] not in ('stopped','error'):return await c.answer('Этот поиск уже завершён.')
+    await c.answer('▶️ Продолжаю…');await run_search(c.message,x['model'],x['start_id'],x['end_id'],sid)
 
-@dp.message(SearchStates.waiting_for_random_count)
-async def process_random_count(message: Message, state: FSMContext):
-    """Обработка количества"""
-    try:
-        count = int(message.text.strip())
-        
-        user_id = message.from_user.id
-        user = db.get_user(user_id)
-        is_admin = (user_id == OWNER_ID)
-        
-        max_count = user['trial_searches_left'] if (user and not is_admin and not user['is_premium']) else 1000
-        
-        if count < 1:
-            await message.answer("❌ Число должно быть больше 0!")
-            return
-        
-        if count > max_count:
-            await message.answer(
-                f"❌ <b>Превышен лимит!</b>\n\n"
-                f"💎 Доступно: {max_count}\n"
-                f"📝 Запрошено: {count}"
-            )
-            return
-        
-        await state.clear()
-        
-        # Начинаем случайный парсинг
-        await start_random_parsing(message, user_id, count)
-        
-    except ValueError:
-        await message.answer("❌ Введи число! Например: <code>50</code>")
+@dp.message(F.text=='🎁 Модели')
+async def models(m:Message):await show_models(m,1)
+async def show_models(target,page):
+    per=8;start=(page-1)*per;items=AVAILABLE_MODELS[start:start+per]
+    text='🎁 <b>Каталог моделей</b>\n\n'+'\n'.join(f'• <code>{x}</code>' for x in items)
+    await target.answer(text,reply_markup=models_nav(page,len(AVAILABLE_MODELS),per))
+@dp.callback_query(F.data.startswith('models:'))
+async def models_page(c:CallbackQuery):await c.answer();await show_models(c.message,int(c.data.split(':')[1]))
+@dp.callback_query(F.data=='noop')
+async def noop(c:CallbackQuery):await c.answer()
 
-async def start_random_parsing(message: Message, user_id: int, count: int):
-    """Случайный парсинг"""
-    import random
-    
-    username = message.from_user.username or "NoUsername"
-    user = db.get_user(user_id)
-    is_admin = (user_id == OWNER_ID)
-    
-    # Очистить флаг остановки
-    db.clear_stop_flag(user_id)
-    
-    # Логирование
-    await channel_logger.log_action(user_id, username, f"Случайный поиск: {count} подарков")
-    
-    # Уменьшаем лимит
-    if not is_admin and user and not user['is_premium']:
-        new_value = user['trial_searches_left'] - count
-        db.update_trial_searches(user_id, max(0, new_value))
-    
-    # Начало
-    progress_msg = await message.answer(
-        "╔═══════════════════════════╗\n"
-        "║  🎲 <b>СЛУЧАЙНЫЙ ПОИСК</b>   ║\n"
-        "╚═══════════════════════════╝\n\n"
-        f"🎯 <b>Цель:</b> {count} подарков\n"
-        f"✅ <b>Найдено:</b> 0\n\n"
-        "⏳ <b>Ищу...</b>",
-        reply_markup=stop_keyboard()
-    )
-    
-    found_gifts = []
-    attempts = 0
-    max_attempts = count * 5
-    last_found = None
-    
-    while len(found_gifts) < count and attempts < max_attempts:
-        # Проверка остановки
-        if db.should_stop_parsing(user_id):
-            await progress_msg.delete()
-            
-            stopped_text = (
-                "⏹️ <b>ПОИСК ОСТАНОВЛЕН</b>\n\n"
-                f"✅ Найдено: {len(found_gifts)}/{count}\n"
-                f"🔍 Попыток: {attempts}\n"
-            )
-            
-            if last_found:
-                stopped_text += f"\n📌 <b>Последний:</b> {last_found}"
-            
-            await message.answer(
-                stopped_text,
-                reply_markup=main_menu(is_admin=is_admin, is_premium=user['is_premium'] if user else False)
-            )
-            return
-        
-        # Случайный выбор
-        random_model = random.choice(AVAILABLE_MODELS)
-        random_id = random.randint(1, 30000)
-        
-        # Проверка
-        gift_data = await peek_gift_info(random_id, random_model)
-        attempts += 1
-        
-        if gift_data['found']:
-            last_found = f"{random_model} #{random_id}"
-            found_gifts.append(gift_data)
-            
-            # Уведомление
-            visibility = "👁️ Открыт" if gift_data.get('is_visible') else "🔒 Скрыт"
-            owner = gift_data.get('username')
-            owner_id = gift_data.get('user_id')
-            
-            gift_text = (
-                "┏━━━━━━━━━━━━━━━━━━━━━━━┓\n"
-                f"┃  ✅ <b>#{random_id}</b>\n"
-                "┗━━━━━━━━━━━━━━━━━━━━━━━┛\n\n"
-                f"🎁 <b>Модель:</b> <code>{random_model}</code>\n"
-            )
-            
-            if owner:
-                gift_text += f"👤 <b>Владелец:</b> @{owner}\n"
-            
-            if owner_id:
-                gift_text += f"🆔 <b>ID:</b> <code>{owner_id}</code>\n"
-            
-            gift_text += f"👁️ <b>Видимость:</b> {visibility}\n"
-            gift_text += f"\n📊 <b>Прогресс:</b> {len(found_gifts)}/{count}"
-            
-            await message.answer(
-                gift_text,
-                reply_markup=gift_inline_keyboard(random_id, owner, random_model)
-            )
-        
-        # Обновление прогресса
-        if attempts % 10 == 0:
-            progress_percent = int((len(found_gifts) / count) * 100)
-            try:
-                await progress_msg.edit_text(
-                    "╔═══════════════════════════╗\n"
-                    "║  🎲 <b>СЛУЧАЙНЫЙ ПОИСК</b>   ║\n"
-                    "╚═══════════════════════════╝\n\n"
-                    f"🎯 <b>Цель:</b> {count}\n"
-                    f"✅ <b>Найдено:</b> {len(found_gifts)}\n"
-                    f"🔍 <b>Попыток:</b> {attempts}\n\n"
-                    f"⏳ <b>Прогресс:</b> {progress_percent}%",
-                    reply_markup=stop_keyboard()
-                )
-            except:
-                pass
-        
-        # Задержка
-        for _ in range(7):
-            if db.should_stop_parsing(user_id):
-                break
-            await asyncio.sleep(1)
-    
-    # Завершение - удаляем кнопку Стоп
-    try:
-        await progress_msg.delete()
-    except:
-        pass
-    
-    result_text = (
-        "╔═══════════════════════════╗\n"
-        "║   ✅ <b>ПОИСК ЗАВЕРШЁН</b>   ║\n"
-        "╚═══════════════════════════╝\n\n"
-        f"🎯 <b>Цель:</b> {count}\n"
-        f"✅ <b>Найдено:</b> {len(found_gifts)}\n"
-        f"🔍 <b>Попыток:</b> {attempts}\n"
-    )
-    
-    if last_found:
-        result_text += f"\n📌 <b>Последний:</b> {last_found}"
-    
-    await message.answer(
-        result_text,
-        reply_markup=main_menu(is_admin=is_admin, is_premium=user['is_premium'] if user else False)
-    )
+@dp.message(F.text=='📊 Профиль')
+async def profile(m:Message):
+    u=db.get_user(m.from_user.id) or {};s=db.stats();status='💎 Premium' if u.get('is_premium') else '🆓 Trial'
+    await m.answer(f'👤 <b>Профиль</b>\n\n🆔 <code>{m.from_user.id}</code>\n👤 Username: {("@"+m.from_user.username) if m.from_user.username else "—"}\n💎 Статус: <b>{status}</b>\n🎫 Осталось Trial: <b>{u.get("trial_searches_left",25)}</b>\n\n🔎 Поисков: <b>{u.get("total_searches",0)}</b>\n🎁 Находок: <b>{u.get("total_found",0)}</b>\n\n🌐 Пользователей бота: <b>{s["users"]}</b>')
 
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# 🚀 ЗАПУСК БОТА
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+@dp.message(F.text=='💎 Premium')
+async def premium(m:Message):await m.answer('💎 <b>Premium</b>\n\nБезлимитный поиск и дополнительные функции.\n\nПлатёжную интеграцию лучше подключить отдельно через безопасные переменные окружения — секретные ключи не должны лежать в коде.')
+@dp.message(F.text=='❓ Помощь')
+async def help_cmd(m:Message):await m.answer('❓ <b>Как пользоваться</b>\n\n🔎 <b>Новый поиск</b> — модель + диапазон ID.\n🆔 <b>Поиск по ID</b> — проверка одного подарка.\n🎲 <b>Случайный</b> — быстрый тест случайных ID.\n📚 <b>История</b> — результаты и продолжение остановленного поиска.\n⭐ <b>Избранное</b> — сохранённые находки.\n\nСовет: для больших диапазонов лучше запускать поиск частями и продолжать из истории.')
+
+@dp.message(F.text=='⚙️ Админка')
+async def admin(m:Message):
+    if not is_admin(m.from_user.id):return
+    await m.answer('⚙️ <b>Админ-панель</b>',reply_markup=admin_menu())
+@dp.callback_query(F.data=='adm:stats')
+async def adm_stats(c:CallbackQuery):
+    if not is_admin(c.from_user.id):return await c.answer('Нет доступа',show_alert=True)
+    s=db.stats();await c.answer();await c.message.answer(f'📈 <b>Статистика</b>\n\n👥 Пользователей: <b>{s["users"]}</b>\n💎 Premium: <b>{s["premium"]}</b>\n🚫 Банов: <b>{s["banned"]}</b>\n🔎 Поисков: <b>{s["searches"]}</b>\n🎁 Находок: <b>{s["found"]}</b>')
+@dp.callback_query(F.data=='adm:users')
+async def adm_users(c:CallbackQuery):
+    if not is_admin(c.from_user.id):return await c.answer('Нет доступа',show_alert=True)
+    await c.answer();await c.message.answer('👥 Для управления конкретным пользователем используйте его Telegram ID в отдельной админ-команде. Это намеренно не сделано через случайные кнопки, чтобы не менять аккаунты по ошибке.')
+
+@dp.message(Command('ban'))
+async def ban(m:Message):
+    if not is_admin(m.from_user.id):return
+    try:uid=int(m.text.split(maxsplit=1)[1])
+    except:return await m.answer('Использование: <code>/ban 123456789</code>')
+    db.set_ban(uid,True);await m.answer(f'🚫 Пользователь <code>{uid}</code> заблокирован.')
+@dp.message(Command('unban'))
+async def unban(m:Message):
+    if not is_admin(m.from_user.id):return
+    try:uid=int(m.text.split(maxsplit=1)[1])
+    except:return await m.answer('Использование: <code>/unban 123456789</code>')
+    db.set_ban(uid,False);await m.answer(f'✅ Пользователь <code>{uid}</code> разблокирован.')
 
 async def main():
-    """Запуск бота"""
-    logger.info("🚀 Бот запускается...")
-    logger.info(f"👑 Владелец: {OWNER_ID}")
-    logger.info(f"📢 Канал логов: {LOG_CHANNEL_ID}")
-    
-    await dp.start_polling(bot)
-
-if __name__ == "__main__":
-    print("\n" + "="*40)
-    print("🎁 GIFT PARSER v3.0 CLEAN")
-    print("="*40 + "\n")
-    
-    try:
-        asyncio.run(main())
-    except KeyboardInterrupt:
-        print("\n👋 Бот остановлен")
-
-
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# ⚙️ АДМИНКА
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-@dp.message(F.text == "⚙️ Админка")
-async def btn_admin(message: Message):
-    """Админка"""
-    user_id = message.from_user.id
-    
-    if user_id != OWNER_ID:
-        await message.answer("❌ Доступ запрещён")
-        return
-    
-    # Статистика
-    conn = db.get_connection()
-    cursor = conn.cursor()
-    
-    cursor.execute("SELECT COUNT(*) FROM users")
-    total_users = cursor.fetchone()[0]
-    
-    cursor.execute("SELECT COUNT(*) FROM users WHERE is_premium = 1")
-    premium_users = cursor.fetchone()[0]
-    
-    cursor.execute("SELECT COUNT(*) FROM search_history")
-    total_searches = cursor.fetchone()[0]
-    
-    conn.close()
-    
-    admin_text = (
-        "╔═══════════════════════════╗\n"
-        "║     ⚙️ <b>АДМИН-ПАНЕЛЬ</b>    ║\n"
-        "╚═══════════════════════════╝\n\n"
-        "<b>📊 Статистика:</b>\n"
-        f"👥 Пользователей: {total_users}\n"
-        f"⭐ Premium: {premium_users}\n"
-        f"🔍 Поисков: {total_searches}\n\n"
-        "<b>Команды:</b>\n"
-        "/give_premium @username - выдать Premium\n"
-        "/add_trials @username 25 - добавить поиски\n"
-        "/ban @username - забанить\n"
-        "/unban @username - разбанить\n"
-        "/stats - детальная статистика"
-    )
-    
-    await message.answer(admin_text)
-
-@dp.message(Command("give_premium"))
-async def cmd_give_premium(message: Message):
-    """Выдать Premium"""
-    if message.from_user.id != OWNER_ID:
-        return
-    
-    # Парсинг @username из команды
-    parts = message.text.split()
-    if len(parts) < 2:
-        await message.answer("❌ Использование: /give_premium @username")
-        return
-    
-    username = parts[1].lstrip('@')
-    user = db.get_user_by_username(username)
-    
-    if not user:
-        await message.answer(f"❌ Пользователь @{username} не найден")
-        return
-    
-    db.set_premium(user['user_id'], True)
-    await message.answer(f"✅ Premium выдан пользователю @{username}")
-    await channel_logger.log_action(message.from_user.id, message.from_user.username, f"Выдан Premium: @{username}")
-
-@dp.message(Command("add_trials"))
-async def cmd_add_trials(message: Message):
-    """Добавить пробные поиски"""
-    if message.from_user.id != OWNER_ID:
-        return
-    
-    parts = message.text.split()
-    if len(parts) < 3:
-        await message.answer("❌ Использование: /add_trials @username количество")
-        return
-    
-    username = parts[1].lstrip('@')
-    try:
-        count = int(parts[2])
-    except ValueError:
-        await message.answer("❌ Количество должно быть числом")
-        return
-    
-    user = db.get_user_by_username(username)
-    
-    if not user:
-        await message.answer(f"❌ Пользователь @{username} не найден")
-        return
-    
-    new_value = user['trial_searches_left'] + count
-    db.update_trial_searches(user['user_id'], new_value)
-    
-    await message.answer(f"✅ Добавлено {count} поисков пользователю @{username}\nТеперь: {new_value}")
-    await channel_logger.log_action(message.from_user.id, message.from_user.username, f"Добавлено {count} поисков: @{username}")
-
-@dp.message(Command("ban"))
-async def cmd_ban(message: Message):
-    """Забанить пользователя"""
-    if message.from_user.id != OWNER_ID:
-        return
-    
-    parts = message.text.split()
-    if len(parts) < 2:
-        await message.answer("❌ Использование: /ban @username")
-        return
-    
-    username = parts[1].lstrip('@')
-    user = db.get_user_by_username(username)
-    
-    if not user:
-        await message.answer(f"❌ Пользователь @{username} не найден")
-        return
-    
-    db.ban_user(user['user_id'])
-    await message.answer(f"✅ Пользователь @{username} забанен")
-    await channel_logger.log_action(message.from_user.id, message.from_user.username, f"Забанен: @{username}")
-
-@dp.message(Command("unban"))
-async def cmd_unban(message: Message):
-    """Разбанить пользователя"""
-    if message.from_user.id != OWNER_ID:
-        return
-    
-    parts = message.text.split()
-    if len(parts) < 2:
-        await message.answer("❌ Использование: /unban @username")
-        return
-    
-    username = parts[1].lstrip('@')
-    user = db.get_user_by_username(username)
-    
-    if not user:
-        await message.answer(f"❌ Пользователь @{username} не найден")
-        return
-    
-    db.unban_user(user['user_id'])
-    await message.answer(f"✅ Пользователь @{username} разбанен")
-    await channel_logger.log_action(message.from_user.id, message.from_user.username, f"Разбанен: @{username}")
-
-@dp.message(Command("stats"))
-async def cmd_stats(message: Message):
-    """Детальная статистика"""
-    if message.from_user.id != OWNER_ID:
-        return
-    
-    conn = db.get_connection()
-    cursor = conn.cursor()
-    
-    # Общая статистика
-    cursor.execute("SELECT COUNT(*) FROM users")
-    total_users = cursor.fetchone()[0]
-    
-    cursor.execute("SELECT COUNT(*) FROM users WHERE is_premium = 1")
-    premium_users = cursor.fetchone()[0]
-    
-    cursor.execute("SELECT COUNT(*) FROM users WHERE is_banned = 1")
-    banned_users = cursor.fetchone()[0]
-    
-    cursor.execute("SELECT COUNT(*) FROM search_history")
-    total_searches = cursor.fetchone()[0]
-    
-    cursor.execute("SELECT COUNT(*) FROM found_gifts")
-    total_found = cursor.fetchone()[0]
-    
-    # Топ пользователей
-    cursor.execute("""
-        SELECT username, total_searches, total_found 
-        FROM users 
-        ORDER BY total_searches DESC 
-        LIMIT 5
-    """)
-    top_users = cursor.fetchall()
-    
-    conn.close()
-    
-    stats_text = (
-        "╔═══════════════════════════╗\n"
-        "║   📊 <b>СТАТИСТИКА БОТА</b>  ║\n"
-        "╚═══════════════════════════╝\n\n"
-        f"👥 Всего пользователей: {total_users}\n"
-        f"⭐ Premium: {premium_users}\n"
-        f"🚫 Забанено: {banned_users}\n\n"
-        f"🔍 Всего поисков: {total_searches}\n"
-        f"✅ Найдено подарков: {total_found}\n\n"
-        "<b>🏆 Топ пользователей:</b>\n"
-    )
-    
-    for i, user in enumerate(top_users, 1):
-        username = user[0] or "Нет username"
-        searches = user[1]
-        found = user[2]
-        stats_text += f"{i}. @{username} - {searches} поисков, {found} найдено\n"
-    
-    await message.answer(stats_text)
+    await bot.delete_webhook(drop_pending_updates=True)
+    try:await dp.start_polling(bot)
+    finally:await api.close();await bot.session.close()
+if __name__=='__main__':asyncio.run(main())
