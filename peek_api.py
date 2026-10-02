@@ -6,7 +6,7 @@ import os
 
 PEEK_URL = "https://server.peek.tg/api/nft/gifts/search"
 
-# Актуальный список моделей подарков (из Telegram) - ПОЛНЫЙ СПИСОК 55 шт
+# Актуальный список моделей подарков (55 шт)
 AVAILABLE_MODELS = [
     "PreciousPeach", "PlushPepe", "HeroicHelmet", "MightyArm", "IonGem",
     "DurovsCap", "NailBracelet", "PerfumeBottle", "MagicPotion", "MiniOscar",
@@ -18,9 +18,7 @@ AVAILABLE_MODELS = [
     "PetSnake", "GingerCookie", "FreshSocks", "BerryBox", "InputKey",
     "VictoryMedal", "HypnoLollipop", "SnoopCigar", "EvilEye", "SpringBasket",
     "ValentineBox", "LushBouquet", "RecordPlayer", "InstantRamen", "HexPot",
-    "SnakeBox", "IonicDryer", "HomemadeCake", "SpicedWine", "SantaHat",
-    # Добавлены недостающие:
-    "EternalRose", "MoneyPot", "BlueStar", "RedRibbon", "GoldenTrophy"
+    "SnakeBox", "IonicDryer", "HomemadeCake", "SpicedWine", "SantaHat"
 ]
 
 # Функция для правильной капитализации (каждое слово с большой буквы, без пробелов)

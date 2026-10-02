@@ -170,28 +170,26 @@ async def cmd_start(message: Message, state: FSMContext):
     is_admin = (user_id == OWNER_ID)
     first_name = message.from_user.first_name or "друг"
     
-    # Красивое приветствие
+    # Красивое приветствие как на скрине
     welcome_text = (
-        "╔═══════════════════════════╗\n"
-        "║   🎁 <b>GIFT PARSER v3.0</b>   ║\n"
-        "╚═══════════════════════════╝\n\n"
-        f"👋 Привет, <b>{first_name}</b>!\n\n"
-        "🔍 <b>Поиск Telegram NFT подарков:</b>\n"
-        "   • По модели (EternalRose, EvilEye...)\n"
-        "   • По диапазону ID (100-200)\n"
-        "   • Случайный поиск\n\n"
-        "💎 <b>Твой статус:</b>\n"
+        f"<i>Привет, {first_name}!</i>\n\n"
+        "Рады видеть тебя в Gift Parser\n\n"
+        "<b>Бот предназначен для поиска любых NFT подарков</b>\n\n"
+        "<blockquote>Твой статус:\n"
     )
     
     if is_admin:
-        welcome_text += "   👑 <b>Администратор</b> (безлимит)\n"
+        welcome_text += "Твои лимиты:</blockquote>"
+        welcome_text += "\n\n👑 <b>Администратор (безлимит)</b>"
     elif user and user['is_premium']:
-        welcome_text += "   ⭐ <b>Premium</b> (безлимит)\n"
+        welcome_text += "Твои лимиты:</blockquote>"
+        welcome_text += "\n\n⭐ <b>Premium (безлимит)</b>"
     else:
         trials = user['trial_searches_left'] if user else 25
-        welcome_text += f"   🆓 Пробная версия (<b>{trials}/25</b> поисков)\n"
+        welcome_text += f"Твои лимиты:</blockquote>"
+        welcome_text += f"\n\n🆓 Пробная версия: <b>{trials}/25</b> поисков"
     
-    welcome_text += "\n📌 <b>Выбери действие в меню</b> 👇"
+    welcome_text += "\n\nВыбери действие в меню 👇"
     
     await message.answer(
         welcome_text,
@@ -353,16 +351,10 @@ async def btn_search_start(message: Message, state: FSMContext):
     
     await state.set_state(SearchStates.waiting_for_model)
     
+    # Текст как на скрине 1
     await message.answer(
-        "╔═══════════════════════════╗\n"
-        "║   🔍 <b>ПОИСК ПО МОДЕЛИ</b>   ║\n"
-        "╚═══════════════════════════╝\n\n"
-        "🎁 <b>Введи название модели:</b>\n\n"
-        "<i>Примеры:</i>\n"
-        "• <code>Eternal Rose</code>\n"
-        "• <code>Evil Eye</code>\n"
-        "• <code>BlueStar</code>\n\n"
-        "💡 Регистр и пробелы не важны",
+        "Поиск подарков по модели\n\n"
+        "<blockquote><b>Введите название подарка:</b></blockquote>",
         reply_markup=cancel_keyboard()
     )
 
@@ -859,3 +851,203 @@ if __name__ == "__main__":
         asyncio.run(main())
     except KeyboardInterrupt:
         print("\n👋 Бот остановлен")
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# ⚙️ АДМИНКА
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+@dp.message(F.text == "⚙️ Админка")
+async def btn_admin(message: Message):
+    """Админка"""
+    user_id = message.from_user.id
+    
+    if user_id != OWNER_ID:
+        await message.answer("❌ Доступ запрещён")
+        return
+    
+    # Статистика
+    conn = db.get_connection()
+    cursor = conn.cursor()
+    
+    cursor.execute("SELECT COUNT(*) FROM users")
+    total_users = cursor.fetchone()[0]
+    
+    cursor.execute("SELECT COUNT(*) FROM users WHERE is_premium = 1")
+    premium_users = cursor.fetchone()[0]
+    
+    cursor.execute("SELECT COUNT(*) FROM search_history")
+    total_searches = cursor.fetchone()[0]
+    
+    conn.close()
+    
+    admin_text = (
+        "╔═══════════════════════════╗\n"
+        "║     ⚙️ <b>АДМИН-ПАНЕЛЬ</b>    ║\n"
+        "╚═══════════════════════════╝\n\n"
+        "<b>📊 Статистика:</b>\n"
+        f"👥 Пользователей: {total_users}\n"
+        f"⭐ Premium: {premium_users}\n"
+        f"🔍 Поисков: {total_searches}\n\n"
+        "<b>Команды:</b>\n"
+        "/give_premium @username - выдать Premium\n"
+        "/add_trials @username 25 - добавить поиски\n"
+        "/ban @username - забанить\n"
+        "/unban @username - разбанить\n"
+        "/stats - детальная статистика"
+    )
+    
+    await message.answer(admin_text)
+
+@dp.message(Command("give_premium"))
+async def cmd_give_premium(message: Message):
+    """Выдать Premium"""
+    if message.from_user.id != OWNER_ID:
+        return
+    
+    # Парсинг @username из команды
+    parts = message.text.split()
+    if len(parts) < 2:
+        await message.answer("❌ Использование: /give_premium @username")
+        return
+    
+    username = parts[1].lstrip('@')
+    user = db.get_user_by_username(username)
+    
+    if not user:
+        await message.answer(f"❌ Пользователь @{username} не найден")
+        return
+    
+    db.set_premium(user['user_id'], True)
+    await message.answer(f"✅ Premium выдан пользователю @{username}")
+    await channel_logger.log_action(message.from_user.id, message.from_user.username, f"Выдан Premium: @{username}")
+
+@dp.message(Command("add_trials"))
+async def cmd_add_trials(message: Message):
+    """Добавить пробные поиски"""
+    if message.from_user.id != OWNER_ID:
+        return
+    
+    parts = message.text.split()
+    if len(parts) < 3:
+        await message.answer("❌ Использование: /add_trials @username количество")
+        return
+    
+    username = parts[1].lstrip('@')
+    try:
+        count = int(parts[2])
+    except ValueError:
+        await message.answer("❌ Количество должно быть числом")
+        return
+    
+    user = db.get_user_by_username(username)
+    
+    if not user:
+        await message.answer(f"❌ Пользователь @{username} не найден")
+        return
+    
+    new_value = user['trial_searches_left'] + count
+    db.update_trial_searches(user['user_id'], new_value)
+    
+    await message.answer(f"✅ Добавлено {count} поисков пользователю @{username}\nТеперь: {new_value}")
+    await channel_logger.log_action(message.from_user.id, message.from_user.username, f"Добавлено {count} поисков: @{username}")
+
+@dp.message(Command("ban"))
+async def cmd_ban(message: Message):
+    """Забанить пользователя"""
+    if message.from_user.id != OWNER_ID:
+        return
+    
+    parts = message.text.split()
+    if len(parts) < 2:
+        await message.answer("❌ Использование: /ban @username")
+        return
+    
+    username = parts[1].lstrip('@')
+    user = db.get_user_by_username(username)
+    
+    if not user:
+        await message.answer(f"❌ Пользователь @{username} не найден")
+        return
+    
+    db.ban_user(user['user_id'])
+    await message.answer(f"✅ Пользователь @{username} забанен")
+    await channel_logger.log_action(message.from_user.id, message.from_user.username, f"Забанен: @{username}")
+
+@dp.message(Command("unban"))
+async def cmd_unban(message: Message):
+    """Разбанить пользователя"""
+    if message.from_user.id != OWNER_ID:
+        return
+    
+    parts = message.text.split()
+    if len(parts) < 2:
+        await message.answer("❌ Использование: /unban @username")
+        return
+    
+    username = parts[1].lstrip('@')
+    user = db.get_user_by_username(username)
+    
+    if not user:
+        await message.answer(f"❌ Пользователь @{username} не найден")
+        return
+    
+    db.unban_user(user['user_id'])
+    await message.answer(f"✅ Пользователь @{username} разбанен")
+    await channel_logger.log_action(message.from_user.id, message.from_user.username, f"Разбанен: @{username}")
+
+@dp.message(Command("stats"))
+async def cmd_stats(message: Message):
+    """Детальная статистика"""
+    if message.from_user.id != OWNER_ID:
+        return
+    
+    conn = db.get_connection()
+    cursor = conn.cursor()
+    
+    # Общая статистика
+    cursor.execute("SELECT COUNT(*) FROM users")
+    total_users = cursor.fetchone()[0]
+    
+    cursor.execute("SELECT COUNT(*) FROM users WHERE is_premium = 1")
+    premium_users = cursor.fetchone()[0]
+    
+    cursor.execute("SELECT COUNT(*) FROM users WHERE is_banned = 1")
+    banned_users = cursor.fetchone()[0]
+    
+    cursor.execute("SELECT COUNT(*) FROM search_history")
+    total_searches = cursor.fetchone()[0]
+    
+    cursor.execute("SELECT COUNT(*) FROM found_gifts")
+    total_found = cursor.fetchone()[0]
+    
+    # Топ пользователей
+    cursor.execute("""
+        SELECT username, total_searches, total_found 
+        FROM users 
+        ORDER BY total_searches DESC 
+        LIMIT 5
+    """)
+    top_users = cursor.fetchall()
+    
+    conn.close()
+    
+    stats_text = (
+        "╔═══════════════════════════╗\n"
+        "║   📊 <b>СТАТИСТИКА БОТА</b>  ║\n"
+        "╚═══════════════════════════╝\n\n"
+        f"👥 Всего пользователей: {total_users}\n"
+        f"⭐ Premium: {premium_users}\n"
+        f"🚫 Забанено: {banned_users}\n\n"
+        f"🔍 Всего поисков: {total_searches}\n"
+        f"✅ Найдено подарков: {total_found}\n\n"
+        "<b>🏆 Топ пользователей:</b>\n"
+    )
+    
+    for i, user in enumerate(top_users, 1):
+        username = user[0] or "Нет username"
+        searches = user[1]
+        found = user[2]
+        stats_text += f"{i}. @{username} - {searches} поисков, {found} найдено\n"
+    
+    await message.answer(stats_text)
