@@ -1,5 +1,6 @@
 import asyncio
 import logging
+from logging.handlers import RotatingFileHandler
 import os
 import random
 import re
@@ -13,7 +14,7 @@ from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
-from aiogram.types import BotCommand, BufferedInputFile, CallbackQuery, LinkPreviewOptions, Message
+from aiogram.types import BotCommand, BufferedInputFile, CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, LinkPreviewOptions, Message
 from dotenv import load_dotenv
 
 import keyboards as kb
@@ -22,7 +23,20 @@ from database import Database
 from peek_api import AVAILABLE_MODELS, PeekAPI, gift_url, is_known_model, normalize_model_name, suggest_models
 
 load_dotenv()
-logging.basicConfig(level=logging.INFO, format='%(asctime)s | %(levelname)s | %(message)s')
+LOG_DIR = os.getenv('LOG_DIR', 'logs')
+os.makedirs(LOG_DIR, exist_ok=True)
+LOG_FILE = os.path.join(LOG_DIR, 'giftparser.log')
+_root = logging.getLogger()
+_root.setLevel(logging.INFO)
+_fmt = logging.Formatter('%(asctime)s | %(levelname)s | %(name)s | %(message)s')
+if not any(isinstance(h, RotatingFileHandler) and getattr(h, 'baseFilename', '') == os.path.abspath(LOG_FILE) for h in _root.handlers):
+    _fh = RotatingFileHandler(LOG_FILE, maxBytes=2_000_000, backupCount=3, encoding='utf-8')
+    _fh.setFormatter(_fmt)
+    _root.addHandler(_fh)
+if not any(isinstance(h, logging.StreamHandler) and not isinstance(h, RotatingFileHandler) for h in _root.handlers):
+    _sh = logging.StreamHandler()
+    _sh.setFormatter(_fmt)
+    _root.addHandler(_sh)
 log = logging.getLogger('giftparser')
 
 TOKEN = os.getenv('BOT_TOKEN')
@@ -33,7 +47,10 @@ if not TOKEN:
 
 MAX_RANGE = 10_000        # максимум ID за один поиск
 MAX_LIVE_CARDS = 30       # сколько карточек присылать «вживую» во время поиска
-EDIT_INTERVAL = 1.5       # не чаще раза в N секунд обновляем статус (защита от flood)
+EDIT_INTERVAL = 1.5       # не чаще раза в N секунд обновляем статус
+GIFT_REQUEST_DELAY = float(os.getenv('GIFT_REQUEST_DELAY', '5'))
+API_REQUEST_LOCK = asyncio.Lock()
+NEXT_API_REQUEST_AT = 0.0
 
 bot = Bot(TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 dp = Dispatcher(storage=MemoryStorage())
@@ -47,7 +64,9 @@ class S(StatesGroup):
     range = State()
     id_model = State()
     id_number = State()
+    random_model = State()
     random_count = State()
+    model_catalog_search = State()
 
 
 # ───────────────────────── помощники ─────────────────────────
@@ -79,6 +98,49 @@ async def safe(fn, *args, **kwargs):
         except TelegramRetryAfter as e:
             await asyncio.sleep(e.retry_after + 0.5)
     return await fn(*args, **kwargs)
+
+
+async def peek_get_gift(model: str, number: int):
+    """Один запрос к Peek с глобальной паузой между стартами запросов."""
+    global NEXT_API_REQUEST_AT
+    async with API_REQUEST_LOCK:
+        loop = asyncio.get_running_loop()
+        wait = max(0.0, NEXT_API_REQUEST_AT - loop.time())
+        if wait:
+            await asyncio.sleep(wait)
+        started = loop.time()
+        try:
+            return await api.get_gift(model, number)
+        finally:
+            NEXT_API_REQUEST_AT = max(loop.time(), started) + GIFT_REQUEST_DELAY
+
+
+def tail_logs(lines=80):
+    try:
+        with open(LOG_FILE, 'r', encoding='utf-8', errors='replace') as f:
+            return ''.join(f.readlines()[-lines:])
+    except OSError as e:
+        return f'Не удалось прочитать лог: {e}'
+
+
+def admin_panel_kb():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text='📊 Статистика', callback_data='adm:stats'), InlineKeyboardButton(text='👥 Пользователи', callback_data='adm:users')],
+        [InlineKeyboardButton(text='📜 Логи', callback_data='adm:logs'), InlineKeyboardButton(text='🔎 Последние поиски', callback_data='adm:searches')],
+    ])
+
+
+def new_search_kb(uid):
+    rows = [[InlineKeyboardButton(text='🎁 Модели', callback_data='models:1'), InlineKeyboardButton(text='🔎 Поиск модели', callback_data='models_search')]]
+    last = db.last_resumable_search(uid)
+    if last:
+        rows.append([InlineKeyboardButton(text=f'▶️ Продолжить #{last["id"]}', callback_data=f'resume:{last["id"]}')])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def models_search_kb(mode='catalog'):
+    cb = 'models_search:random' if mode == 'random' else 'models_search'
+    return InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text='🔎 Найти модель', callback_data=cb)]])
 
 
 async def edit(msg: Message, text, markup=None):
@@ -222,7 +284,7 @@ async def new_search(m: Message, state: FSMContext):
         '🔎 <b>Новый поиск</b>\n\nВведите название модели:\n'
         + ui.block('<code>Plush Pepe</code>', '<code>Eternal Rose</code>') +
         '\n<i>Или выберите из каталога — кнопка «🎁 Модели».</i>',
-        reply_markup=kb.cancel())
+        reply_markup=new_search_kb(m.from_user.id))
 
 
 @dp.message(S.model)
@@ -248,6 +310,11 @@ async def pick_model(c: CallbackQuery, state: FSMContext):
     await c.answer()
     if not allowed(c.from_user.id, 1):
         return await c.message.answer('🆓 <b>Лимит Trial закончился.</b>\n\n💎 Подключите Premium для продолжения.')
+    current_state = await state.get_state()
+    if current_state == S.random_model.state:
+        await state.update_data(model=model)
+        await state.set_state(S.random_count)
+        return await c.message.answer(f'🎲 Модель · <b>{ui.esc(ui.pretty(model))}</b>\n\nСколько случайных ID проверить? <code>1–20</code>', reply_markup=kb.cancel())
     await ask_range(c.message, state, model)
 
 
@@ -291,7 +358,7 @@ async def run_search(chat: Message, uid: int, model: str, start: int, end: int, 
     t0 = time.monotonic()
     session_checked = skipped = shown = fail_streak = 0
     last_edit = 0.0
-    batch_size = max(5, CONCURRENCY * 3)
+    batch_size = 1
 
     def card(state, **kw):
         elapsed = time.monotonic() - t0
@@ -299,7 +366,7 @@ async def run_search(chat: Message, uid: int, model: str, start: int, end: int, 
         eta = (total - checked) / rate if rate else 0
         return ui.search_card(state, model, start, end, checked, total, found,
                               rate=rate, eta=eta, elapsed=elapsed, skipped=skipped,
-                              shown_cards=MAX_LIVE_CARDS, **kw)
+                              shown_cards=MAX_LIVE_CARDS, search_id=sid, **kw)
 
     msg = await chat.answer(card('running'), reply_markup=kb.running_kb())
     try:
@@ -310,13 +377,13 @@ async def run_search(chat: Message, uid: int, model: str, start: int, end: int, 
                 return await edit(msg, card('stopped'), kb.search_done_kb(sid, found, resumable=True))
 
             nums = list(range(current, min(end, current + batch_size - 1) + 1))
-            results = dict(zip(nums, await asyncio.gather(*(api.get_gift(model, n) for n in nums),
+            results = dict(zip(nums, await asyncio.gather(*(peek_get_gift(model, n) for n in nums),
                                                           return_exceptions=True)))
             # ── повторная попытка для сбойных ID
             failed = [n for n, r in results.items() if isinstance(r, Exception)]
             if failed:
                 await asyncio.sleep(2)
-                again = await asyncio.gather(*(api.get_gift(model, n) for n in failed), return_exceptions=True)
+                again = await asyncio.gather(*(peek_get_gift(model, n) for n in failed), return_exceptions=True)
                 results.update(zip(failed, again))
                 failed = [n for n, r in results.items() if isinstance(r, Exception)]
 
@@ -405,7 +472,7 @@ async def id_number(m: Message, state: FSMContext):
     ACTIVE.add(uid)
     await m.answer('🔎 Проверяю…', reply_markup=user_menu(uid))
     try:
-        g = await api.get_gift(model, n)
+        g = await peek_get_gift(model, n)
         if not is_unlimited(uid):
             db.consume_trial(uid, 1)
         if not g:
@@ -422,9 +489,23 @@ async def id_number(m: Message, state: FSMContext):
 async def random_search(m: Message, state: FSMContext):
     if not allowed(m.from_user.id, 1):
         return await m.answer('🆓 <b>Лимит Trial закончился.</b>')
+    await state.set_state(S.random_model)
+    await m.answer('🎲 <b>Случайный подарок</b>\n\nВведите модель или выберите её в каталоге.', reply_markup=models_search_kb('random'))
+
+
+@dp.message(S.random_model)
+async def random_model(m: Message, state: FSMContext):
+    raw = (m.text or '').strip()
+    if len(raw) < 2:
+        return await m.answer('❌ Введите название модели.')
+    name = normalize_model_name(raw)
+    if not is_known_model(name):
+        options = suggest_models(raw)
+        if options:
+            return await m.answer('🤔 Выберите модель:', reply_markup=kb.model_suggest_kb(options, name))
+    await state.update_data(model=name)
     await state.set_state(S.random_count)
-    await m.answer('🎲 <b>Случайный поиск</b>\n\nСколько случайных ID проверить? <code>1–20</code>',
-                   reply_markup=kb.cancel())
+    await m.answer(f'🎲 Модель · <b>{ui.esc(ui.pretty(name))}</b>\n\nСколько случайных ID проверить? <code>1–20</code>', reply_markup=kb.cancel())
 
 
 @dp.message(S.random_count)
@@ -435,11 +516,11 @@ async def random_count(m: Message, state: FSMContext):
     count, uid = int(text), m.from_user.id
     if not allowed(uid, count):
         return await m.answer(f'🆓 Недостаточно проверок: осталось <b>{trial_left(uid)}</b>.')
+    model = (await state.get_data()).get('model')
     await state.clear()
 
     if uid in ACTIVE:
         return await m.answer('⏳ У вас уже идёт проверка. Дождитесь её завершения или остановите.')
-    model = random.choice(AVAILABLE_MODELS)
     numbers = random.sample(range(1, 100_000), count)
     ACTIVE.add(uid)
     db.clear_stop(uid)
@@ -453,7 +534,7 @@ async def random_count(m: Message, state: FSMContext):
                 stopped = True
                 break
             try:
-                gift = await api.get_gift(model, n)
+                gift = await peek_get_gift(model, n)
             except Exception as exc:
                 errors += 1
                 log.warning('Random lookup failed for #%s: %s', n, exc)
@@ -635,6 +716,28 @@ async def show_models(target: Message, page: int, edit_mode=False):
         await target.answer(text, reply_markup=markup)
 
 
+@dp.callback_query(F.data.in_({'models_search', 'models_search:random'}))
+async def models_search_start(c: CallbackQuery, state: FSMContext):
+    await c.answer()
+    random_mode = c.data == 'models_search:random'
+    await state.set_state(S.random_model if random_mode else S.model_catalog_search)
+    await c.message.answer('🔎 <b>Поиск модели</b>\n\nВведите название модели:', reply_markup=kb.cancel())
+
+
+@dp.message(S.model_catalog_search)
+async def models_search_step(m: Message, state: FSMContext):
+    raw = (m.text or '').strip()
+    if len(raw) < 2:
+        return await m.answer('❌ Введите хотя бы 2 символа.')
+    options = suggest_models(raw)
+    if not options and is_known_model(normalize_model_name(raw)):
+        options = [normalize_model_name(raw)]
+    await state.clear()
+    if not options:
+        return await m.answer('❌ Модель не найдена. Попробуйте другое название.', reply_markup=models_search_kb())
+    await m.answer('🎁 <b>Найденные модели</b>\n\n' + ui.block(*[f'• {ui.esc(ui.pretty(x))}' for x in options[:20]]), reply_markup=kb.model_suggest_kb(options[:20], normalize_model_name(raw)))
+
+
 @dp.message(F.text == kb.BTN_MODELS)
 async def models(m: Message):
     await show_models(m, 1)
@@ -650,7 +753,7 @@ async def models_page(c: CallbackQuery):
 @dp.message(F.text == kb.BTN_ADMIN)
 async def admin(m: Message):
     if is_admin(m.from_user.id):
-        await m.answer(f'⚙️ <b>{ui.small("Admin")} · Панель</b>', reply_markup=kb.admin_menu())
+        await m.answer('⚙️ <b>Админ-панель</b>\n\nУправление, статистика и логи.', reply_markup=admin_panel_kb())
 
 
 def stats_text():
@@ -685,6 +788,29 @@ async def adm_users(c: CallbackQuery):
     await c.message.answer(
         f'👥 <b>{ui.small("Users")} · Последние пользователи</b>\n\n' + ui.block(*lines) +
         '\n<i>Команды:</i> <code>/grant ID</code> · <code>/revoke ID</code> · <code>/ban ID</code> · <code>/unban ID</code>')
+
+
+@dp.callback_query(F.data == 'adm:logs')
+async def adm_logs(c: CallbackQuery):
+    if not is_admin(c.from_user.id):
+        return await c.answer('Нет доступа', show_alert=True)
+    await c.answer()
+    text = tail_logs(60)
+    if len(text) > 3800:
+        text = text[-3800:]
+    await c.message.answer('📜 <b>Логи</b>\n\n<pre>' + ui.esc(text) + '</pre>')
+
+
+@dp.callback_query(F.data == 'adm:searches')
+async def adm_searches(c: CallbackQuery):
+    if not is_admin(c.from_user.id):
+        return await c.answer('Нет доступа', show_alert=True)
+    await c.answer()
+    rows = db.recent_searches(15)
+    lines = []
+    for x in rows:
+        lines.append(f'#{x["id"]} · <b>{ui.esc(ui.pretty(x["model"]))}</b> · {x["start_id"]}-{x["end_id"]} · {x["status"]} · {x["last_checked_id"]}')
+    await c.message.answer('🔎 <b>Последние поиски</b>\n\n' + ui.block(*lines) if lines else '🔎 <b>Поисков пока нет.</b>')
 
 
 def _admin_target(m: Message):
@@ -725,6 +851,7 @@ async def revoke(m: Message):
 
 # ───────────────────────── запуск ─────────────────────────
 async def main():
+    log.info('GiftParser started; request delay=%ss; concurrency=%s', GIFT_REQUEST_DELAY, CONCURRENCY)
     await bot.delete_webhook(drop_pending_updates=True)
     await bot.set_my_commands([
         BotCommand(command='start', description='Главное меню'),

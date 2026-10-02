@@ -15,30 +15,12 @@ VERSION = '5.2'
 TRIAL_DEFAULT = 25
 
 # ───────────────────────── «шрифты» ─────────────────────────
-_SMALL = dict(zip(
-    'abcdefghijklmnopqrstuvwxyz',
-    'ᴀʙᴄᴅᴇғɢʜɪᴊᴋʟᴍɴᴏᴘǫʀsᴛᴜᴠᴡxʏᴢ',
-))
-
-
 def small(text: str) -> str:
-    """ɢɪғᴛᴘᴀʀsᴇʀ — маленькие капсы (латиница, остальное без изменений)."""
-    return ''.join(_SMALL.get(ch.lower(), ch) for ch in str(text))
+    return str(text)
 
 
 def sans(text: str) -> str:
-    """𝗦𝗮𝗻𝘀 𝗕𝗼𝗹𝗱 — жирный гротеск (латиница и цифры)."""
-    out = []
-    for ch in str(text):
-        if 'A' <= ch <= 'Z':
-            out.append(chr(0x1D5D4 + ord(ch) - 65))
-        elif 'a' <= ch <= 'z':
-            out.append(chr(0x1D5EE + ord(ch) - 97))
-        elif '0' <= ch <= '9':
-            out.append(chr(0x1D7EC + ord(ch) - 48))
-        else:
-            out.append(ch)
-    return ''.join(out)
+    return str(text)
 
 
 # ───────────────────────── мелкие помощники ─────────────────────────
@@ -245,7 +227,7 @@ _SEARCH_TITLES = {
 
 
 def search_card(state, model, start, end, checked, total, found,
-                rate=0.0, eta=0.0, elapsed=0.0, skipped=0, shown_cards=None) -> str:
+                rate=0.0, eta=0.0, elapsed=0.0, skipped=0, shown_cards=None, search_id=None) -> str:
     stats = [
         kv('📦', 'Проверено', f'{num(checked)} / {num(total)}'),
         kv('✨', 'Найдено', num(found)),
@@ -259,8 +241,9 @@ def search_card(state, model, start, end, checked, total, found,
 
     text = (
         f'{_SEARCH_TITLES[state]}\n'
-        f'🎁 <b>{esc(pretty(model))}</b> · <code>{start} → {end}</code>\n\n'
-        f'{bar(checked, total)}  <b>{percent(checked, total)}%</b>\n'
+        f'🎁 <b>{esc(pretty(model))}</b> · <code>{start} → {end}</code>\n'
+        + (f'📌 Поиск · <code>#{search_id}</code>\n\n' if search_id else '\n')
+        + f'{bar(checked, total)}  <b>{percent(checked, total)}%</b>\n'
         f'{block(*stats)}'
     )
     if shown_cards is not None and found > shown_cards:
