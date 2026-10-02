@@ -136,6 +136,11 @@ class Database:
         conn.commit()
         conn.close()
     
+    def is_banned(self, user_id: int) -> bool:
+        """Проверить забанен ли пользователь"""
+        user = self.get_user(user_id)
+        return user['is_banned'] if user else False
+    
     def set_premium(self, user_id: int, is_premium: bool):
         """Установить премиум статус"""
         conn = self.get_connection()
