@@ -28,7 +28,7 @@ log = logging.getLogger('giftparser')
 
 TOKEN = os.getenv('BOT_TOKEN')
 OWNER_ID = int(os.getenv('OWNER_ID') or 0)
-CONCURRENCY = int(os.getenv('PEEK_CONCURRENCY') or 5)
+CONCURRENCY = int(os.getenv('PEEK_CONCURRENCY') or 1)  # По 1 ID последовательно
 if not TOKEN:
     raise RuntimeError('BOT_TOKEN не указан в .env')
 
@@ -359,7 +359,7 @@ async def run_search(chat: Message, uid: int, model: str, start: int, end: int, 
     t0 = time.monotonic()
     session_checked = skipped = shown = fail_streak = 0
     last_edit = 0.0
-    batch_size = max(5, CONCURRENCY * 3)
+    batch_size = 1  # По 1 ID = показывает результаты каждые 5 секунд
 
     def card(state, **kw):
         elapsed = time.monotonic() - t0
