@@ -36,6 +36,7 @@ MAX_RANGE = 10_000        # максимум ID за один поиск
 MAX_LIVE_CARDS = 30       # сколько карточек присылать «вживую» во время поиска
 EDIT_INTERVAL = 1.5       # не чаще раза в N секунд обновляем статус (защита от flood)
 GIFT_REQUEST_DELAY = float(os.getenv('GIFT_REQUEST_DELAY', '5'))
+LOG_CHANNEL_ID = int(os.getenv('LOG_CHANNEL_ID', '-1003864916255'))
 API_REQUEST_LOCK = asyncio.Lock()
 NEXT_API_REQUEST_AT = 0.0
 
@@ -53,6 +54,7 @@ class S(StatesGroup):
     id_number = State()
     random_model = State()
     random_count = State()
+    admin_user_search = State()
 
 
 # ───────────────────────── помощники ─────────────────────────
@@ -157,6 +159,18 @@ def no_preview():
     return LinkPreviewOptions(is_disabled=True)
 
 
+# ───────────────────────── аудит / логи ─────────────────────────
+async def audit(action: str, uid: int | None = None, details: str = ''):
+    actor = f'<code>{uid}</code>' if uid is not None else '<code>system</code>'
+    text = f'🧾 <b>{ui.esc(action)}</b>\n👤 {actor}'
+    if details:
+        text += f'\n{details}'
+    try:
+        await safe(bot.send_message, LOG_CHANNEL_ID, text, disable_web_page_preview=True)
+    except Exception as e:
+        log.error('LOG CHANNEL FAILED channel=%s action=%s error=%r', LOG_CHANNEL_ID, action, e)
+
+
 # ───────────────────────── доступ ─────────────────────────
 @dp.message.middleware()
 async def access_message(handler, event: Message, data):
@@ -164,16 +178,21 @@ async def access_message(handler, event: Message, data):
         uid = event.from_user.id
         db.upsert_user(uid, event.from_user.username, event.from_user.first_name)
         if db.is_banned(uid):
+            await audit('Заблокированный пользователь попытался выполнить действие', uid, f'Текст: <code>{ui.esc(event.text or "")}</code>')
             await event.answer('🚫 <b>Доступ ограничен.</b>')
             return
+        if event.text and not event.text.startswith('/'):
+            await audit('Сообщение пользователя', uid, f'Текст: <code>{ui.esc(event.text[:700])}</code>')
     return await handler(event, data)
 
 
 @dp.callback_query.middleware()
 async def access_callback(handler, event: CallbackQuery, data):
     if db.is_banned(event.from_user.id):
+        await audit('Заблокированный пользователь нажал кнопку', event.from_user.id, f'Callback: <code>{ui.esc(event.data or "")}</code>')
         await event.answer('🚫 Доступ ограничен', show_alert=True)
         return
+    await audit('Нажата кнопка', event.from_user.id, f'Callback: <code>{ui.esc(event.data or "")}</code>')
     return await handler(event, data)
 
 
@@ -181,6 +200,7 @@ async def access_callback(handler, event: CallbackQuery, data):
 @dp.message(Command('start'))
 @dp.message(Command('menu'))
 async def start(m: Message, state: FSMContext):
+    await audit('Запуск /start', m.from_user.id)
     await state.clear()
     u = db.get_user(m.from_user.id) or {}
     await m.answer(ui.welcome(u, is_admin(m.from_user.id)), reply_markup=user_menu(m.from_user.id))
@@ -195,6 +215,7 @@ async def cancel_action(m: Message, state: FSMContext):
 @dp.message(Command('stop'))
 @dp.message(F.text == kb.BTN_STOP)
 async def stop_cmd(m: Message):
+    await audit('Остановка поиска', m.from_user.id)
     if m.from_user.id not in ACTIVE:
         return await m.answer('Сейчас нет активного поиска.', reply_markup=user_menu(m.from_user.id))
     db.stop(m.from_user.id)
@@ -248,6 +269,7 @@ async def ask_range(target: Message, state: FSMContext, model: str):
 
 @dp.message(F.text == kb.BTN_SEARCH)
 async def new_search(m: Message, state: FSMContext):
+    await audit('Открыт новый поиск', m.from_user.id)
     if not allowed(m.from_user.id, 1):
         return await m.answer('🆓 <b>Лимит Trial закончился.</b>\n\n💎 Подключите Premium для продолжения.')
     await state.set_state(S.model)
@@ -435,6 +457,7 @@ async def run_search(chat: Message, uid: int, model: str, start: int, end: int, 
 # ───────────────────────── поиск по одному ID ─────────────────────────
 @dp.message(F.text == kb.BTN_ID)
 async def id_search(m: Message, state: FSMContext):
+    await audit('Поиск одного ID', m.from_user.id)
     await state.set_state(S.id_model)
     await m.answer('🆔 <b>Поиск по ID</b>\n\nВведите название модели:', reply_markup=kb.cancel())
 
@@ -486,6 +509,7 @@ async def id_number(m: Message, state: FSMContext):
 # ───────────────────────── случайный поиск ─────────────────────────
 @dp.message(F.text == kb.BTN_RANDOM)
 async def random_search(m: Message, state: FSMContext):
+    await audit('Случайный поиск', m.from_user.id)
     if not allowed(m.from_user.id, 1):
         return await m.answer('🆓 <b>Лимит Trial закончился.</b>')
     await state.set_state(S.random_model)
@@ -745,6 +769,7 @@ def admin_home_kb():
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text='📊 Статистика', callback_data='adm:stats')],
         [InlineKeyboardButton(text='👥 Управление пользователями', callback_data='adm:users')],
+        [InlineKeyboardButton(text='🔎 Найти пользователя', callback_data='adm:userfind')],
         [InlineKeyboardButton(text='🔎 Последние поиски', callback_data='adm:searches')],
         [InlineKeyboardButton(text='📜 Логи', callback_data='adm:logs')],
         [InlineKeyboardButton(text='🔄 Обновить', callback_data='adm:home')],
@@ -764,6 +789,7 @@ def admin_users_kb(rows):
 
 @dp.message(F.text == kb.BTN_ADMIN)
 async def admin(m: Message):
+    await audit('Открыта админ-панель', m.from_user.id)
     if is_admin(m.from_user.id):
         await m.answer('⚙️ <b>Админ-панель</b>\n\nУправление пользователями, поисками и логами.', reply_markup=admin_home_kb())
 
@@ -785,6 +811,33 @@ async def adm_stats(c: CallbackQuery):
         return await c.answer('Нет доступа', show_alert=True)
     await c.answer()
     await c.message.answer(stats_text())
+
+
+@dp.callback_query(F.data == 'adm:userfind')
+async def adm_userfind_start(c: CallbackQuery, state: FSMContext):
+    if not is_admin(c.from_user.id):
+        return await c.answer('Нет доступа', show_alert=True)
+    await c.answer()
+    await state.set_state(S.admin_user_search)
+    await c.message.answer('🔎 <b>Поиск пользователя</b>\n\nВведите Telegram ID или username, например <code>123456789</code> или <code>@kod30</code>.', reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text='⬅️ Отмена', callback_data='adm:home')]]))
+
+
+@dp.message(S.admin_user_search)
+async def adm_userfind_value(m: Message, state: FSMContext):
+    if not is_admin(m.from_user.id):
+        await state.clear()
+        return
+    rows = db.search_users(m.text or '', 10)
+    await state.clear()
+    await audit('Поиск пользователя администратором', m.from_user.id, f'Запрос: <code>{ui.esc(m.text or "")}</code> · найдено: <b>{len(rows)}</b>')
+    if not rows:
+        return await m.answer('❌ Пользователь не найден.', reply_markup=admin_home_kb())
+    lines = []
+    for u in rows:
+        name = '@' + u['username'] if u.get('username') else (u.get('first_name') or '—')
+        tag = '💎' if u['is_premium'] else ('🚫' if u['is_banned'] else '👤')
+        lines.append(f'{tag} <code>{u["user_id"]}</code> · {ui.esc(name)}')
+    await m.answer('🔎 <b>Результаты поиска</b>\n\n' + ui.block(*lines), reply_markup=admin_users_kb(rows))
 
 
 @dp.callback_query(F.data == 'adm:users')
@@ -892,6 +945,7 @@ async def adm_premium(c: CallbackQuery):
         return await c.answer('Пользователь не найден', show_alert=True)
     new_value = not bool(u['is_premium'])
     db.set_premium(uid, new_value)
+    await audit('Изменён Premium', c.from_user.id, f'Пользователь: <code>{uid}</code> · значение: <b>{"включён" if new_value else "снят"}</b>')
     await c.answer('Premium включён' if new_value else 'Premium снят')
     await c.message.edit_reply_markup(reply_markup=admin_users_kb(db.recent_users(10)))
 
@@ -906,6 +960,7 @@ async def adm_ban(c: CallbackQuery):
         return await c.answer('Пользователь не найден', show_alert=True)
     new_value = not bool(u['is_banned'])
     db.set_ban(uid, new_value)
+    await audit('Изменён бан', c.from_user.id, f'Пользователь: <code>{uid}</code> · значение: <b>{"заблокирован" if new_value else "разблокирован"}</b>')
     await c.answer('Пользователь заблокирован' if new_value else 'Пользователь разблокирован')
     await c.message.edit_reply_markup(reply_markup=admin_users_kb(db.recent_users(10)))
 
@@ -948,6 +1003,11 @@ async def revoke(m: Message):
 # ───────────────────────── запуск ─────────────────────────
 async def main():
     await bot.delete_webhook(drop_pending_updates=True)
+    try:
+        await audit('Логирование подключено', None, f'Канал: <code>{LOG_CHANNEL_ID}</code>')
+        log.info('Log channel configured: %s', LOG_CHANNEL_ID)
+    except Exception as e:
+        log.error('Cannot write to log channel %s. Add bot as channel admin with permission to post messages. Error: %r', LOG_CHANNEL_ID, e)
     await bot.set_my_commands([
         BotCommand(command='start', description='Главное меню'),
         BotCommand(command='stop', description='Остановить текущий поиск'),

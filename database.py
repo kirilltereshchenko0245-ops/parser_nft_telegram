@@ -122,6 +122,18 @@ class Database:
     def recent_users(self, limit=10):
         return self._all('SELECT * FROM users ORDER BY last_activity DESC LIMIT ?', (limit,))
 
+    def search_users(self, query, limit=10):
+        q = str(query or '').strip().lstrip('@')
+        if not q:
+            return []
+        if q.lstrip('-').isdigit():
+            return self._all('SELECT * FROM users WHERE user_id=? LIMIT ?', (int(q), limit))
+        like = f'%{q.lower()}%'
+        return self._all(
+            'SELECT * FROM users WHERE LOWER(COALESCE(username, "")) LIKE ? OR LOWER(COALESCE(first_name, "")) LIKE ? ORDER BY last_activity DESC LIMIT ?',
+            (like, like, limit),
+        )
+
     # ───────────── поиски ─────────────
     def create_search(self, uid, model, start, end):
         with self._db() as c:
