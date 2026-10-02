@@ -16,6 +16,8 @@ from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import Message, CallbackQuery, ReplyKeyboardMarkup, KeyboardButton
 from aiogram.utils.keyboard import ReplyKeyboardBuilder, InlineKeyboardBuilder
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram.client.default import DefaultBotProperties
+from aiogram.enums import ParseMode
 from dotenv import load_dotenv
 
 from database import Database
@@ -43,11 +45,14 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # Инициализация
-bot = Bot(token=BOT_TOKEN, parse_mode="HTML")
+bot = Bot(
+    token=BOT_TOKEN,
+    default=DefaultBotProperties(parse_mode=ParseMode.HTML)
+)
 storage = MemoryStorage()
 dp = Dispatcher(storage=storage)
 db = Database()
-channel_logger = ChannelLogger(bot)  # Только bot
+channel_logger = ChannelLogger(bot)
 
 print("✅ Бот инициализирован")
 
