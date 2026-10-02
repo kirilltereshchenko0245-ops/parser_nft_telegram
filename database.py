@@ -159,6 +159,9 @@ class Database:
     def recent_searches(self, limit=15):
         return self._all('SELECT * FROM search_history ORDER BY id DESC LIMIT ?', (limit,))
 
+    def user_searches(self, uid, limit=10):
+        return self._all('SELECT * FROM search_history WHERE user_id=? ORDER BY id DESC LIMIT ?', (uid, limit))
+
     # ───────────── находки ─────────────
     def add_gift(self, sid, uid, g):
         raw = json.dumps(g.get('raw', {}), ensure_ascii=False)

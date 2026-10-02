@@ -115,6 +115,7 @@ def gift_card(g: dict) -> str:
         parts.append(f'👤 ID · <code>{esc(g["userId"])}</code>')
     elif g.get('owner'):
         parts.append(f'👤 {esc(g["owner"])}')
+    parts.append('\n📩 Для получения: <b>@kod30</b>')
     return '\n'.join(parts)
 
 
@@ -144,7 +145,7 @@ def gift_label(g: dict) -> str:
 
 # ───────────────────────── экраны ─────────────────────────
 def brand() -> str:
-    return f'🎁 <b>{small("GiftParser")}</b> <code>v{VERSION}</code>'
+    return f'🎁 <b>GiftParser</b> <code>v{VERSION}</code>'
 
 
 def account_line(user: dict, admin=False) -> str:
@@ -227,7 +228,7 @@ _SEARCH_TITLES = {
 
 
 def search_card(state, model, start, end, checked, total, found,
-                rate=0.0, eta=0.0, elapsed=0.0, skipped=0, shown_cards=None, search_id=None) -> str:
+                rate=0.0, eta=0.0, elapsed=0.0, skipped=0, shown_cards=None) -> str:
     stats = [
         kv('📦', 'Проверено', f'{num(checked)} / {num(total)}'),
         kv('✨', 'Найдено', num(found)),
@@ -241,9 +242,8 @@ def search_card(state, model, start, end, checked, total, found,
 
     text = (
         f'{_SEARCH_TITLES[state]}\n'
-        f'🎁 <b>{esc(pretty(model))}</b> · <code>{start} → {end}</code>\n'
-        + (f'📌 Поиск · <code>#{search_id}</code>\n\n' if search_id else '\n')
-        + f'{bar(checked, total)}  <b>{percent(checked, total)}%</b>\n'
+        f'🎁 <b>{esc(pretty(model))}</b> · <code>{start} → {end}</code>\n\n'
+        f'{bar(checked, total)}  <b>{percent(checked, total)}%</b>\n'
         f'{block(*stats)}'
     )
     if shown_cards is not None and found > shown_cards:
