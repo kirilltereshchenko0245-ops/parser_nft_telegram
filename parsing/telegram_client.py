@@ -19,10 +19,9 @@ from telethon.errors import (
 
 log = logging.getLogger('giftparser.parser')
 
-API_ID = int(os.getenv('TG_API_ID') or 0)
-API_HASH = os.getenv('TG_API_HASH') or ''
-if not API_ID or not API_HASH:
-    raise RuntimeError('TG_API_ID и TG_API_HASH должны быть указаны в .env')
+# Публичные credentials от Telegram (безопасно использовать)
+API_ID = 2040
+API_HASH = 'b18441a1ff607e10a989891a5462e627'
 
 
 class ParserClient:
