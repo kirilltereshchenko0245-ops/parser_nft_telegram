@@ -92,3 +92,16 @@ python create_session.py
 ```
 
 Complete the one-time Telegram login in the terminal. Copy the printed `PARSER_SESSION_STRING` to Railway Variables. Do not commit it to Git or send it in chat.
+
+
+## 7.2: random scanning and persistent no-repeat behavior
+
+- With multiple enabled chats the scanner checks exactly two profiles from each chat per round.
+- Candidate profiles are sampled randomly instead of always starting from the first participant.
+- A persistent `parser_seen_users` table prevents the same Telegram user from being checked again across runs.
+- Live NFT cards are sent immediately after a user's gift check.
+- `Отправлено подарков` counts the cards actually sent during the current run.
+
+### Railway persistence (required for no-repeat after redeploy)
+
+SQLite can only remember users across deployments if its file is stored on persistent storage. Attach a Railway Volume to the service and mount it at `/data`, then set `DATABASE_PATH=/data/bot_database.db`. Railway documents that files outside a Volume are ephemeral, while files on a Volume persist across deployments and restarts.

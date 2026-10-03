@@ -15,7 +15,7 @@ BATCH_DELAY_MIN = float(os.getenv('PARSER_BATCH_DELAY_MIN', '4'))
 BATCH_DELAY_MAX = float(os.getenv('PARSER_BATCH_DELAY_MAX', '8'))
 RECHECK_AFTER_HOURS = 168
 MAX_RETRIES = 4
-CHAT_QUOTA = 2  # When several chats are enabled: 2 people from each chat per round.
+CHAT_QUOTA = 2  # Exactly two profiles per enabled chat per round.
 
 
 class ChatScanner:
@@ -141,10 +141,17 @@ class ChatScanner:
         access = await self.client.participant_access(chat_id) if hasattr(self.client, 'participant_access') else {'hidden': False, 'can_view': None}
         hidden = bool(access.get('hidden')) or access.get('can_view') is False
         if hidden:
-            log.warning('Chat %s has hidden/inaccessible members; using message-author discovery', chat_id)
-            user_iter = self.client.iter_message_authors(chat_id, max_messages=50000)
+            log.warning('Chat %s has hidden/inaccessible members; using RANDOM message-author discovery', chat_id)
+            if hasattr(self.client, 'iter_random_message_authors'):
+                user_iter = self.client.iter_random_message_authors(chat_id, max_messages=50000)
+            else:
+                user_iter = self.client.iter_message_authors(chat_id, max_messages=50000)
         else:
-            user_iter = self.client.iter_participants(chat_id, limit=None)
+            log.info('Chat %s uses RANDOM participant sampling; reported_count=%s', chat_id, chat.get('total_participants'))
+            if hasattr(self.client, 'iter_random_participants'):
+                user_iter = self.client.iter_random_participants(chat_id, chat.get('total_participants', 0), batch_size=100)
+            else:
+                user_iter = self.client.iter_participants(chat_id, limit=None)
 
         state = {
             'chat': chat,
@@ -181,8 +188,6 @@ class ChatScanner:
                 return None
 
             state['index'] += 1
-            if state['index'] <= state['offset']:
-                continue
             state['offset'] = state['index']
 
             if self._is_bot_or_deleted(user):
@@ -195,6 +200,12 @@ class ChatScanner:
                 log.info('Skipping parser account itself: %s', user_id)
                 continue
             if int(user_id) in self._checked_this_run:
+                continue
+            # Persistent global de-duplication: a user already checked in a previous
+            # run is never selected again, even after a bot restart, provided the DB
+            # itself is persistent (Railway Volume / external DB).
+            if hasattr(self.db, 'is_parser_user_seen') and self.db.is_parser_user_seen(user_id):
+                log.info('Skipping previously scanned user=%s chat=%s', user_id, state['chat_id'])
                 continue
             return user_data
         return None
@@ -243,12 +254,11 @@ class ChatScanner:
 
         self.db.add_parser_user(user_id, user_data.get('username'), user_data.get('first_name'),
                                 user_data.get('last_name'), has_gifts)
-        new_gifts = []
+        if hasattr(self.db, 'mark_parser_user_seen'):
+            self.db.mark_parser_user_seen(user_id, state['chat_id'])
         for gift in matched:
             try:
-                if self.db.add_parser_gift(user_id, state['chat_id'], gift):
-                    new_gifts.append(gift)
-                    self.stats['total_new_gifts'] += 1
+                self.db.add_parser_gift(user_id, state['chat_id'], gift)
             except Exception:
                 log.exception('Failed saving gift for user %s; continuing', user_id)
 
@@ -263,9 +273,12 @@ class ChatScanner:
                 self._sent_this_run.add(key)
                 live_gifts.append(gift)
         if live_gifts and self.result_callback:
+            user_data['_source_chat_title'] = state['chat'].get('title') or str(state['chat_id'])
+            user_data['_source_chat_id'] = state['chat_id']
             try:
                 await self.result_callback(user_data, live_gifts)
-                log.info('Sent live NFT result for user %s: gifts=%s', user_id, len(live_gifts))
+                self.stats['total_new_gifts'] += len(live_gifts)
+                log.info('Sent live NFT result for user %s: gifts=%s chat=%s', user_id, len(live_gifts), state['chat']['title'])
             except Exception:
                 log.exception('Result callback failed for user %s; scanner continues', user_id)
 

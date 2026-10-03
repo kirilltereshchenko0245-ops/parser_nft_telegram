@@ -1,1 +1,1 @@
-GiftParser 7.1 - live NFT delivery + reliable stop + faster gift lookup + custom limit UX fix
+GiftParser 7.3 - final message ordering + source chat in NFT cards

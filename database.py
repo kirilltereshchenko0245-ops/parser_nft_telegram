@@ -117,6 +117,17 @@ class Database:
             c.execute('''CREATE TABLE IF NOT EXISTS parser_settings(
                 key TEXT PRIMARY KEY,
                 value TEXT NOT NULL)''')
+            c.execute('''CREATE TABLE IF NOT EXISTS parser_seen_users(
+                user_id INTEGER PRIMARY KEY,
+                first_chat_id INTEGER,
+                first_seen_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                last_seen_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )''')
+
+            # Backfill the persistent seen-user table from profiles already checked by older versions.
+            c.execute('''INSERT OR IGNORE INTO parser_seen_users(user_id, first_chat_id)
+                         SELECT user_id, NULL FROM parser_users''')
+
             c.execute('''CREATE TABLE IF NOT EXISTS parser_scan_state(
                 id INTEGER PRIMARY KEY CHECK(id=1),
                 owner_id INTEGER NOT NULL,
@@ -426,6 +437,17 @@ class Database:
                 has_gifts=excluded.has_gifts, last_checked_at=CURRENT_TIMESTAMP''',
                       (user_id, username, first_name, last_name, int(has_gifts)))
     
+
+    def is_parser_user_seen(self, user_id):
+        return bool(self._one('SELECT 1 FROM parser_seen_users WHERE user_id=?', (int(user_id),)))
+
+    def mark_parser_user_seen(self, user_id, chat_id):
+        with self._db() as c:
+            c.execute("INSERT INTO parser_seen_users(user_id, first_chat_id) VALUES(?,?) ON CONFLICT(user_id) DO UPDATE SET last_seen_at=CURRENT_TIMESTAMP", (int(user_id), int(chat_id)))
+
+    def count_parser_seen_users(self):
+        return (self._one('SELECT COUNT(*) n FROM parser_seen_users') or {}).get('n', 0)
+
     def is_user_checked(self, user_id, hours=24):
         """Проверяет был ли пользователь проверен за последние N часов"""
         row = self._one('''SELECT 1 FROM parser_users WHERE user_id=? 

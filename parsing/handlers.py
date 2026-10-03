@@ -395,7 +395,7 @@ async def start_scan_with_limit(message, uid, state, db, limit, call, explicit_m
     else:
         status_message = await message.answer(status_text, reply_markup=parser_kb.parser_running_keyboard())
     if call: await call.answer('Запущено')
-    asyncio.create_task(monitor_scan_progress(status_message, scanner, db))
+    asyncio.create_task(monitor_scan_progress(status_message, scanner, db, scan_task))
 
 
 def format_gift_card(user, gift):
@@ -409,7 +409,8 @@ def format_gift_card(user, gift):
     link = f'https://t.me/nft/{gift["gift_slug"]}' if gift.get('gift_slug') else 'ссылка недоступна для обычного подарка'
     return ('🎁 <b>НАЙДЕН ПОДАРОК</b>\n\n'
             f'👤 Владелец: <b>{username}</b>\n'
-            f'🆔 Telegram ID: <code>{user.get("user_id")}</code>\n\n'
+            f'🆔 Telegram ID: <code>{user.get("user_id")}</code>\n'
+            f'💬 Найден в чате: <b>{user.get("_source_chat_title") or "—"}</b>\n\n'
             f'🎁 Подарок: <b>{gift.get("gift_name") or "Telegram Gift"}</b>\n'
             f'🔢 ID типа: <code>{gift.get("gift_id") or "—"}</code>\n'
             f'🔢 Номер: <code>{gift.get("gift_num") or "—"}</code>\n'
@@ -417,7 +418,7 @@ def format_gift_card(user, gift):
             f'🔗 {link}')
 
 
-async def monitor_scan_progress(message, scanner, db):
+async def monitor_scan_progress(message, scanner, db, scan_task=None):
     while scanner.is_running:
         await asyncio.sleep(5)
         s = scanner.get_stats()
@@ -426,18 +427,27 @@ async def monitor_scan_progress(message, scanner, db):
                 f'📂 Чат: <b>{s["current_chat_title"]}</b>\n'
                 f'👥 Проверено: <b>{s["total_checked"]}/{s["limit"]}</b>\n'
                 f'🎁 Пользователей с NFT: <b>{s["total_found"]}</b>\n'
-                f'✨ Новых подарков: <b>{s["total_new_gifts"]}</b>\n'
+                f'✨ Отправлено подарков: <b>{s["total_new_gifts"]}</b>\n'
                 f'⏱ Время: <b>{elapsed}</b>\n\n'
-                '🐢 Режим: тщательная последовательная проверка')
+                '🎲 Режим: случайная выборка + без повторов')
         try: await message.edit_text(text, reply_markup=parser_kb.parser_running_keyboard())
         except Exception: pass
+    # Wait for the actual scan task to finish so the terminal message cannot
+    # race ahead of live NFT result messages.
+    if scan_task and not scan_task.done():
+        try:
+            await scan_task
+        except asyncio.CancelledError:
+            pass
+        except Exception:
+            log.exception('Scan task failed while finalizing progress message')
     s = scanner.get_stats()
     terminal = '⏹ <b>ПАРСИНГ ОСТАНОВЛЕН</b>' if scanner.stop_flag else '✅ <b>ПАРСИНГ ЗАВЕРШЁН</b>'
     try:
         await message.edit_text((terminal + '\n\n'
             f'👥 Проверено профилей: <b>{s["total_checked"]}</b>\n'
             f'🎁 Профилей с NFT: <b>{s["total_found"]}</b>\n'
-            f'✨ Новых подарков: <b>{s["total_new_gifts"]}</b>\n\n'
+            f'✨ Отправлено подарков: <b>{s["total_new_gifts"]}</b>\n\n'
             'Результаты сохранены в базе.'), reply_markup=parser_kb.back_to_parser())
     except Exception:
         log.exception('Could not update final scan message')

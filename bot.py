@@ -43,7 +43,8 @@ NEXT_API_REQUEST_AT = 0.0
 
 bot = Bot(TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 dp = Dispatcher(storage=MemoryStorage())
-db = Database(os.getenv('DATABASE_PATH', 'bot_database.db'))
+db_path = os.getenv('DATABASE_PATH') or (os.path.join(os.getenv('RAILWAY_VOLUME_MOUNT_PATH'), 'bot_database.db') if os.getenv('RAILWAY_VOLUME_MOUNT_PATH') else 'bot_database.db')
+db = Database(db_path)
 api = PeekAPI(CONCURRENCY)
 ACTIVE: set[int] = set()  # пользователи с запущенным поиском
 

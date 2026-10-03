@@ -130,6 +130,111 @@ class ParserClient:
                 })
         return dialogs
 
+    async def iter_random_participants(self, chat_id, participant_count=0, batch_size=100):
+        """Yield participants from randomized API windows instead of walking from offset 0.
+
+        Telegram does not expose a true random-member API. We approximate random
+        sampling by requesting ChannelParticipantsSearch windows at random offsets.
+        This avoids restarting every deployment at the first member and works
+        much better with a persistent seen-user table in the scanner.
+        """
+        if not self.client:
+            raise RuntimeError('Клиент не подключён')
+        import random
+        from telethon.errors import FloodWaitError
+        entity = await self.client.get_input_entity(chat_id)
+        total = int(participant_count or 0)
+        if total <= 0:
+            try:
+                probe = await self.client(functions.channels.GetParticipantsRequest(
+                    channel=entity,
+                    filter=types.ChannelParticipantsSearch(q=''),
+                    offset=0, limit=1, hash=0))
+                total = int(getattr(probe, 'count', 0) or 0)
+            except Exception:
+                total = 10000
+        seen_ids = set()
+        attempts = 0
+        max_attempts = max(30, min(500, total // max(1, batch_size) * 4 + 20))
+        while attempts < max_attempts:
+            attempts += 1
+            max_offset = max(0, total - batch_size)
+            offset = random.randint(0, max_offset) if max_offset else 0
+            try:
+                response = await self.client(functions.channels.GetParticipantsRequest(
+                    channel=entity,
+                    filter=types.ChannelParticipantsSearch(q=''),
+                    offset=offset,
+                    limit=batch_size,
+                    hash=0))
+            except FloodWaitError:
+                raise
+            users = getattr(response, 'users', None) or []
+            if not users:
+                continue
+            random.shuffle(users)
+            for user in users:
+                uid = getattr(user, 'id', None)
+                if not uid or uid in seen_ids:
+                    continue
+                seen_ids.add(uid)
+                if getattr(user, 'bot', False) or getattr(user, 'deleted', False):
+                    continue
+                yield {
+                    'user_id': uid,
+                    'username': getattr(user, 'username', None),
+                    'first_name': getattr(user, 'first_name', None),
+                    'last_name': getattr(user, 'last_name', None),
+                    'is_bot': bool(getattr(user, 'bot', False)),
+                }
+
+    async def iter_random_message_authors(self, chat_id, max_messages=50000):
+        """Randomly sample message windows in a hidden-member chat."""
+        if not self.client:
+            raise RuntimeError('Клиент не подключён')
+        import random
+        from telethon.errors import FloodWaitError
+        probe = await self.client.get_messages(chat_id, limit=1)
+        max_id = 0
+        if probe:
+            first = probe[0] if isinstance(probe, (list, tuple)) else probe
+            max_id = int(getattr(first, 'id', 0) or 0)
+        if max_id <= 0:
+            return
+        seen_ids = set()
+        seen_offsets = set()
+        attempts = 0
+        while attempts < 300 and len(seen_offsets) < 300:
+            attempts += 1
+            offset = random.randint(1, max_id)
+            if offset in seen_offsets:
+                continue
+            seen_offsets.add(offset)
+            try:
+                messages = await self.client.get_messages(chat_id, limit=100, offset_id=offset)
+            except FloodWaitError:
+                raise
+            for message in messages or []:
+                sender = getattr(message, 'sender', None)
+                if sender is None:
+                    try:
+                        sender = await message.get_sender()
+                    except Exception:
+                        sender = None
+                if not isinstance(sender, types.User):
+                    continue
+                uid = getattr(sender, 'id', None)
+                if not uid or uid in seen_ids or getattr(sender, 'bot', False) or getattr(sender, 'deleted', False):
+                    continue
+                seen_ids.add(uid)
+                yield {
+                    'user_id': uid,
+                    'username': getattr(sender, 'username', None),
+                    'first_name': getattr(sender, 'first_name', None),
+                    'last_name': getattr(sender, 'last_name', None),
+                    'is_bot': bool(getattr(sender, 'bot', False)),
+                }
+
     async def iter_participants(self, chat_id, limit=None):
         """Yield participants using Telethon's supported iterator signature."""
         if not self.client:
