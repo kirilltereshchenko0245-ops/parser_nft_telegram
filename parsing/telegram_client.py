@@ -23,8 +23,11 @@ class ParserClient:
     async def start_auth(self, phone: str):
         """Шаг 1: отправка кода на номер телефона."""
         self._phone = phone
-        self.client = TelegramClient(StringSession(self.session_string), API_ID, API_HASH)
-        await self.client.connect()
+        
+        # Если клиент уже создан, используем его
+        if not self.client:
+            self.client = TelegramClient(StringSession(self.session_string), API_ID, API_HASH)
+            await self.client.connect()
         
         if not await self.client.is_user_authorized():
             result = await self.client.send_code_request(phone)
@@ -47,8 +50,14 @@ class ParserClient:
             log.warning('Неверный код')
             return {'success': False, 'error': 'invalid_code'}
         except Exception as e:
-            log.error(f'Ошибка при проверке кода: {e}')
-            return {'success': False, 'error': str(e)}
+            error_msg = str(e)
+            log.error(f'Ошибка при проверке кода: {error_msg}')
+            
+            # Обработка истёкшего кода
+            if 'expired' in error_msg.lower() or 'confirmation code has expired' in error_msg.lower():
+                return {'success': False, 'error': 'code_expired', 'message': 'Код истёк. Начните подключение заново'}
+            
+            return {'success': False, 'error': 'unknown', 'message': error_msg}
     
     async def verify_2fa(self, password: str):
         """Шаг 3: проверка 2FA пароля."""

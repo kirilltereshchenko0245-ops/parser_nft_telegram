@@ -161,9 +161,29 @@ async def parser_code_handler(message: Message, state: FSMContext, db):
             
         elif result.get('error') == 'invalid_code':
             await message.answer('❌ Неверный код.\n\nПопробуйте снова:')
+        
+        elif result.get('error') == 'code_expired':
+            # Автоматически запрашиваем новый код
+            data = await state.get_data()
+            phone = data.get('phone')
+            
+            try:
+                await parser_client.start_auth(phone)
+                await message.answer(
+                    '⚠️ Код истёк.\n\n'
+                    '📩 Отправлен новый код!\n\n'
+                    'Введите новый код из Telegram:'
+                )
+            except Exception as e:
+                log.error(f'Ошибка при повторной отправке кода: {e}')
+                await message.answer(
+                    '❌ Код истёк и не удалось отправить новый.\n\n'
+                    'Нажмите ✖️ Отмена и начните подключение заново.'
+                )
             
         else:
-            await message.answer(f'❌ Ошибка: {result.get("error")}\n\nПопробуйте снова:')
+            error_text = result.get('message', result.get('error', 'Неизвестная ошибка'))
+            await message.answer(f'❌ Ошибка: {error_text}\n\nПопробуйте снова:')
             
     except Exception as e:
         log.error(f'Ошибка при проверке кода: {e}')
