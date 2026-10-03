@@ -1,18 +1,21 @@
-"""Long-running, sequential Telegram chat/NFT scanner."""
+"""Long-running Telegram chat/NFT scanner with round-robin chat scheduling."""
 import asyncio
 import logging
 import random
+import os
 from datetime import datetime
 from telethon.errors import FloodWaitError
 
 log = logging.getLogger('giftparser.parser')
 
-MIN_DELAY = 2.5
-MAX_DELAY = 5.5
-BATCH_DELAY_MIN = 10
-BATCH_DELAY_MAX = 30
+# Faster, but still deliberately paced. A FloodWait from Telegram always wins.
+MIN_DELAY = float(os.getenv('PARSER_DELAY_MIN', '0.8'))
+MAX_DELAY = float(os.getenv('PARSER_DELAY_MAX', '1.8'))
+BATCH_DELAY_MIN = float(os.getenv('PARSER_BATCH_DELAY_MIN', '4'))
+BATCH_DELAY_MAX = float(os.getenv('PARSER_BATCH_DELAY_MAX', '8'))
 RECHECK_AFTER_HOURS = 168
-MAX_RETRIES = 5
+MAX_RETRIES = 4
+CHAT_QUOTA = 2  # When several chats are enabled: 2 people from each chat per round.
 
 
 class ChatScanner:
@@ -28,6 +31,7 @@ class ChatScanner:
                       'current_chat': None, 'current_chat_title': '',
                       'start_time': None, 'limit': 0}
         self._checked_this_run = set()
+        self._sent_this_run = set()
         self.self_user_id = None
 
     async def start_scan(self, mode='all', max_users=100):
@@ -39,8 +43,14 @@ class ChatScanner:
         self.max_users = max(1, int(max_users))
         self.stats['start_time'] = datetime.now()
         self.stats['limit'] = self.max_users
+        self.stats['current_chat'] = None
+        self.stats['current_chat_title'] = ''
+        self.stats['total_checked'] = 0
+        self.stats['total_found'] = 0
+        self.stats['total_new_gifts'] = 0
         self._checked_this_run.clear()
-        # Never scan the Telegram account used by the parser itself.
+        self._sent_this_run.clear()
+
         try:
             me = await self.client.get_me()
             self.self_user_id = (me or {}).get('user_id') if isinstance(me, dict) else getattr(me, 'id', None)
@@ -48,28 +58,23 @@ class ChatScanner:
         except Exception:
             log.exception('Could not determine parser account id; self-account protection is unavailable')
             self.self_user_id = None
+
         enabled_chats = self.db.get_enabled_parser_chats()
         if not enabled_chats:
             self.is_running = False
             self.db.set_parser_scan_status('idle')
             return False
+
         interrupted = False
         try:
-            for chat in enabled_chats:
-                if self.stop_flag or self.stats['total_checked'] >= self.max_users:
-                    break
-                try:
-                    await self._scan_chat(chat)
-                except FloodWaitError as e:
-                    log.warning('FloodWait in chat %s: %ss', chat['title'], e.seconds)
-                    await asyncio.sleep(e.seconds + random.uniform(1, 3))
-                except Exception:
-                    log.exception('Error scanning chat %s; continuing with next chat', chat['title'])
-                    await asyncio.sleep(3)
+            await self._scan_round_robin(enabled_chats)
         except asyncio.CancelledError:
             interrupted = True
-            self.db.set_parser_scan_status('running')
+            # A user-requested stop is a normal terminal state, not an interrupted scan.
+            self.db.set_parser_scan_status('stopped' if self.stop_flag else 'running')
             raise
+        except Exception:
+            log.exception('Unexpected scanner error')
         finally:
             self.is_running = False
             if not interrupted:
@@ -79,139 +84,217 @@ class ChatScanner:
                      self.stats['total_checked'], self.stats['total_found'], self.stats['total_new_gifts'])
         return True
 
-    async def _scan_chat(self, chat):
+    async def _scan_round_robin(self, chats):
+        """Check users in batches of two per chat, cycling through all enabled chats."""
+        states = []
+        for chat in chats:
+            try:
+                states.append(await self._make_chat_state(chat))
+            except Exception:
+                log.exception('Could not initialize chat %s; skipping', chat.get('title'))
+
+        active = [s for s in states if s]
+        if not active:
+            log.warning('No enabled chat produced a usable participant/message iterator')
+            return
+
+        log.info('Round-robin scan initialized: chats=%s quota_per_chat=%s limit=%s',
+                 len(active), CHAT_QUOTA, self.max_users)
+
+        while active and not self.stop_flag and self.stats['total_checked'] < self.max_users:
+            next_active = []
+            made_progress = False
+            for state in active:
+                if self.stop_flag or self.stats['total_checked'] >= self.max_users:
+                    break
+                processed_here = 0
+                for _ in range(CHAT_QUOTA):
+                    if self.stop_flag or self.stats['total_checked'] >= self.max_users:
+                        break
+                    user = await self._next_user(state)
+                    if user is None:
+                        break
+                    processed = await self._process_user(state, user)
+                    if processed:
+                        made_progress = True
+                        processed_here += 1
+                if not state['exhausted']:
+                    next_active.append(state)
+                log.info('Round chat=%s checked_this_round=%s total=%s/%s',
+                         state['chat']['title'], processed_here,
+                         self.stats['total_checked'], self.max_users)
+            active = next_active
+            if active and not made_progress:
+                log.warning('Round-robin made no progress; stopping to avoid an infinite loop')
+                break
+
+        for state in states:
+            self._save_state(state, 'stopped' if self.stop_flag else 'completed')
+
+    async def _make_chat_state(self, chat):
         chat_id = chat['chat_id']
-        self.stats['current_chat'] = chat_id
-        self.stats['current_chat_title'] = chat['title']
-        self.stats['chat_checked'] = 0
-        self.stats['chat_found'] = 0
         progress = self.db.get_parser_progress(chat_id)
         offset = int(progress['last_user_offset']) if progress else 0
         checked_before = int(progress['checked_count']) if progress else 0
         found_before = int(progress['found_count']) if progress else 0
-        self.db.update_parser_progress(chat_id, offset, checked_before, found_before, 'running')
-        processed_since_pause = 0
 
         access = await self.client.participant_access(chat_id) if hasattr(self.client, 'participant_access') else {'hidden': False, 'can_view': None}
-        hidden_members = bool(access.get('hidden')) or access.get('can_view') is False
-        if hidden_members:
-            log.warning('Chat %s has hidden/inaccessible members; switching to message-author discovery', chat_id)
-            log.info('A hidden member list cannot be enumerated. The fallback discovers visible human message authors only.')
+        hidden = bool(access.get('hidden')) or access.get('can_view') is False
+        if hidden:
+            log.warning('Chat %s has hidden/inaccessible members; using message-author discovery', chat_id)
             user_iter = self.client.iter_message_authors(chat_id, max_messages=50000)
-            index = 0
-            # Message-author discovery has its own cursor; do not reuse the member-list offset.
-            offset = 0
         else:
-            # Do not pass offset to Telethon: current installed versions reject it.
-            # We consume the iterator once and locally skip the saved position.
-            index = 0
             user_iter = self.client.iter_participants(chat_id, limit=None)
 
-        async for user in user_iter:
-            if self.stop_flag or self.stats['total_checked'] >= self.max_users:
-                break
-            if index < offset:
-                index += 1
-                continue
-            index += 1
-            offset = index
+        state = {
+            'chat': chat,
+            'chat_id': chat_id,
+            'offset': offset,
+            'checked_before': checked_before,
+            'found_before': found_before,
+            'chat_checked': 0,
+            'chat_found': 0,
+            'index': 0,
+            'iter': user_iter,
+            'exhausted': False,
+            'hidden': hidden,
+        }
+        self.db.update_parser_progress(chat_id, offset, checked_before, found_before, 'running')
+        return state
 
-            if (isinstance(user, dict) and (user.get('is_bot') or user.get('bot') or user.get('deleted'))) or (not isinstance(user, dict) and (getattr(user, 'bot', False) or getattr(user, 'deleted', False))):
+    async def _next_user(self, state):
+        while not state['exhausted']:
+            try:
+                user = await state['iter'].__anext__()
+            except StopAsyncIteration:
+                state['exhausted'] = True
+                self._save_state(state, 'completed')
+                return None
+            except FloodWaitError as e:
+                log.warning('FloodWait while reading chat %s: %ss', state['chat']['title'], e.seconds)
+                await asyncio.sleep(e.seconds + random.uniform(1, 3))
                 continue
-            # ParserClient.iter_participants() normally yields dictionaries,
-            # but keep compatibility with raw Telethon User objects too.
-            if isinstance(user, dict):
-                user_data = {
-                    'user_id': user.get('user_id') or user.get('id'),
-                    'username': user.get('username'),
-                    'first_name': user.get('first_name'),
-                    'last_name': user.get('last_name'),
-                    'is_bot': bool(user.get('is_bot') or user.get('bot')),
-                }
-            else:
-                user_data = {
-                    'user_id': getattr(user, 'id', None),
-                    'username': getattr(user, 'username', None),
-                    'first_name': getattr(user, 'first_name', None),
-                    'last_name': getattr(user, 'last_name', None),
-                    'is_bot': bool(getattr(user, 'bot', False)),
-                }
-            user_id = user_data['user_id']
+            except Exception:
+                log.exception('Participant/message iterator failed for chat %s', state['chat']['title'])
+                state['exhausted'] = True
+                self._save_state(state, 'error')
+                return None
+
+            state['index'] += 1
+            if state['index'] <= state['offset']:
+                continue
+            state['offset'] = state['index']
+
+            if self._is_bot_or_deleted(user):
+                continue
+            user_data = self._normalize_user(user)
+            user_id = user_data.get('user_id')
             if not user_id:
-                log.warning('Participant without user_id; skipping: %r', user)
                 continue
-            # Do not ever parse the account that is used for MTProto access.
             if self.self_user_id and int(user_id) == int(self.self_user_id):
                 log.info('Skipping parser account itself: %s', user_id)
                 continue
-
-            # A profile may be checked again. The database is responsible for
-            # deduplicating gifts, while the run limit must mean a real number
-            # of profiles actually inspected during THIS run.
-            if user_id in self._checked_this_run:
+            if int(user_id) in self._checked_this_run:
                 continue
+            return user_data
+        return None
 
-            self._checked_this_run.add(user_id)
-            self.stats['total_checked'] += 1
-            self.stats['chat_checked'] += 1
-            log.info('Checking profile %s/%s in chat %s: user_id=%s username=%s',
-                     self.stats['total_checked'], self.max_users, chat_id,
-                     user_id, user_data.get('username'))
-            processed_since_pause += 1
+    @staticmethod
+    def _is_bot_or_deleted(user):
+        if isinstance(user, dict):
+            return bool(user.get('is_bot') or user.get('bot') or user.get('deleted'))
+        return bool(getattr(user, 'bot', False) or getattr(user, 'deleted', False))
 
-            gifts = await self._check_user_gifts(user_data)
-            matched = self._filter_mode(gifts)
-            has_gifts = bool(matched)
-            if has_gifts:
-                self.stats['total_found'] += 1
-                self.stats['chat_found'] += 1
+    @staticmethod
+    def _normalize_user(user):
+        if isinstance(user, dict):
+            return {
+                'user_id': user.get('user_id') or user.get('id'),
+                'username': user.get('username'),
+                'first_name': user.get('first_name'),
+                'last_name': user.get('last_name'),
+                'is_bot': bool(user.get('is_bot') or user.get('bot')),
+            }
+        return {
+            'user_id': getattr(user, 'id', None),
+            'username': getattr(user, 'username', None),
+            'first_name': getattr(user, 'first_name', None),
+            'last_name': getattr(user, 'last_name', None),
+            'is_bot': bool(getattr(user, 'bot', False)),
+        }
 
-            self.db.add_parser_user(user_id, user_data.get('username'), user_data.get('first_name'),
-                                    user_data.get('last_name'), has_gifts)
-            new_gifts = []
-            for gift in matched:
-                try:
-                    if self.db.add_parser_gift(user_id, chat_id, gift):
-                        new_gifts.append(gift)
-                        self.stats['total_new_gifts'] += 1
-                except Exception:
-                    log.exception('Failed saving gift for user %s; continuing', user_id)
+    async def _process_user(self, state, user_data):
+        user_id = user_data['user_id']
+        self._checked_this_run.add(int(user_id))
+        self.stats['total_checked'] += 1
+        state['chat_checked'] += 1
+        self.stats['current_chat'] = state['chat_id']
+        self.stats['current_chat_title'] = state['chat']['title']
+        log.info('Checking profile %s/%s in chat %s: user_id=%s username=%s',
+                 self.stats['total_checked'], self.max_users, state['chat_id'],
+                 user_id, user_data.get('username'))
 
-            if new_gifts and self.result_callback:
-                try:
-                    await self.result_callback(user_data, new_gifts)
-                except Exception:
-                    log.exception('Result callback failed for user %s; scanner continues', user_id)
+        gifts = await self._check_user_gifts(user_data)
+        matched = self._filter_mode(gifts)
+        has_gifts = bool(matched)
+        if has_gifts:
+            self.stats['total_found'] += 1
+            state['chat_found'] += 1
 
-            self.db.update_parser_progress(chat_id, offset,
-                                           checked_before + self.stats['chat_checked'],
-                                           found_before + self.stats['chat_found'], 'running')
-            await self._polite_delay()
-            if processed_since_pause >= 20 and not self.stop_flag:
-                await asyncio.sleep(random.uniform(BATCH_DELAY_MIN, BATCH_DELAY_MAX))
-                processed_since_pause = 0
+        self.db.add_parser_user(user_id, user_data.get('username'), user_data.get('first_name'),
+                                user_data.get('last_name'), has_gifts)
+        new_gifts = []
+        for gift in matched:
+            try:
+                if self.db.add_parser_gift(user_id, state['chat_id'], gift):
+                    new_gifts.append(gift)
+                    self.stats['total_new_gifts'] += 1
+            except Exception:
+                log.exception('Failed saving gift for user %s; continuing', user_id)
 
-        status = 'stopped' if self.stop_flag else 'completed'
-        self.db.update_parser_progress(chat_id, offset,
-                                       checked_before + self.stats['chat_checked'],
-                                       found_before + self.stats['chat_found'], status)
+        # Send matching NFT users immediately, even if the same gift was already
+        # stored in the database on an earlier run. Database deduplication still
+        # controls the 'new gifts' counter; this set only prevents duplicate cards
+        # for the same gift during one scan.
+        live_gifts = []
+        for gift in matched:
+            key = (int(user_id), gift.get('gift_id'), gift.get('gift_num'), gift.get('gift_slug'))
+            if key not in self._sent_this_run:
+                self._sent_this_run.add(key)
+                live_gifts.append(gift)
+        if live_gifts and self.result_callback:
+            try:
+                await self.result_callback(user_data, live_gifts)
+                log.info('Sent live NFT result for user %s: gifts=%s', user_id, len(live_gifts))
+            except Exception:
+                log.exception('Result callback failed for user %s; scanner continues', user_id)
+
+        self._save_state(state, 'running')
+        await asyncio.sleep(random.uniform(MIN_DELAY, MAX_DELAY))
+        return True
+
+    def _save_state(self, state, status='running'):
+        self.db.update_parser_progress(
+            state['chat_id'], state['offset'],
+            state['checked_before'] + state['chat_checked'],
+            state['found_before'] + state['chat_found'], status)
 
     async def _check_user_gifts(self, user):
         for attempt in range(1, MAX_RETRIES + 1):
             try:
-                return await self.client.get_user_gifts(user['user_id'], limit=1000)
+                return await self.client.get_user_gifts(user['user_id'], limit=1000, only_unupgraded=(self.mode == 'unupgraded'))
             except FloodWaitError as e:
                 log.warning('FloodWait checking user %s: %ss', user['user_id'], e.seconds)
                 await asyncio.sleep(e.seconds + random.uniform(1, 3))
             except (ConnectionError, TimeoutError) as e:
                 log.warning('Network error for %s (%s/%s): %s', user['user_id'], attempt, MAX_RETRIES, e)
                 await self._recover_connection()
-                await asyncio.sleep(min(60, 3 * attempt))
+                await asyncio.sleep(min(30, 2 * attempt))
             except Exception as e:
                 if attempt == MAX_RETRIES:
                     log.warning('Gift lookup failed for %s after %s attempts: %s', user['user_id'], attempt, e)
                     return []
-                await asyncio.sleep(min(60, 4 * attempt))
+                await asyncio.sleep(min(20, 2 * attempt))
         return []
 
     async def _recover_connection(self):
@@ -222,17 +305,10 @@ class ChatScanner:
             log.exception('Telegram reconnect failed; retrying later')
 
     def _filter_mode(self, gifts):
-        # 'NFT' here means a collectible gift or a non-collectible gift that
-        # Telegram explicitly marks as upgradeable to a collectible. Ordinary
-        # Telegram gifts must never be reported as NFT.
         nft_gifts = [g for g in gifts if g.get('is_nft_candidate')]
         if self.mode == 'all':
             return nft_gifts
-        # Unupgraded NFT = not collectible yet, but explicitly upgradeable.
         return [g for g in nft_gifts if g.get('can_upgrade') and not g.get('is_collectible')]
-
-    async def _polite_delay(self):
-        await asyncio.sleep(random.uniform(MIN_DELAY, MAX_DELAY))
 
     def stop(self):
         self.stop_flag = True

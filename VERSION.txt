@@ -1,1 +1,1 @@
-GiftParser 6.8 - self-skip + NFT classification + real per-run limit
+GiftParser 7.1 - live NFT delivery + reliable stop + faster gift lookup + custom limit UX fix

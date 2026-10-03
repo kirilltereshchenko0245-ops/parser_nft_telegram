@@ -4,7 +4,7 @@ import logging
 import os
 from datetime import datetime
 from aiogram import Router, F
-from aiogram.types import Message, CallbackQuery
+from aiogram.types import Message, CallbackQuery, ReplyKeyboardRemove
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from telethon.errors import FloodWaitError
@@ -330,30 +330,49 @@ async def parser_start_handler(call: CallbackQuery, state: FSMContext, db):
 async def parser_limit_handler(call: CallbackQuery, state: FSMContext, db):
     value = call.data.split(':')[2]
     if value == 'custom':
-        await state.update_data(scan_mode=(await state.get_data()).get('scan_mode', 'all'))
+        data = await state.get_data()
+        await state.update_data(scan_mode=data.get('scan_mode', 'all'))
         await state.set_state(ParserStates.waiting_limit)
-        return await call.message.edit_text('✏️ <b>Введите количество профилей</b>\n\nНапример: <code>350</code>\nМаксимум за один запуск: <code>5000</code>.', reply_markup=parser_kb.parser_cancel_keyboard())
+        await call.answer('Введите свой лимит', show_alert=False)
+        await call.message.answer(
+            '✏️ <b>СВОЙ ЛИМИТ</b>\n\n'
+            'Введите количество профилей одним числом.\n'
+            'Например: <code>350</code>\n'
+            'Максимум: <code>5000</code>.',
+            reply_markup=parser_kb.parser_cancel_keyboard()
+        )
+        return
     await start_scan_with_limit(call, call.from_user.id, state, db, int(value), call)
 
 
 @router.message(ParserStates.waiting_limit)
 async def parser_custom_limit(message: Message, state: FSMContext, db):
     if message.text == '✖️ Отмена':
-        await state.clear(); return await parser_menu_handler(message, state, db)
+        await state.clear()
+        return await parser_menu_handler(message, state, db)
     try:
         limit = int((message.text or '').strip())
-        if not 1 <= limit <= 5000: raise ValueError
+        if not 1 <= limit <= 5000:
+            raise ValueError
     except ValueError:
         return await message.answer('❌ Введи целое число от 1 до 5000.')
-    await start_scan_with_limit(message, message.from_user.id, state, db, limit, None)
+
+    data = await state.get_data()
+    mode = data.get('scan_mode', 'all')
+    await state.clear()
+    await message.answer(
+        f'✅ Лимит принят: <b>{limit}</b> профилей. Запускаю парсер…',
+        reply_markup=ReplyKeyboardRemove()
+    )
+    await start_scan_with_limit(message, message.from_user.id, state, db, limit, None, explicit_mode=mode)
 
 
-async def start_scan_with_limit(message, uid, state, db, limit, call):
+async def start_scan_with_limit(message, uid, state, db, limit, call, explicit_mode=None):
     global parser_client, scanner, scan_task
     if scanner and scanner.is_running:
         if call: await call.answer('⚠️ Парсинг уже идёт', show_alert=True)
         return
-    data = await state.get_data(); mode = data.get('scan_mode', 'all')
+    data = await state.get_data(); mode = explicit_mode or data.get('scan_mode', 'all')
     await state.clear()
     client = await ensure_client(db)
     enabled = db.get_enabled_parser_chats()
@@ -413,11 +432,15 @@ async def monitor_scan_progress(message, scanner, db):
         try: await message.edit_text(text, reply_markup=parser_kb.parser_running_keyboard())
         except Exception: pass
     s = scanner.get_stats()
-    await message.edit_text(('✅ <b>ПАРСИНГ ЗАВЕРШЁН</b>\n\n'
-        f'👥 Проверено профилей: <b>{s["total_checked"]}</b>\n'
-        f'🎁 Профилей с подарками: <b>{s["total_found"]}</b>\n'
-        f'✨ Новых подарков: <b>{s["total_new_gifts"]}</b>\n\n'
-        'Результаты сохранены в базе и не будут повторно показаны как новые.'), reply_markup=parser_kb.back_to_parser())
+    terminal = '⏹ <b>ПАРСИНГ ОСТАНОВЛЕН</b>' if scanner.stop_flag else '✅ <b>ПАРСИНГ ЗАВЕРШЁН</b>'
+    try:
+        await message.edit_text((terminal + '\n\n'
+            f'👥 Проверено профилей: <b>{s["total_checked"]}</b>\n'
+            f'🎁 Профилей с NFT: <b>{s["total_found"]}</b>\n'
+            f'✨ Новых подарков: <b>{s["total_new_gifts"]}</b>\n\n'
+            'Результаты сохранены в базе.'), reply_markup=parser_kb.back_to_parser())
+    except Exception:
+        log.exception('Could not update final scan message')
 
 
 def datetime_delta(dt):
@@ -427,11 +450,28 @@ def datetime_delta(dt):
 
 @router.callback_query(F.data == 'parser:stop')
 async def parser_stop_handler(call, db):
+    global scanner, scan_task
     session = db.get_parser_session()
-    if not _session_owned(session, call.from_user.id): return await call.answer('Нет доступа', show_alert=True)
-    if scanner and scanner.is_running:
-        scanner.stop(); await call.answer('⏹ Останавливаю…')
-    else: await call.answer('Парсинг не запущен')
+    if not _session_owned(session, call.from_user.id):
+        return await call.answer('Нет доступа', show_alert=True)
+    if not scanner or not scanner.is_running:
+        return await call.answer('Парсинг не запущен', show_alert=True)
+
+    # Set the scanner flag first so its finally block records 'stopped'.
+    scanner.stop()
+    task = scan_task
+    if task and not task.done():
+        task.cancel()
+    await call.answer('⏹ Останавливаю…')
+    try:
+        if task and not task.done():
+            await asyncio.wait_for(asyncio.shield(task), timeout=3.0)
+    except asyncio.CancelledError:
+        pass
+    except asyncio.TimeoutError:
+        log.warning('Scanner task did not finish within stop timeout')
+    except Exception:
+        log.exception('Scanner stop failed')
 
 
 @router.callback_query(F.data == 'parser:account')

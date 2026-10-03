@@ -220,11 +220,13 @@ class ParserClient:
                 break
         return participants
 
-    async def get_user_gifts(self, user_id: int, limit: int = 1000):
-        """Return gifts owned/received/hosted by a Telegram user.
+    async def get_user_gifts(self, user_id: int, limit: int = 1000, only_unupgraded: bool = False):
+        """Return relevant gifts owned by a Telegram user.
 
-        Telegram's current API exposes both saved and unsaved gifts through
-        payments.getSavedStarGifts. Pagination is followed until exhausted.
+        For the unupgraded mode Telegram can filter server-side:
+        exclude_unupgradable=True leaves gifts that can actually be upgraded
+        to collectible. This avoids downloading ordinary gifts and is much
+        faster for large gift inventories.
         """
         if not self.client:
             raise RuntimeError('Клиент не подключён')
@@ -242,9 +244,11 @@ class ParserClient:
                 exclude_unsaved=False,
                 exclude_saved=False,
                 exclude_unlimited=False,
+                # In 'all NFT' mode keep unique collectibles and gifts that can
+                # be upgraded. Ordinary non-upgradable gifts are not relevant.
                 exclude_unique=False,
                 exclude_upgradable=False,
-                exclude_unupgradable=False,
+                exclude_unupgradable=True,
                 exclude_hosted=False,
             ))
 
