@@ -20,7 +20,7 @@ def parser_main_menu(is_connected=False, mode='all'):
             InlineKeyboardButton(text='⚙️ Аккаунт', callback_data='parser:account')
         )
     else:
-        b.row(InlineKeyboardButton(text='🔐 Подключить аккаунт', callback_data='parser:connect'))
+        b.row(InlineKeyboardButton(text='🔐 Подключить аккаунт (сессия)', callback_data='parser:connect'))
     return b.as_markup()
 
 

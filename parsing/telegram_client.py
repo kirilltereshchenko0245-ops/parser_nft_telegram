@@ -5,14 +5,11 @@ Gift lookup uses Telegram's MTProto payments.getSavedStarGifts method.
 """
 import logging
 import os
-from pathlib import Path
 from typing import Any
 
-try:
-    from dotenv import load_dotenv
-    load_dotenv(Path(__file__).resolve().parents[1] / '.env')
-except Exception:
-    pass
+from dotenv import load_dotenv
+
+load_dotenv()
 
 from telethon import TelegramClient, functions, types
 from telethon.sessions import StringSession
@@ -26,16 +23,16 @@ from telethon.errors import (
 
 log = logging.getLogger('giftparser.parser')
 
-# Prefer Railway/environment credentials. For backward compatibility with the
-# original project, fall back to the Telegram API credentials already used by it.
-# If you have your own app credentials, set TG_API_ID and TG_API_HASH in Railway Variables.
-API_ID = int(os.getenv('TG_API_ID') or 2040)
-API_HASH = os.getenv('TG_API_HASH') or 'b18441a1ff607e10a989891a5462e627'
+# Telegram application credentials. Account authorization is provided by SESSION_STRING.
+API_ID = int(os.getenv('TG_API_ID', '2040'))
+API_HASH = os.getenv('TG_API_HASH', 'b18441a1ff607e10a989891a5462e627')
+DEFAULT_SESSION_STRING = os.getenv('PARSER_SESSION_STRING', '').strip()
+
 
 
 class ParserClient:
     def __init__(self, session_string: str | None = None):
-        self.session_string = session_string or ''
+        self.session_string = (session_string or DEFAULT_SESSION_STRING).strip()
         self.client: TelegramClient | None = None
         self._phone: str | None = None
         self._phone_code_hash: str | None = None
@@ -46,14 +43,11 @@ class ParserClient:
         if not self.client.is_connected():
             await self.client.connect()
 
-    async def start_auth(self, phone: str, phone_code_hash: str | None = None):
+    async def start_auth(self, phone: str):
         self._phone = phone
         await self._ensure_client()
         if await self.client.is_user_authorized():
             return False
-        if phone_code_hash:
-            self._phone_code_hash = phone_code_hash
-            return True
         result = await self.client.send_code_request(phone)
         self._phone_code_hash = result.phone_code_hash
         log.info('Telegram login code sent')
@@ -84,11 +78,6 @@ class ParserClient:
         except Exception as e:
             log.exception('2FA verification failed')
             return {'success': False, 'error': str(e)}
-
-    def get_current_session_string(self):
-        if self.client:
-            return self.client.session.save()
-        return None
 
     async def get_session_string(self):
         if self.client and await self.client.is_user_authorized():

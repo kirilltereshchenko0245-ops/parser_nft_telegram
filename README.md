@@ -50,18 +50,13 @@ pip install -r requirements.txt
 python bot.py
 ```
 
-Заполните `.env` или Railway Variables:
+Заполните `.env`:
 
 ```env
 BOT_TOKEN=...
 OWNER_ID=...
 DATABASE_PATH=bot_database.db
-# Рекомендуется указать свои MTProto credentials:
-TG_API_ID=...
-TG_API_HASH=...
 ```
-
-`TG_API_ID` и `TG_API_HASH` имеют приоритет над настройками совместимости старой версии. Если они не заданы, проект сохраняет обратную совместимость с исходным `parserf.zip` и не падает на старте.
 
 Для Railway рекомендуется Volume и:
 
@@ -84,3 +79,16 @@ DATABASE_PATH=/data/bot_database.db
 ## Зависимости
 
 Telethon должен быть достаточно свежим для актуального слоя Telegram Gifts; в проекте установлен `telethon>=1.41,<2`.
+
+
+## Pre-authorized Telegram account (recommended)
+
+This version does not perform phone/code login inside the bot. Use a one-time Telethon StringSession, then store it as the Railway variable `PARSER_SESSION_STRING`. Also set `OWNER_ID`. `TG_API_ID` and `TG_API_HASH` identify the Telegram application; the StringSession is what authorizes the actual account.
+
+To generate a session locally:
+
+```bash
+python create_session.py
+```
+
+Complete the one-time Telegram login in the terminal. Copy the printed `PARSER_SESSION_STRING` to Railway Variables. Do not commit it to Git or send it in chat.
