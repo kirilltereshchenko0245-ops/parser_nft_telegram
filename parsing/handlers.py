@@ -330,6 +330,7 @@ async def parser_start_handler(call: CallbackQuery, state: FSMContext, db):
 async def parser_limit_handler(call: CallbackQuery, state: FSMContext, db):
     value = call.data.split(':')[2]
     if value == 'custom':
+        await state.update_data(scan_mode=(await state.get_data()).get('scan_mode', 'all'))
         await state.set_state(ParserStates.waiting_limit)
         return await call.message.edit_text('✏️ <b>Введите количество профилей</b>\n\nНапример: <code>350</code>\nМаксимум за один запуск: <code>5000</code>.', reply_markup=parser_kb.parser_cancel_keyboard())
     await start_scan_with_limit(call, call.from_user.id, state, db, int(value), call)

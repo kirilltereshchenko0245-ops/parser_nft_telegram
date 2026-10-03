@@ -149,6 +149,63 @@ class ParserClient:
             if limit is not None and count >= limit:
                 break
 
+    async def participant_access(self, chat_id):
+        """Return Telegram's participant-list visibility for a supergroup/channel.
+
+        Hidden-member groups intentionally do not expose the full member list to
+        clients. In that case the scanner must use the message-author fallback
+        instead of treating an empty participant iterator as a completed scan.
+        """
+        if not self.client:
+            raise RuntimeError('Клиент не подключён')
+        try:
+            entity = await self.client.get_input_entity(chat_id)
+            full = await self.client(functions.channels.GetFullChannelRequest(entity))
+            full_chat = getattr(full, 'full_chat', None)
+            hidden = bool(getattr(full_chat, 'participants_hidden', False))
+            can_view = getattr(full_chat, 'can_view_participants', None)
+            return {'hidden': hidden, 'can_view': can_view}
+        except Exception as e:
+            log.warning('Could not determine participant visibility for %s: %s', chat_id, e)
+            return {'hidden': False, 'can_view': None}
+
+    async def iter_message_authors(self, chat_id, max_messages=50000):
+        """Yield unique human users who authored messages in a chat.
+
+        This is a fallback for supergroups whose participant list is hidden.
+        It cannot reveal silent/unknown members; it only discovers users whose
+        messages are visible to the connected account.
+        """
+        if not self.client:
+            raise RuntimeError('Клиент не подключён')
+        seen = set()
+        scanned_messages = 0
+        async for message in self.client.iter_messages(chat_id, limit=max_messages):
+            scanned_messages += 1
+            sender = getattr(message, 'sender', None)
+            if sender is None:
+                try:
+                    sender = await message.get_sender()
+                except Exception:
+                    sender = None
+            if not isinstance(sender, types.User):
+                continue
+            if getattr(sender, 'bot', False) or getattr(sender, 'deleted', False):
+                continue
+            user_id = getattr(sender, 'id', None)
+            if not user_id or user_id in seen:
+                continue
+            seen.add(user_id)
+            yield {
+                'user_id': user_id,
+                'username': getattr(sender, 'username', None),
+                'first_name': getattr(sender, 'first_name', None),
+                'last_name': getattr(sender, 'last_name', None),
+                'is_bot': bool(getattr(sender, 'bot', False)),
+            }
+        log.info('Hidden-member fallback exhausted chat=%s messages=%s unique_users=%s',
+                 chat_id, scanned_messages, len(seen))
+
     async def get_participants(self, chat_id, limit=None, offset=0):
         """Compatibility wrapper; offset is applied locally because Telethon's
         installed iter_participants does not accept an offset keyword."""

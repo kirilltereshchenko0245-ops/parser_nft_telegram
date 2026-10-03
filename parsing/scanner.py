@@ -92,10 +92,22 @@ class ChatScanner:
         self.db.update_parser_progress(chat_id, offset, checked_before, found_before, 'running')
         processed_since_pause = 0
 
-        # Do not pass offset to Telethon: current installed versions reject it.
-        # We consume the iterator once and locally skip the saved position.
-        index = 0
-        async for user in self.client.iter_participants(chat_id, limit=None):
+        access = await self.client.participant_access(chat_id) if hasattr(self.client, 'participant_access') else {'hidden': False, 'can_view': None}
+        hidden_members = bool(access.get('hidden')) or access.get('can_view') is False
+        if hidden_members:
+            log.warning('Chat %s has hidden/inaccessible members; switching to message-author discovery', chat_id)
+            log.info('A hidden member list cannot be enumerated. The fallback discovers visible human message authors only.')
+            user_iter = self.client.iter_message_authors(chat_id, max_messages=50000)
+            index = 0
+            # Message-author discovery has its own cursor; do not reuse the member-list offset.
+            offset = 0
+        else:
+            # Do not pass offset to Telethon: current installed versions reject it.
+            # We consume the iterator once and locally skip the saved position.
+            index = 0
+            user_iter = self.client.iter_participants(chat_id, limit=None)
+
+        async for user in user_iter:
             if self.stop_flag or self.stats['total_checked'] >= self.max_users:
                 break
             if index < offset:
@@ -104,7 +116,7 @@ class ChatScanner:
             index += 1
             offset = index
 
-            if getattr(user, 'bot', False) or getattr(user, 'deleted', False):
+            if (isinstance(user, dict) and (user.get('is_bot') or user.get('bot') or user.get('deleted'))) or (not isinstance(user, dict) and (getattr(user, 'bot', False) or getattr(user, 'deleted', False))):
                 continue
             # ParserClient.iter_participants() normally yields dictionaries,
             # but keep compatibility with raw Telethon User objects too.
@@ -142,6 +154,9 @@ class ChatScanner:
             self._checked_this_run.add(user_id)
             self.stats['total_checked'] += 1
             self.stats['chat_checked'] += 1
+            log.info('Checking profile %s/%s in chat %s: user_id=%s username=%s',
+                     self.stats['total_checked'], self.max_users, chat_id,
+                     user_id, user_data.get('username'))
             processed_since_pause += 1
 
             gifts = await self._check_user_gifts(user_data)
