@@ -97,14 +97,28 @@ class ChatScanner:
 
             if getattr(user, 'bot', False) or getattr(user, 'deleted', False):
                 continue
-            user_data = {
-                'user_id': user.id,
-                'username': getattr(user, 'username', None),
-                'first_name': getattr(user, 'first_name', None),
-                'last_name': getattr(user, 'last_name', None),
-                'is_bot': bool(getattr(user, 'bot', False)),
-            }
+            # ParserClient.iter_participants() normally yields dictionaries,
+            # but keep compatibility with raw Telethon User objects too.
+            if isinstance(user, dict):
+                user_data = {
+                    'user_id': user.get('user_id') or user.get('id'),
+                    'username': user.get('username'),
+                    'first_name': user.get('first_name'),
+                    'last_name': user.get('last_name'),
+                    'is_bot': bool(user.get('is_bot') or user.get('bot')),
+                }
+            else:
+                user_data = {
+                    'user_id': getattr(user, 'id', None),
+                    'username': getattr(user, 'username', None),
+                    'first_name': getattr(user, 'first_name', None),
+                    'last_name': getattr(user, 'last_name', None),
+                    'is_bot': bool(getattr(user, 'bot', False)),
+                }
             user_id = user_data['user_id']
+            if not user_id:
+                log.warning('Participant without user_id; skipping: %r', user)
+                continue
             if user_id in self._checked_this_run or self.db.is_user_checked(user_id, hours=RECHECK_AFTER_HOURS):
                 continue
 
