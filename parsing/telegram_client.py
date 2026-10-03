@@ -19,9 +19,10 @@ from telethon.errors import (
 
 log = logging.getLogger('giftparser.parser')
 
-# Публичные credentials от Telegram (безопасно использовать)
-API_ID = 2040
-API_HASH = 'b18441a1ff607e10a989891a5462e627'
+API_ID = int(os.getenv('TG_API_ID') or 0)
+API_HASH = os.getenv('TG_API_HASH') or ''
+if not API_ID or not API_HASH:
+    raise RuntimeError('TG_API_ID и TG_API_HASH должны быть указаны в .env')
 
 
 class ParserClient:
@@ -75,6 +76,11 @@ class ParserClient:
         except Exception as e:
             log.exception('2FA verification failed')
             return {'success': False, 'error': str(e)}
+
+    def get_current_session_string(self):
+        if self.client:
+            return self.client.session.save()
+        return None
 
     async def get_session_string(self):
         if self.client and await self.client.is_user_authorized():

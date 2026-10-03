@@ -26,6 +26,7 @@ class ParserStates(StatesGroup):
 parser_client = None
 scanner = None
 scan_task = None
+auth_lock = asyncio.Lock()
 
 
 def _session_owned(session, uid):
@@ -101,6 +102,7 @@ async def parser_menu_callback(call: CallbackQuery, state: FSMContext, db):
 
 @router.callback_query(F.data == 'parser:connect')
 async def parser_connect_handler(call: CallbackQuery, state: FSMContext, db):
+    global parser_client
     session = db.get_parser_session()
     if session and session.get('session_string') and _session_owned(session, call.from_user.id):
         try:
@@ -109,6 +111,28 @@ async def parser_connect_handler(call: CallbackQuery, state: FSMContext, db):
             return await call.answer('Уже подключён')
         except Exception:
             pass
+
+    # Если контейнер перезапустился после отправки кода, продолжаем
+    # ИМЕННО ту же MTProto auth-сессию. Новый код не запрашиваем.
+    if (session and session.get('auth_phone') and session.get('auth_phone_code_hash')
+            and session.get('auth_session_string')
+            and _session_owned(session, call.from_user.id)):
+        try:
+            parser_client = ParserClient(session['auth_session_string'])
+            await parser_client.start_auth(session['auth_phone'], session['auth_phone_code_hash'])
+            await state.update_data(phone=session['auth_phone'])
+            await state.set_state(ParserStates.waiting_code)
+            await call.message.edit_text(
+                '📩 <b>Незавершённая попытка входа</b>\n\n'
+                f'📱 <code>{session["auth_phone"]}</code>\n\n'
+                'Введите уже полученный код из Telegram. <b>Новый код не отправляю.</b>',
+                reply_markup=parser_kb.parser_cancel_keyboard()
+            )
+            return await call.answer('Продолжаем предыдущий вход')
+        except Exception as e:
+            log.warning('Could not restore pending auth: %s', e)
+            db.clear_pending_parser_auth()
+
     await state.set_state(ParserStates.waiting_phone)
     await call.message.edit_text('🔐 <b>Подключение аккаунта</b>\n\nВведите номер в международном формате:\n<code>+79991234567</code>\n\nПосле успешного входа сессия сохранится и новый код при каждом запуске не потребуется.', reply_markup=parser_kb.back_to_parser())
     await call.answer()
@@ -118,20 +142,39 @@ async def parser_connect_handler(call: CallbackQuery, state: FSMContext, db):
 async def parser_phone_handler(message: Message, state: FSMContext, db):
     global parser_client
     if message.text == '✖️ Отмена':
+        db.clear_pending_parser_auth()
         await state.clear(); return await parser_menu_handler(message, state, db)
     phone = (message.text or '').strip()
     if not phone.startswith('+'):
         return await message.answer('❌ Номер должен начинаться с +')
-    try:
-        parser_client = ParserClient()
-        await parser_client.start_auth(phone)
-        db.save_pending_parser_auth(message.from_user.id, phone, parser_client._phone_code_hash)
-        await state.update_data(phone=phone)
-        await state.set_state(ParserStates.waiting_code)
-        await message.answer('📩 <b>Код отправлен</b>\n\nВведите код из Telegram.\n\n⚠️ Новый код автоматически запрашиваться не будет.', reply_markup=parser_kb.parser_cancel_keyboard())
-    except Exception as e:
-        log.exception('Failed to send auth code')
-        await message.answer(f'❌ Не удалось отправить код: <code>{str(e)[:500]}</code>')
+    async with auth_lock:
+        try:
+            pending = db.get_parser_session()
+            # Если уже существует незавершённая попытка этого пользователя,
+            # НЕ отправляем второй код. Используем существующую попытку.
+            if (pending and pending.get('auth_phone') and pending.get('auth_phone_code_hash')
+                    and pending.get('auth_session_string')
+                    and int(pending.get('owner_id') or 0) == int(message.from_user.id)
+                    and pending.get('auth_phone') == phone):
+                parser_client = ParserClient(pending['auth_session_string'])
+                await parser_client.start_auth(phone, pending['auth_phone_code_hash'])
+                await state.update_data(phone=phone)
+                await state.set_state(ParserStates.waiting_code)
+                return await message.answer('📩 <b>Есть незавершённая попытка входа.</b>\n\nВведите уже полученный код. Новый код не отправляю.', reply_markup=parser_kb.parser_cancel_keyboard())
+
+            parser_client = ParserClient()
+            await parser_client.start_auth(phone)
+            # КРИТИЧНО: сохраняем не только phone_code_hash, но и StringSession
+            # того же MTProto-сеанса. Иначе после пересоздания клиента hash
+            # больше не связан с исходной auth key.
+            auth_session = parser_client.get_current_session_string()
+            db.save_pending_parser_auth(message.from_user.id, phone, parser_client._phone_code_hash, auth_session)
+            await state.update_data(phone=phone)
+            await state.set_state(ParserStates.waiting_code)
+            await message.answer('📩 <b>Код отправлен</b>\n\nВведите этот код из Telegram.\n\n⚠️ Второй код автоматически запрашиваться не будет.', reply_markup=parser_kb.parser_cancel_keyboard())
+        except Exception as e:
+            log.exception('Failed to send auth code')
+            await message.answer(f'❌ Не удалось отправить код: <code>{str(e)[:500]}</code>')
 
 
 @router.message(ParserStates.waiting_code)
@@ -139,11 +182,14 @@ async def parser_code_handler(message: Message, state: FSMContext, db):
     global parser_client
     if message.text == '✖️ Отмена':
         if parser_client: await parser_client.disconnect()
+        db.clear_pending_parser_auth()
         await state.clear(); return await parser_menu_handler(message, state, db)
     if not parser_client:
         pending = db.get_parser_session()
-        if pending and pending.get('auth_phone') and pending.get('auth_phone_code_hash') and int(pending.get('owner_id') or 0) == int(message.from_user.id):
-            parser_client = ParserClient()
+        if (pending and pending.get('auth_phone') and pending.get('auth_phone_code_hash')
+                and pending.get('auth_session_string')
+                and int(pending.get('owner_id') or 0) == int(message.from_user.id)):
+            parser_client = ParserClient(pending['auth_session_string'])
             await parser_client.start_auth(pending['auth_phone'], pending['auth_phone_code_hash'])
         else:
             await state.clear(); return await message.answer('❌ Активная попытка входа не найдена. Нажмите подключение и запросите один новый код.')
@@ -165,6 +211,7 @@ async def parser_code_handler(message: Message, state: FSMContext, db):
 async def parser_2fa_handler(message: Message, state: FSMContext, db):
     if message.text == '✖️ Отмена':
         if parser_client: await parser_client.disconnect()
+        db.clear_pending_parser_auth()
         await state.clear(); return await parser_menu_handler(message, state, db)
     result = await parser_client.verify_2fa((message.text or '').strip())
     if result.get('success'):

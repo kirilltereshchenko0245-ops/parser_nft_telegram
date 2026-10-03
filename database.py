@@ -77,6 +77,7 @@ class Database:
             existing = {row[1] for row in c.execute('PRAGMA table_info(parser_session)').fetchall()}
             if 'auth_phone' not in existing: c.execute('ALTER TABLE parser_session ADD COLUMN auth_phone TEXT')
             if 'auth_phone_code_hash' not in existing: c.execute('ALTER TABLE parser_session ADD COLUMN auth_phone_code_hash TEXT')
+            if 'auth_session_string' not in existing: c.execute('ALTER TABLE parser_session ADD COLUMN auth_session_string TEXT')
             
             c.execute('''CREATE TABLE IF NOT EXISTS parser_chats(
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -333,12 +334,12 @@ class Database:
                 VALUES(1,?,?,?,?,?,?,1,NULL,NULL,CURRENT_TIMESTAMP)''',
                       (owner_id, session_string, phone, username, user_id, first_name))
 
-    def save_pending_parser_auth(self, owner_id, phone, phone_code_hash):
+    def save_pending_parser_auth(self, owner_id, phone, phone_code_hash, auth_session_string):
         with self._db() as c:
-            c.execute('''INSERT INTO parser_session(id, owner_id, auth_phone, auth_phone_code_hash, is_active, updated_at)
-                VALUES(1,?,?,?,0,CURRENT_TIMESTAMP)
-                ON CONFLICT(id) DO UPDATE SET owner_id=excluded.owner_id, auth_phone=excluded.auth_phone, auth_phone_code_hash=excluded.auth_phone_code_hash, is_active=0, updated_at=CURRENT_TIMESTAMP''',
-                      (owner_id, phone, phone_code_hash))
+            c.execute('''INSERT INTO parser_session(id, owner_id, auth_phone, auth_phone_code_hash, auth_session_string, is_active, updated_at)
+                VALUES(1,?,?,?,?,0,CURRENT_TIMESTAMP)
+                ON CONFLICT(id) DO UPDATE SET owner_id=excluded.owner_id, auth_phone=excluded.auth_phone, auth_phone_code_hash=excluded.auth_phone_code_hash, auth_session_string=excluded.auth_session_string, is_active=0, updated_at=CURRENT_TIMESTAMP''',
+                      (owner_id, phone, phone_code_hash, auth_session_string))
 
     def get_parser_session(self):
         return self._one('SELECT * FROM parser_session WHERE id=1')
@@ -349,7 +350,7 @@ class Database:
     
     def clear_pending_parser_auth(self):
         with self._db() as c:
-            c.execute('UPDATE parser_session SET auth_phone=NULL, auth_phone_code_hash=NULL, updated_at=CURRENT_TIMESTAMP WHERE id=1')
+            c.execute('UPDATE parser_session SET auth_phone=NULL, auth_phone_code_hash=NULL, auth_session_string=NULL, updated_at=CURRENT_TIMESTAMP WHERE id=1')
 
     def set_parser_active(self, active):
         with self._db() as c:
