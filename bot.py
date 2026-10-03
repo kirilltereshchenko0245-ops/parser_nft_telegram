@@ -20,6 +20,7 @@ import keyboards as kb
 import ui
 from database import Database
 from peek_api import AVAILABLE_MODELS, PeekAPI, gift_url, is_known_model, normalize_model_name, suggest_models
+from parsing import handlers as parser_handlers
 
 load_dotenv()
 os.makedirs('logs', exist_ok=True)
@@ -45,6 +46,16 @@ dp = Dispatcher(storage=MemoryStorage())
 db = Database(os.getenv('DATABASE_PATH', 'bot_database.db'))
 api = PeekAPI(CONCURRENCY)
 ACTIVE: set[int] = set()  # пользователи с запущенным поиском
+
+# Подключаем router парсера
+dp.include_router(parser_handlers.router)
+
+# Middleware для передачи db в handlers
+@dp.message.middleware()
+@dp.callback_query.middleware()
+async def inject_db(handler, event, data):
+    data['db'] = db
+    return await handler(event, data)
 
 
 class S(StatesGroup):

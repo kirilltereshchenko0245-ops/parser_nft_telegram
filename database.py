@@ -59,6 +59,60 @@ class Database:
                 user_id INTEGER, gift_number INTEGER, model TEXT, username TEXT,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 PRIMARY KEY(user_id, gift_number, model))''')
+            
+            # Таблицы для MTProto-парсера
+            c.execute('''CREATE TABLE IF NOT EXISTS parser_session(
+                id INTEGER PRIMARY KEY CHECK(id=1),
+                owner_id INTEGER NOT NULL,
+                session_string TEXT,
+                phone TEXT,
+                username TEXT,
+                user_id INTEGER,
+                first_name TEXT,
+                is_active INTEGER DEFAULT 0,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)''')
+            
+            c.execute('''CREATE TABLE IF NOT EXISTS parser_chats(
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                chat_id INTEGER UNIQUE NOT NULL,
+                title TEXT,
+                username TEXT,
+                chat_type TEXT,
+                is_enabled INTEGER DEFAULT 1,
+                total_participants INTEGER DEFAULT 0,
+                last_scanned_at TIMESTAMP,
+                added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)''')
+            
+            c.execute('''CREATE TABLE IF NOT EXISTS parser_users(
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER UNIQUE NOT NULL,
+                username TEXT,
+                first_name TEXT,
+                last_name TEXT,
+                has_gifts INTEGER DEFAULT 0,
+                last_checked_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)''')
+            
+            c.execute('''CREATE TABLE IF NOT EXISTS parser_gifts(
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                chat_id INTEGER NOT NULL,
+                gift_id INTEGER,
+                gift_name TEXT,
+                gift_slug TEXT,
+                is_collectible INTEGER DEFAULT 0,
+                is_upgraded INTEGER DEFAULT 0,
+                raw_data TEXT,
+                found_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(user_id, gift_id))''')
+            
+            c.execute('''CREATE TABLE IF NOT EXISTS parser_progress(
+                chat_id INTEGER PRIMARY KEY,
+                last_user_offset INTEGER DEFAULT 0,
+                checked_count INTEGER DEFAULT 0,
+                found_count INTEGER DEFAULT 0,
+                status TEXT DEFAULT 'idle',
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)''')
 
             # Безопасные миграции со старых версий: докидываем всё, чего не хватает
             expected = {
@@ -83,6 +137,8 @@ class Database:
                 model) WHERE gift_name IS NULL''')
             c.execute('CREATE INDEX IF NOT EXISTS idx_hist_user ON search_history(user_id, id)')
             c.execute('CREATE INDEX IF NOT EXISTS idx_found_search ON found_gifts(search_id)')
+            c.execute('CREATE INDEX IF NOT EXISTS idx_parser_users ON parser_users(user_id)')
+            c.execute('CREATE INDEX IF NOT EXISTS idx_parser_gifts ON parser_gifts(user_id, chat_id)')
 
     @staticmethod
     def _add_col(c, table, col, ddl):
@@ -244,3 +300,132 @@ class Database:
                       'COALESCE(SUM(is_banned),0) banned FROM users')
         s = self._one('SELECT COUNT(*) searches, COALESCE(SUM(found_count),0) found FROM search_history')
         return {**u, **s}
+
+    # ───────────── MTProto Parser Session ─────────────
+    def save_parser_session(self, owner_id, session_string, phone, username, user_id, first_name):
+        with self._db() as c:
+            c.execute('''INSERT OR REPLACE INTO parser_session(id, owner_id, session_string, phone, 
+                username, user_id, first_name, is_active, updated_at) 
+                VALUES(1,?,?,?,?,?,?,1,CURRENT_TIMESTAMP)''',
+                      (owner_id, session_string, phone, username, user_id, first_name))
+    
+    def get_parser_session(self):
+        return self._one('SELECT * FROM parser_session WHERE id=1')
+    
+    def clear_parser_session(self):
+        with self._db() as c:
+            c.execute('DELETE FROM parser_session WHERE id=1')
+    
+    def set_parser_active(self, active):
+        with self._db() as c:
+            c.execute('UPDATE parser_session SET is_active=?, updated_at=CURRENT_TIMESTAMP WHERE id=1', (int(active),))
+    
+    # ───────────── Parser Chats ─────────────
+    def add_parser_chat(self, chat_id, title, username, chat_type, total_participants=0):
+        with self._db() as c:
+            c.execute('''INSERT OR IGNORE INTO parser_chats(chat_id, title, username, chat_type, total_participants)
+                VALUES(?,?,?,?,?)''', (chat_id, title, username, chat_type, total_participants))
+    
+    def get_parser_chats(self):
+        return self._all('SELECT * FROM parser_chats ORDER BY added_at DESC')
+    
+    def get_enabled_parser_chats(self):
+        return self._all('SELECT * FROM parser_chats WHERE is_enabled=1 ORDER BY added_at DESC')
+    
+    def toggle_parser_chat(self, chat_id):
+        with self._db() as c:
+            c.execute('UPDATE parser_chats SET is_enabled = 1 - is_enabled WHERE chat_id=?', (chat_id,))
+    
+    def remove_parser_chat(self, chat_id):
+        with self._db() as c:
+            c.execute('DELETE FROM parser_chats WHERE chat_id=?', (chat_id,))
+    
+    def update_chat_participants(self, chat_id, count):
+        with self._db() as c:
+            c.execute('UPDATE parser_chats SET total_participants=?, last_scanned_at=CURRENT_TIMESTAMP WHERE chat_id=?',
+                      (count, chat_id))
+    
+    # ───────────── Parser Users ─────────────
+    def add_parser_user(self, user_id, username, first_name, last_name, has_gifts=False):
+        with self._db() as c:
+            c.execute('''INSERT INTO parser_users(user_id, username, first_name, last_name, has_gifts, last_checked_at)
+                VALUES(?,?,?,?,?,CURRENT_TIMESTAMP)
+                ON CONFLICT(user_id) DO UPDATE SET 
+                username=excluded.username, first_name=excluded.first_name, last_name=excluded.last_name,
+                has_gifts=excluded.has_gifts, last_checked_at=CURRENT_TIMESTAMP''',
+                      (user_id, username, first_name, last_name, int(has_gifts)))
+    
+    def is_user_checked(self, user_id, hours=24):
+        """Проверяет был ли пользователь проверен за последние N часов"""
+        row = self._one('''SELECT 1 FROM parser_users WHERE user_id=? 
+            AND datetime(last_checked_at) > datetime('now', '-' || ? || ' hours')''', (user_id, hours))
+        return bool(row)
+    
+    def get_parser_user(self, user_id):
+        return self._one('SELECT * FROM parser_users WHERE user_id=?', (user_id,))
+    
+    # ───────────── Parser Gifts ─────────────
+    def add_parser_gift(self, user_id, chat_id, gift_data):
+        with self._db() as c:
+            import json
+            raw = json.dumps(gift_data, ensure_ascii=False)
+            c.execute('''INSERT OR IGNORE INTO parser_gifts
+                (user_id, chat_id, gift_id, gift_name, gift_slug, is_collectible, is_upgraded, raw_data)
+                VALUES(?,?,?,?,?,?,?,?)''',
+                      (user_id, chat_id, gift_data.get('gift_id'), gift_data.get('gift_name'),
+                       gift_data.get('gift_slug'), int(gift_data.get('is_collectible', False)),
+                       int(gift_data.get('is_upgraded', False)), raw))
+    
+    def get_parser_gifts(self, user_id=None, chat_id=None, only_unupgraded=False):
+        sql = 'SELECT * FROM parser_gifts WHERE 1=1'
+        args = []
+        if user_id:
+            sql += ' AND user_id=?'
+            args.append(user_id)
+        if chat_id:
+            sql += ' AND chat_id=?'
+            args.append(chat_id)
+        if only_unupgraded:
+            sql += ' AND is_upgraded=0'
+        sql += ' ORDER BY found_at DESC'
+        return self._all(sql, args)
+    
+    def count_parser_gifts(self, only_unupgraded=False):
+        sql = 'SELECT COUNT(*) n FROM parser_gifts'
+        if only_unupgraded:
+            sql += ' WHERE is_upgraded=0'
+        return (self._one(sql) or {}).get('n', 0)
+    
+    # ───────────── Parser Progress ─────────────
+    def get_parser_progress(self, chat_id):
+        return self._one('SELECT * FROM parser_progress WHERE chat_id=?', (chat_id,))
+    
+    def update_parser_progress(self, chat_id, offset, checked, found, status='running'):
+        with self._db() as c:
+            c.execute('''INSERT INTO parser_progress(chat_id, last_user_offset, checked_count, found_count, status, updated_at)
+                VALUES(?,?,?,?,?,CURRENT_TIMESTAMP)
+                ON CONFLICT(chat_id) DO UPDATE SET
+                last_user_offset=excluded.last_user_offset, checked_count=excluded.checked_count,
+                found_count=excluded.found_count, status=excluded.status, updated_at=CURRENT_TIMESTAMP''',
+                      (chat_id, offset, checked, found, status))
+    
+    def reset_parser_progress(self, chat_id):
+        with self._db() as c:
+            c.execute('UPDATE parser_progress SET last_user_offset=0, checked_count=0, status="idle" WHERE chat_id=?',
+                      (chat_id,))
+    
+    def get_parser_stats(self):
+        total_chats = (self._one('SELECT COUNT(*) n FROM parser_chats') or {}).get('n', 0)
+        enabled_chats = (self._one('SELECT COUNT(*) n FROM parser_chats WHERE is_enabled=1') or {}).get('n', 0)
+        total_users = (self._one('SELECT COUNT(*) n FROM parser_users') or {}).get('n', 0)
+        users_with_gifts = (self._one('SELECT COUNT(*) n FROM parser_users WHERE has_gifts=1') or {}).get('n', 0)
+        total_gifts = (self._one('SELECT COUNT(*) n FROM parser_gifts') or {}).get('n', 0)
+        unupgraded_gifts = (self._one('SELECT COUNT(*) n FROM parser_gifts WHERE is_upgraded=0') or {}).get('n', 0)
+        return {
+            'total_chats': total_chats,
+            'enabled_chats': enabled_chats,
+            'total_users': total_users,
+            'users_with_gifts': users_with_gifts,
+            'total_gifts': total_gifts,
+            'unupgraded_gifts': unupgraded_gifts
+        }
