@@ -1014,6 +1014,13 @@ async def revoke(m: Message):
 # ───────────────────────── запуск ─────────────────────────
 async def main():
     await bot.delete_webhook(drop_pending_updates=True)
+    # Восстанавливаем сохранённую MTProto StringSession без повторного запроса кода.
+    try:
+        restored = await parser_handlers.restore_saved_parser_session(db)
+        log.info('Saved parser session restore: %s', restored)
+    except Exception:
+        log.exception('Failed to restore saved parser session')
+
     try:
         await audit('Логирование подключено', None, f'Канал: <code>{LOG_CHANNEL_ID}</code>')
         log.info('Log channel configured: %s', LOG_CHANNEL_ID)

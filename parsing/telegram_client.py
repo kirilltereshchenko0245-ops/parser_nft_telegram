@@ -1,84 +1,83 @@
-"""MTProto клиент через Telethon с авторизацией через бот."""
+"""Telethon client for the chat/NFT parser.
+
+The user account is authenticated once and persisted as a StringSession.
+Gift lookup uses Telegram's MTProto payments.getSavedStarGifts method.
+"""
 import logging
-from telethon import TelegramClient
+from typing import Any
+
+from telethon import TelegramClient, functions, types
 from telethon.sessions import StringSession
-from telethon.errors import SessionPasswordNeededError, PhoneCodeInvalidError, PasswordHashInvalidError
+from telethon.errors import (
+    SessionPasswordNeededError,
+    PhoneCodeInvalidError,
+    PasswordHashInvalidError,
+    PhoneCodeExpiredError,
+    FloodWaitError,
+)
 
 log = logging.getLogger('giftparser.parser')
 
-# Публичные credentials от Telegram (безопасно использовать)
 API_ID = 2040
 API_HASH = 'b18441a1ff607e10a989891a5462e627'
 
 
 class ParserClient:
-    """Обёртка над Telethon для авторизации и работы с чатами."""
-    
-    def __init__(self, session_string: str = None):
+    def __init__(self, session_string: str | None = None):
         self.session_string = session_string or ''
-        self.client = None
-        self._phone = None
-        self._phone_code_hash = None
-    
-    async def start_auth(self, phone: str):
-        """Шаг 1: отправка кода на номер телефона."""
-        self._phone = phone
-        
-        # Если клиент уже создан, используем его
-        if not self.client:
+        self.client: TelegramClient | None = None
+        self._phone: str | None = None
+        self._phone_code_hash: str | None = None
+
+    async def _ensure_client(self):
+        if self.client is None:
             self.client = TelegramClient(StringSession(self.session_string), API_ID, API_HASH)
+        if not self.client.is_connected():
             await self.client.connect()
-        
-        if not await self.client.is_user_authorized():
-            result = await self.client.send_code_request(phone)
-            self._phone_code_hash = result.phone_code_hash
-            log.info(f'Код отправлен на {phone}')
-            return True
-        else:
-            log.info('Аккаунт уже авторизован')
+
+    async def start_auth(self, phone: str):
+        self._phone = phone
+        await self._ensure_client()
+        if await self.client.is_user_authorized():
             return False
-    
+        result = await self.client.send_code_request(phone)
+        self._phone_code_hash = result.phone_code_hash
+        log.info('Telegram login code sent')
+        return True
+
     async def verify_code(self, code: str):
-        """Шаг 2: проверка кода из Telegram."""
+        if not self.client or not self._phone or not self._phone_code_hash:
+            return {'success': False, 'error': 'auth_session_missing', 'message': 'Сессия авторизации потеряна. Начните подключение заново.'}
         try:
             await self.client.sign_in(self._phone, code, phone_code_hash=self._phone_code_hash)
             return {'success': True, 'need_2fa': False}
         except SessionPasswordNeededError:
-            log.info('Требуется 2FA пароль')
             return {'success': False, 'need_2fa': True}
         except PhoneCodeInvalidError:
-            log.warning('Неверный код')
             return {'success': False, 'error': 'invalid_code'}
+        except PhoneCodeExpiredError:
+            return {'success': False, 'error': 'code_expired', 'message': 'Код истёк. Нажмите отмену и запросите новый код.'}
         except Exception as e:
-            error_msg = str(e)
-            log.error(f'Ошибка при проверке кода: {error_msg}')
-            
-            # Обработка истёкшего кода
-            if 'expired' in error_msg.lower() or 'confirmation code has expired' in error_msg.lower():
-                return {'success': False, 'error': 'code_expired', 'message': 'Код истёк. Начните подключение заново'}
-            
-            return {'success': False, 'error': 'unknown', 'message': error_msg}
-    
+            log.exception('Code verification failed')
+            return {'success': False, 'error': 'unknown', 'message': str(e)}
+
     async def verify_2fa(self, password: str):
-        """Шаг 3: проверка 2FA пароля."""
         try:
             await self.client.sign_in(password=password)
             return {'success': True}
         except PasswordHashInvalidError:
-            log.warning('Неверный 2FA пароль')
             return {'success': False, 'error': 'invalid_password'}
         except Exception as e:
-            log.error(f'Ошибка при проверке 2FA: {e}')
+            log.exception('2FA verification failed')
             return {'success': False, 'error': str(e)}
-    
+
     async def get_session_string(self):
-        """Получить StringSession после успешной авторизации."""
         if self.client and await self.client.is_user_authorized():
-            return self.client.session.save()
+            self.session_string = self.client.session.save()
+            return self.session_string
         return None
-    
+
     async def get_me(self):
-        """Получить информацию о текущем аккаунте."""
         if self.client and await self.client.is_user_authorized():
             me = await self.client.get_me()
             return {
@@ -86,79 +85,144 @@ class ParserClient:
                 'username': me.username,
                 'first_name': me.first_name,
                 'last_name': me.last_name,
-                'phone': me.phone
+                'phone': me.phone,
             }
         return None
-    
+
     async def connect(self):
-        """Подключиться с существующей сессией."""
         if not self.session_string:
             raise ValueError('Session string не установлен')
-        
         self.client = TelegramClient(StringSession(self.session_string), API_ID, API_HASH)
         await self.client.connect()
-        
         if not await self.client.is_user_authorized():
-            raise RuntimeError('Сессия недействительна')
-        
-        log.info('MTProto клиент подключён')
+            await self.client.disconnect()
+            self.client = None
+            raise RuntimeError('Сессия Telegram недействительна или истекла')
+        log.info('MTProto client restored from StringSession')
         return True
-    
+
     async def disconnect(self):
-        """Отключиться."""
         if self.client:
             await self.client.disconnect()
-            log.info('MTProto клиент отключён')
-    
+            self.client = None
+
     async def get_dialogs(self):
-        """Получить список всех чатов."""
         if not self.client:
             raise RuntimeError('Клиент не подключён')
-        
         dialogs = []
         async for dialog in self.client.iter_dialogs():
             if dialog.is_group or dialog.is_channel:
+                entity = dialog.entity
                 dialogs.append({
                     'chat_id': dialog.id,
-                    'title': dialog.title,
-                    'username': dialog.entity.username if hasattr(dialog.entity, 'username') else None,
+                    'title': dialog.title or 'Без названия',
+                    'username': getattr(entity, 'username', None),
                     'type': 'channel' if dialog.is_channel else 'group',
-                    'participants_count': getattr(dialog.entity, 'participants_count', 0)
+                    'participants_count': getattr(entity, 'participants_count', 0) or 0,
                 })
-        
-        log.info(f'Найдено {len(dialogs)} чатов')
         return dialogs
-    
+
     async def get_participants(self, chat_id, limit=None, offset=0):
-        """Получить участников чата."""
         if not self.client:
             raise RuntimeError('Клиент не подключён')
-        
         participants = []
-        try:
-            async for user in self.client.iter_participants(chat_id, limit=limit, offset=offset):
-                if user.bot:
+        async for user in self.client.iter_participants(chat_id, limit=limit, offset=offset):
+            if getattr(user, 'bot', False) or getattr(user, 'deleted', False):
+                continue
+            participants.append({
+                'user_id': user.id,
+                'username': getattr(user, 'username', None),
+                'first_name': getattr(user, 'first_name', None),
+                'last_name': getattr(user, 'last_name', None),
+                'is_bot': bool(getattr(user, 'bot', False)),
+            })
+        return participants
+
+    async def get_user_gifts(self, user_id: int, limit: int = 1000):
+        """Return gifts owned/received/hosted by a Telegram user.
+
+        Telegram's current API exposes both saved and unsaved gifts through
+        payments.getSavedStarGifts. Pagination is followed until exhausted.
+        """
+        if not self.client:
+            raise RuntimeError('Клиент не подключён')
+
+        peer = await self.client.get_input_entity(user_id)
+        offset = ''
+        result = []
+        seen = set()
+
+        while True:
+            response = await self.client(functions.payments.GetSavedStarGiftsRequest(
+                peer=peer,
+                offset=offset,
+                limit=min(100, limit),
+                exclude_unsaved=False,
+                exclude_saved=False,
+                exclude_unlimited=False,
+                exclude_unique=False,
+                exclude_upgradable=False,
+                exclude_unupgradable=False,
+                exclude_hosted=False,
+            ))
+
+            gifts = getattr(response, 'gifts', None) or []
+            for saved in gifts:
+                data = self._normalize_saved_gift(saved, user_id)
+                key = data.get('unique_key') or (data.get('gift_id'), data.get('gift_num'), data.get('slug'))
+                if key in seen:
                     continue
-                
-                participants.append({
-                    'user_id': user.id,
-                    'username': user.username,
-                    'first_name': user.first_name,
-                    'last_name': user.last_name,
-                    'is_bot': user.bot
-                })
-            
-            return participants
-        except Exception as e:
-            log.error(f'Ошибка получения участников чата {chat_id}: {e}')
-            return []
-    
-    async def get_user_profile_photos(self, user_id):
-        """Проверить есть ли у пользователя подарки через анализ профиля."""
-        # TODO: Реализовать получение подарков через Telegram API
-        # Пока заглушка - вернёт пустой список
-        return []
-    
+                seen.add(key)
+                result.append(data)
+                if len(result) >= limit:
+                    return result
+
+            next_offset = getattr(response, 'next_offset', None)
+            if not next_offset or next_offset == offset or not gifts:
+                break
+            offset = next_offset
+
+        return result
+
+    @staticmethod
+    def _normalize_saved_gift(saved: Any, owner_id: int) -> dict:
+        gift = getattr(saved, 'gift', None)
+        gift_id = getattr(gift, 'id', None)
+        title = getattr(gift, 'title', None)
+        gift_num = getattr(saved, 'gift_num', None) or getattr(gift, 'num', None)
+        slug = getattr(gift, 'slug', None)
+        unique = isinstance(gift, types.StarGiftUnique)
+        attributes = []
+        for attr in getattr(gift, 'attributes', None) or []:
+            attributes.append(GiftParserAttribute.normalize(attr))
+
+        return {
+            'gift_id': gift_id,
+            'gift_num': gift_num,
+            'gift_name': title or getattr(gift, 'title', None) or 'Telegram Gift',
+            'gift_slug': slug,
+            'is_collectible': unique,
+            'is_upgraded': unique,
+            'attributes': attributes,
+            'owner_id': owner_id,
+            'unique_key': (getattr(gift, 'id', None), gift_num, slug),
+            'raw_type': type(gift).__name__ if gift else type(saved).__name__,
+        }
+
     def is_connected(self):
-        """Проверка подключения."""
-        return self.client and self.client.is_connected()
+        return bool(self.client and self.client.is_connected())
+
+
+class GiftParserAttribute:
+    @staticmethod
+    def normalize(attr: Any) -> dict:
+        name = type(attr).__name__
+        if hasattr(attr, 'name'):
+            value = getattr(attr, 'name')
+        elif hasattr(attr, 'pattern'):
+            value = getattr(attr, 'pattern')
+        elif hasattr(attr, 'backdrop'):
+            value = getattr(attr, 'backdrop')
+        else:
+            value = None
+        return {'type': name, 'value': value}

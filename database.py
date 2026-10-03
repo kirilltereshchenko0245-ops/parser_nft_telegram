@@ -98,13 +98,13 @@ class Database:
                 user_id INTEGER NOT NULL,
                 chat_id INTEGER NOT NULL,
                 gift_id INTEGER,
+                gift_num INTEGER,
                 gift_name TEXT,
                 gift_slug TEXT,
                 is_collectible INTEGER DEFAULT 0,
                 is_upgraded INTEGER DEFAULT 0,
                 raw_data TEXT,
-                found_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                UNIQUE(user_id, gift_id))''')
+                found_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)''')
             
             c.execute('''CREATE TABLE IF NOT EXISTS parser_progress(
                 chat_id INTEGER PRIMARY KEY,
@@ -113,6 +113,24 @@ class Database:
                 found_count INTEGER DEFAULT 0,
                 status TEXT DEFAULT 'idle',
                 updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)''')
+
+            # Миграция старой таблицы parser_gifts: раньше UNIQUE(user_id, gift_id)
+            # ошибочно удалял разные экземпляры одного типа подарка.
+            table_sql = c.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name='parser_gifts'").fetchone()
+            if table_sql and 'UNIQUE(user_id' in (table_sql[0] or '') and 'gift_id)' in (table_sql[0] or ''):
+                c.execute('ALTER TABLE parser_gifts RENAME TO parser_gifts_legacy')
+                c.execute('''CREATE TABLE parser_gifts(
+                    id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL, chat_id INTEGER NOT NULL,
+                    gift_id INTEGER, gift_num INTEGER, gift_name TEXT, gift_slug TEXT,
+                    is_collectible INTEGER DEFAULT 0, is_upgraded INTEGER DEFAULT 0, raw_data TEXT,
+                    found_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)''')
+                legacy_cols = {r[1] for r in c.execute('PRAGMA table_info(parser_gifts_legacy)').fetchall()}
+                if {'user_id','chat_id','gift_id'}.issubset(legacy_cols):
+                    c.execute('''INSERT INTO parser_gifts
+                        (id,user_id,chat_id,gift_id,gift_name,gift_slug,is_collectible,is_upgraded,raw_data,found_at)
+                        SELECT id,user_id,chat_id,gift_id,gift_name,gift_slug,is_collectible,is_upgraded,raw_data,found_at
+                        FROM parser_gifts_legacy''')
+                c.execute('DROP TABLE parser_gifts_legacy')
 
             # Безопасные миграции со старых версий: докидываем всё, чего не хватает
             expected = {
@@ -126,6 +144,7 @@ class Database:
                                 'price': 'REAL', 'raw_json': 'TEXT',
                                 'gift_name': 'TEXT'},   # gift_name — коллекция (PlushPepe)
                 'favorites': {'gift_name': 'TEXT'},
+                'parser_gifts': {'gift_num': 'INTEGER', 'gift_slug': 'TEXT', 'is_collectible': 'INTEGER DEFAULT 0', 'is_upgraded': 'INTEGER DEFAULT 0'},
             }
             for table, cols in expected.items():
                 for col, ddl in cols.items():
@@ -139,6 +158,7 @@ class Database:
             c.execute('CREATE INDEX IF NOT EXISTS idx_found_search ON found_gifts(search_id)')
             c.execute('CREATE INDEX IF NOT EXISTS idx_parser_users ON parser_users(user_id)')
             c.execute('CREATE INDEX IF NOT EXISTS idx_parser_gifts ON parser_gifts(user_id, chat_id)')
+            c.execute('CREATE INDEX IF NOT EXISTS idx_parser_gift_identity ON parser_gifts(user_id, gift_id, gift_num, gift_slug)')
 
     @staticmethod
     def _add_col(c, table, col, ddl):
@@ -336,6 +356,10 @@ class Database:
         with self._db() as c:
             c.execute('UPDATE parser_chats SET is_enabled = 1 - is_enabled WHERE chat_id=?', (chat_id,))
     
+    def set_all_parser_chats(self, enabled):
+        with self._db() as c:
+            c.execute('UPDATE parser_chats SET is_enabled=?', (int(bool(enabled)),))
+
     def remove_parser_chat(self, chat_id):
         with self._db() as c:
             c.execute('DELETE FROM parser_chats WHERE chat_id=?', (chat_id,))
@@ -367,15 +391,24 @@ class Database:
     # ───────────── Parser Gifts ─────────────
     def add_parser_gift(self, user_id, chat_id, gift_data):
         with self._db() as c:
-            import json
             raw = json.dumps(gift_data, ensure_ascii=False)
-            c.execute('''INSERT OR IGNORE INTO parser_gifts
-                (user_id, chat_id, gift_id, gift_name, gift_slug, is_collectible, is_upgraded, raw_data)
-                VALUES(?,?,?,?,?,?,?,?)''',
-                      (user_id, chat_id, gift_data.get('gift_id'), gift_data.get('gift_name'),
-                       gift_data.get('gift_slug'), int(gift_data.get('is_collectible', False)),
-                       int(gift_data.get('is_upgraded', False)), raw))
-    
+            gift_id = gift_data.get('gift_id')
+            gift_num = gift_data.get('gift_num')
+            gift_slug = gift_data.get('gift_slug')
+            exists = c.execute('''SELECT id FROM parser_gifts
+                WHERE user_id=? AND COALESCE(gift_id,-1)=COALESCE(?, -1)
+                AND COALESCE(gift_num,-1)=COALESCE(?, -1)
+                AND COALESCE(gift_slug,'')=COALESCE(?, '') LIMIT 1''',
+                (user_id, gift_id, gift_num, gift_slug)).fetchone()
+            if exists:
+                return False
+            c.execute('''INSERT INTO parser_gifts
+                (user_id, chat_id, gift_id, gift_num, gift_name, gift_slug, is_collectible, is_upgraded, raw_data)
+                VALUES(?,?,?,?,?,?,?,?,?)''',
+                (user_id, chat_id, gift_id, gift_num, gift_data.get('gift_name'), gift_slug,
+                 int(gift_data.get('is_collectible', False)), int(gift_data.get('is_upgraded', False)), raw))
+            return True
+
     def get_parser_gifts(self, user_id=None, chat_id=None, only_unupgraded=False):
         sql = 'SELECT * FROM parser_gifts WHERE 1=1'
         args = []
@@ -390,6 +423,21 @@ class Database:
         sql += ' ORDER BY found_at DESC'
         return self._all(sql, args)
     
+
+    def recent_parser_gifts(self, limit=20, only_unupgraded=False):
+        sql = 'SELECT g.*, u.username, u.first_name, u.last_name FROM parser_gifts g LEFT JOIN parser_users u ON u.user_id=g.user_id'
+        if only_unupgraded:
+            sql += ' WHERE g.is_upgraded=0'
+        sql += ' ORDER BY g.found_at DESC LIMIT ?'
+        return self._all(sql, (limit,))
+
+    def recent_parser_gifts(self, limit=20, only_unupgraded=False):
+        sql = 'SELECT g.*, u.username, u.first_name, u.last_name FROM parser_gifts g LEFT JOIN parser_users u ON u.user_id=g.user_id'
+        if only_unupgraded:
+            sql += ' WHERE g.is_upgraded=0'
+        sql += ' ORDER BY g.found_at DESC LIMIT ?'
+        return self._all(sql, (limit,))
+
     def count_parser_gifts(self, only_unupgraded=False):
         sql = 'SELECT COUNT(*) n FROM parser_gifts'
         if only_unupgraded:
