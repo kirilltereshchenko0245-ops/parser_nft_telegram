@@ -50,13 +50,18 @@ pip install -r requirements.txt
 python bot.py
 ```
 
-Заполните `.env`:
+Заполните `.env` или Railway Variables:
 
 ```env
 BOT_TOKEN=...
 OWNER_ID=...
 DATABASE_PATH=bot_database.db
+# Рекомендуется указать свои MTProto credentials:
+TG_API_ID=...
+TG_API_HASH=...
 ```
+
+`TG_API_ID` и `TG_API_HASH` имеют приоритет над настройками совместимости старой версии. Если они не заданы, проект сохраняет обратную совместимость с исходным `parserf.zip` и не падает на старте.
 
 Для Railway рекомендуется Volume и:
 

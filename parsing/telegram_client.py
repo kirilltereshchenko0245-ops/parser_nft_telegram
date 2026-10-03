@@ -5,7 +5,14 @@ Gift lookup uses Telegram's MTProto payments.getSavedStarGifts method.
 """
 import logging
 import os
+from pathlib import Path
 from typing import Any
+
+try:
+    from dotenv import load_dotenv
+    load_dotenv(Path(__file__).resolve().parents[1] / '.env')
+except Exception:
+    pass
 
 from telethon import TelegramClient, functions, types
 from telethon.sessions import StringSession
@@ -19,10 +26,11 @@ from telethon.errors import (
 
 log = logging.getLogger('giftparser.parser')
 
-API_ID = int(os.getenv('TG_API_ID') or 0)
-API_HASH = os.getenv('TG_API_HASH') or ''
-if not API_ID or not API_HASH:
-    raise RuntimeError('TG_API_ID и TG_API_HASH должны быть указаны в .env')
+# Prefer Railway/environment credentials. For backward compatibility with the
+# original project, fall back to the Telegram API credentials already used by it.
+# If you have your own app credentials, set TG_API_ID and TG_API_HASH in Railway Variables.
+API_ID = int(os.getenv('TG_API_ID') or 2040)
+API_HASH = os.getenv('TG_API_HASH') or 'b18441a1ff607e10a989891a5462e627'
 
 
 class ParserClient:
