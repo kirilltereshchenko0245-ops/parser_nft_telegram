@@ -380,7 +380,12 @@ async def start_scan_with_limit(message, uid, state, db, limit, call):
 
 def format_gift_card(user, gift):
     username = f'@{user.get("username")}' if user.get('username') else 'без username'
-    status = '💎 Неулучшенный' if not gift.get('is_upgraded') else '✨ Улучшенный / collectible'
+    if gift.get('can_upgrade') and not gift.get('is_collectible'):
+        status = '💎 Неулучшенный NFT (доступно улучшение)'
+    elif gift.get('is_collectible'):
+        status = '✨ NFT / collectible'
+    else:
+        status = '—'
     link = f'https://t.me/nft/{gift["gift_slug"]}' if gift.get('gift_slug') else 'ссылка недоступна для обычного подарка'
     return ('🎁 <b>НАЙДЕН ПОДАРОК</b>\n\n'
             f'👤 Владелец: <b>{username}</b>\n'

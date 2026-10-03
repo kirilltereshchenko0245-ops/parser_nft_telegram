@@ -228,6 +228,10 @@ class ParserClient:
             'gift_slug': slug,
             'is_collectible': unique,
             'is_upgraded': unique,
+            # Telegram sets savedStarGift.can_upgrade only for non-collectible
+            # gifts that can be upgraded into a collectible gift.
+            'can_upgrade': bool(getattr(saved, 'can_upgrade', False)),
+            'is_nft_candidate': bool(unique or getattr(saved, 'can_upgrade', False)),
             'attributes': attributes,
             'owner_id': owner_id,
             'unique_key': (getattr(gift, 'id', None), gift_num, slug),

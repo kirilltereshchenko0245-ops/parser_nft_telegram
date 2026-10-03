@@ -1,1 +1,1 @@
-GiftParser 6.7 - parser participant format fix\n
+GiftParser 6.8 - self-skip + NFT classification + real per-run limit

@@ -28,6 +28,7 @@ class ChatScanner:
                       'current_chat': None, 'current_chat_title': '',
                       'start_time': None, 'limit': 0}
         self._checked_this_run = set()
+        self.self_user_id = None
 
     async def start_scan(self, mode='all', max_users=100):
         if self.is_running:
@@ -39,6 +40,14 @@ class ChatScanner:
         self.stats['start_time'] = datetime.now()
         self.stats['limit'] = self.max_users
         self._checked_this_run.clear()
+        # Never scan the Telegram account used by the parser itself.
+        try:
+            me = await self.client.get_me()
+            self.self_user_id = (me or {}).get('user_id') if isinstance(me, dict) else getattr(me, 'id', None)
+            log.info('Parser account id=%s will be excluded from participant scanning', self.self_user_id)
+        except Exception:
+            log.exception('Could not determine parser account id; self-account protection is unavailable')
+            self.self_user_id = None
         enabled_chats = self.db.get_enabled_parser_chats()
         if not enabled_chats:
             self.is_running = False
@@ -119,7 +128,15 @@ class ChatScanner:
             if not user_id:
                 log.warning('Participant without user_id; skipping: %r', user)
                 continue
-            if user_id in self._checked_this_run or self.db.is_user_checked(user_id, hours=RECHECK_AFTER_HOURS):
+            # Do not ever parse the account that is used for MTProto access.
+            if self.self_user_id and int(user_id) == int(self.self_user_id):
+                log.info('Skipping parser account itself: %s', user_id)
+                continue
+
+            # A profile may be checked again. The database is responsible for
+            # deduplicating gifts, while the run limit must mean a real number
+            # of profiles actually inspected during THIS run.
+            if user_id in self._checked_this_run:
                 continue
 
             self._checked_this_run.add(user_id)
@@ -190,9 +207,14 @@ class ChatScanner:
             log.exception('Telegram reconnect failed; retrying later')
 
     def _filter_mode(self, gifts):
+        # 'NFT' here means a collectible gift or a non-collectible gift that
+        # Telegram explicitly marks as upgradeable to a collectible. Ordinary
+        # Telegram gifts must never be reported as NFT.
+        nft_gifts = [g for g in gifts if g.get('is_nft_candidate')]
         if self.mode == 'all':
-            return gifts
-        return [g for g in gifts if not g.get('is_upgraded') and not g.get('is_collectible')]
+            return nft_gifts
+        # Unupgraded NFT = not collectible yet, but explicitly upgradeable.
+        return [g for g in nft_gifts if g.get('can_upgrade') and not g.get('is_collectible')]
 
     async def _polite_delay(self):
         await asyncio.sleep(random.uniform(MIN_DELAY, MAX_DELAY))
