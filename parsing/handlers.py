@@ -443,14 +443,22 @@ async def monitor_scan_progress(message, scanner, db, scan_task=None):
             log.exception('Scan task failed while finalizing progress message')
     s = scanner.get_stats()
     terminal = '⏹ <b>ПАРСИНГ ОСТАНОВЛЕН</b>' if scanner.stop_flag else '✅ <b>ПАРСИНГ ЗАВЕРШЁН</b>'
+    final_text = (terminal + '\n\n'
+        f'👥 Проверено профилей: <b>{s["total_checked"]}</b>\n'
+        f'🎁 Профилей с NFT: <b>{s["total_found"]}</b>\n'
+        f'✨ Отправлено новых подарков: <b>{s["total_new_gifts"]}</b>\n\n'
+        'Результаты сохранены в базе.')
+    # The progress message is above the live result cards. Delete it and send
+    # the terminal summary as a NEW message so the completion notice is always
+    # physically below every gift card in Telegram.
     try:
-        await message.edit_text((terminal + '\n\n'
-            f'👥 Проверено профилей: <b>{s["total_checked"]}</b>\n'
-            f'🎁 Профилей с NFT: <b>{s["total_found"]}</b>\n'
-            f'✨ Отправлено подарков: <b>{s["total_new_gifts"]}</b>\n\n'
-            'Результаты сохранены в базе.'), reply_markup=parser_kb.back_to_parser())
+        await message.delete()
     except Exception:
-        log.exception('Could not update final scan message')
+        log.exception('Could not delete final progress message')
+    try:
+        await message.bot.send_message(message.chat.id, final_text, reply_markup=parser_kb.back_to_parser())
+    except Exception:
+        log.exception('Could not send final scan message')
 
 
 def datetime_delta(dt):

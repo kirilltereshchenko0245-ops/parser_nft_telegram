@@ -254,20 +254,26 @@ class ChatScanner:
 
         self.db.add_parser_user(user_id, user_data.get('username'), user_data.get('first_name'),
                                 user_data.get('last_name'), has_gifts)
+        # Persist the user as seen before sending result cards. This makes the
+        # "one person only once" rule independent of chat order and prevents a
+        # second occurrence from another selected chat in the same run.
         if hasattr(self.db, 'mark_parser_user_seen'):
             self.db.mark_parser_user_seen(user_id, state['chat_id'])
-        for gift in matched:
-            try:
-                self.db.add_parser_gift(user_id, state['chat_id'], gift)
-            except Exception:
-                log.exception('Failed saving gift for user %s; continuing', user_id)
-
-        # Send matching NFT users immediately, even if the same gift was already
-        # stored in the database on an earlier run. Database deduplication still
-        # controls the 'new gifts' counter; this set only prevents duplicate cards
-        # for the same gift during one scan.
+        # Only gifts that were actually inserted into the persistent DB are
+        # allowed to be sent to the user. Previously we sent every matched gift
+        # even when add_parser_gift() reported that it already existed, which
+        # caused the same person's gifts to appear again on later scans.
         live_gifts = []
         for gift in matched:
+            try:
+                inserted = self.db.add_parser_gift(user_id, state['chat_id'], gift)
+            except Exception:
+                inserted = False
+                log.exception('Failed saving gift for user %s; continuing', user_id)
+            if not inserted:
+                log.info('Skipping already stored gift user=%s gift_id=%s gift_num=%s slug=%s',
+                         user_id, gift.get('gift_id'), gift.get('gift_num'), gift.get('gift_slug'))
+                continue
             key = (int(user_id), gift.get('gift_id'), gift.get('gift_num'), gift.get('gift_slug'))
             if key not in self._sent_this_run:
                 self._sent_this_run.add(key)
