@@ -1,1 +1,1 @@
-GiftParser 7.3 - final message ordering + source chat in NFT cards
+GiftParser 7.4 - batched hidden-chat discovery + floodwait protection + final ordering + source chat

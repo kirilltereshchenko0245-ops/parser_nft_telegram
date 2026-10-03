@@ -105,3 +105,11 @@ Complete the one-time Telegram login in the terminal. Copy the printed `PARSER_S
 ### Railway persistence (required for no-repeat after redeploy)
 
 SQLite can only remember users across deployments if its file is stored on persistent storage. Attach a Railway Volume to the service and mount it at `/data`, then set `DATABASE_PATH=/data/bot_database.db`. Railway documents that files outside a Volume are ephemeral, while files on a Volume persist across deployments and restarts.
+
+
+## 7.4 changes
+- Hidden-member chats no longer perform random `GetHistoryRequest` calls for every refill.
+- Message authors are discovered in controlled history batches, shuffled per batch, and cached in-memory by the scanner.
+- This reduces Telegram history API pressure and makes `FloodWait` much less likely.
+- The parser still excludes the connected parser account and previously seen users.
+- Live NFT cards keep the source chat, and the final summary waits for the scan task to finish.

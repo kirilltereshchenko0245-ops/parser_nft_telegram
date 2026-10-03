@@ -141,7 +141,7 @@ class ChatScanner:
         access = await self.client.participant_access(chat_id) if hasattr(self.client, 'participant_access') else {'hidden': False, 'can_view': None}
         hidden = bool(access.get('hidden')) or access.get('can_view') is False
         if hidden:
-            log.warning('Chat %s has hidden/inaccessible members; using RANDOM message-author discovery', chat_id)
+            log.warning('Chat %s has hidden/inaccessible members; using batched randomized message-author discovery', chat_id)
             if hasattr(self.client, 'iter_random_message_authors'):
                 user_iter = self.client.iter_random_message_authors(chat_id, max_messages=50000)
             else:

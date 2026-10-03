@@ -5,6 +5,7 @@ Gift lookup uses Telegram's MTProto payments.getSavedStarGifts method.
 """
 import logging
 import os
+import asyncio
 from typing import Any
 
 from dotenv import load_dotenv
@@ -189,32 +190,58 @@ class ParserClient:
                 }
 
     async def iter_random_message_authors(self, chat_id, max_messages=50000):
-        """Randomly sample message windows in a hidden-member chat."""
+        """Yield unique human message authors from controlled history batches.
+
+        Hidden-member chats cannot expose the complete participant list. The old
+        implementation picked a brand-new random message offset on every refill,
+        which caused many GetHistoryRequest calls and quickly triggered Telegram
+        FloodWaits. Instead we walk history in small sequential batches, shuffle
+        the discovered authors inside each batch, and keep the batch in memory.
+        This still gives varied/randomized users while drastically reducing API
+        pressure and avoids hammering the same chat with random history requests.
+        """
         if not self.client:
             raise RuntimeError('Клиент не подключён')
+
         import random
         from telethon.errors import FloodWaitError
-        probe = await self.client.get_messages(chat_id, limit=1)
-        max_id = 0
-        if probe:
-            first = probe[0] if isinstance(probe, (list, tuple)) else probe
-            max_id = int(getattr(first, 'id', 0) or 0)
-        if max_id <= 0:
-            return
+
+        batch_size = max(100, min(500, int(os.getenv('PARSER_HISTORY_BATCH', '300'))))
+        min_delay = float(os.getenv('PARSER_HISTORY_DELAY_MIN', '0.8'))
+        max_delay = float(os.getenv('PARSER_HISTORY_DELAY_MAX', '1.8'))
+        remaining = max(1, int(max_messages))
+        offset_id = 0
         seen_ids = set()
-        seen_offsets = set()
-        attempts = 0
-        while attempts < 300 and len(seen_offsets) < 300:
-            attempts += 1
-            offset = random.randint(1, max_id)
-            if offset in seen_offsets:
-                continue
-            seen_offsets.add(offset)
+        batch_no = 0
+
+        while remaining > 0:
             try:
-                messages = await self.client.get_messages(chat_id, limit=100, offset_id=offset)
+                messages = await self.client.get_messages(
+                    chat_id,
+                    limit=min(batch_size, remaining),
+                    offset_id=offset_id,
+                )
             except FloodWaitError:
                 raise
-            for message in messages or []:
+
+            if not messages:
+                break
+
+            batch_no += 1
+            messages = list(messages)
+            remaining -= len(messages)
+
+            # Telegram returns newest -> oldest. Randomize the current batch so
+            # users from a single history window are not checked in strict order.
+            random.shuffle(messages)
+            authors = []
+
+            oldest_id = None
+            for message in messages:
+                message_id = int(getattr(message, 'id', 0) or 0)
+                if message_id and (oldest_id is None or message_id < oldest_id):
+                    oldest_id = message_id
+
                 sender = getattr(message, 'sender', None)
                 if sender is None:
                     try:
@@ -223,17 +250,40 @@ class ParserClient:
                         sender = None
                 if not isinstance(sender, types.User):
                     continue
+
                 uid = getattr(sender, 'id', None)
-                if not uid or uid in seen_ids or getattr(sender, 'bot', False) or getattr(sender, 'deleted', False):
+                if not uid or uid in seen_ids:
                     continue
+                if getattr(sender, 'bot', False) or getattr(sender, 'deleted', False):
+                    continue
+
                 seen_ids.add(uid)
-                yield {
+                authors.append({
                     'user_id': uid,
                     'username': getattr(sender, 'username', None),
                     'first_name': getattr(sender, 'first_name', None),
                     'last_name': getattr(sender, 'last_name', None),
                     'is_bot': bool(getattr(sender, 'bot', False)),
-                }
+                })
+
+            log.info('History batch chat=%s batch=%s messages=%s new_authors=%s',
+                     chat_id, batch_no, len(messages), len(authors))
+
+            for user in authors:
+                yield user
+
+            if oldest_id is None or oldest_id <= 1 or oldest_id == offset_id:
+                break
+            offset_id = oldest_id
+
+            # One controlled pause per history batch. User/profile checking has
+            # its own delay in the scanner, so do not sleep between individual
+            # authors here.
+            if remaining > 0:
+                await asyncio.sleep(random.uniform(min_delay, max_delay))
+
+        log.info('Hidden-member history scan exhausted chat=%s messages_read=%s unique_users=%s',
+                 chat_id, max_messages - remaining, len(seen_ids))
 
     async def iter_participants(self, chat_id, limit=None):
         """Yield participants using Telethon's supported iterator signature."""
