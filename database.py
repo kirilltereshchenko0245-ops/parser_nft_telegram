@@ -65,6 +65,8 @@ class Database:
                 id INTEGER PRIMARY KEY CHECK(id=1),
                 owner_id INTEGER NOT NULL,
                 session_string TEXT,
+                auth_phone TEXT,
+                auth_phone_code_hash TEXT,
                 phone TEXT,
                 username TEXT,
                 user_id INTEGER,
@@ -72,6 +74,9 @@ class Database:
                 is_active INTEGER DEFAULT 0,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)''')
+            existing = {row[1] for row in c.execute('PRAGMA table_info(parser_session)').fetchall()}
+            if 'auth_phone' not in existing: c.execute('ALTER TABLE parser_session ADD COLUMN auth_phone TEXT')
+            if 'auth_phone_code_hash' not in existing: c.execute('ALTER TABLE parser_session ADD COLUMN auth_phone_code_hash TEXT')
             
             c.execute('''CREATE TABLE IF NOT EXISTS parser_chats(
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -324,11 +329,17 @@ class Database:
     # ───────────── MTProto Parser Session ─────────────
     def save_parser_session(self, owner_id, session_string, phone, username, user_id, first_name):
         with self._db() as c:
-            c.execute('''INSERT OR REPLACE INTO parser_session(id, owner_id, session_string, phone, 
-                username, user_id, first_name, is_active, updated_at) 
-                VALUES(1,?,?,?,?,?,?,1,CURRENT_TIMESTAMP)''',
+            c.execute('''INSERT OR REPLACE INTO parser_session(id, owner_id, session_string, phone, username, user_id, first_name, is_active, auth_phone, auth_phone_code_hash, updated_at)
+                VALUES(1,?,?,?,?,?,?,1,NULL,NULL,CURRENT_TIMESTAMP)''',
                       (owner_id, session_string, phone, username, user_id, first_name))
-    
+
+    def save_pending_parser_auth(self, owner_id, phone, phone_code_hash):
+        with self._db() as c:
+            c.execute('''INSERT INTO parser_session(id, owner_id, auth_phone, auth_phone_code_hash, is_active, updated_at)
+                VALUES(1,?,?,?,0,CURRENT_TIMESTAMP)
+                ON CONFLICT(id) DO UPDATE SET owner_id=excluded.owner_id, auth_phone=excluded.auth_phone, auth_phone_code_hash=excluded.auth_phone_code_hash, is_active=0, updated_at=CURRENT_TIMESTAMP''',
+                      (owner_id, phone, phone_code_hash))
+
     def get_parser_session(self):
         return self._one('SELECT * FROM parser_session WHERE id=1')
     
@@ -336,6 +347,10 @@ class Database:
         with self._db() as c:
             c.execute('DELETE FROM parser_session WHERE id=1')
     
+    def clear_pending_parser_auth(self):
+        with self._db() as c:
+            c.execute('UPDATE parser_session SET auth_phone=NULL, auth_phone_code_hash=NULL, updated_at=CURRENT_TIMESTAMP WHERE id=1')
+
     def set_parser_active(self, active):
         with self._db() as c:
             c.execute('UPDATE parser_session SET is_active=?, updated_at=CURRENT_TIMESTAMP WHERE id=1', (int(active),))

@@ -4,6 +4,7 @@ The user account is authenticated once and persisted as a StringSession.
 Gift lookup uses Telegram's MTProto payments.getSavedStarGifts method.
 """
 import logging
+import os
 from typing import Any
 
 from telethon import TelegramClient, functions, types
@@ -18,8 +19,10 @@ from telethon.errors import (
 
 log = logging.getLogger('giftparser.parser')
 
-API_ID = 2040
-API_HASH = 'b18441a1ff607e10a989891a5462e627'
+API_ID = int(os.getenv('TG_API_ID') or 0)
+API_HASH = os.getenv('TG_API_HASH') or ''
+if not API_ID or not API_HASH:
+    raise RuntimeError('TG_API_ID и TG_API_HASH должны быть указаны в .env')
 
 
 class ParserClient:
@@ -35,11 +38,14 @@ class ParserClient:
         if not self.client.is_connected():
             await self.client.connect()
 
-    async def start_auth(self, phone: str):
+    async def start_auth(self, phone: str, phone_code_hash: str | None = None):
         self._phone = phone
         await self._ensure_client()
         if await self.client.is_user_authorized():
             return False
+        if phone_code_hash:
+            self._phone_code_hash = phone_code_hash
+            return True
         result = await self.client.send_code_request(phone)
         self._phone_code_hash = result.phone_code_hash
         log.info('Telegram login code sent')

@@ -125,6 +125,7 @@ async def parser_phone_handler(message: Message, state: FSMContext, db):
     try:
         parser_client = ParserClient()
         await parser_client.start_auth(phone)
+        db.save_pending_parser_auth(message.from_user.id, phone, parser_client._phone_code_hash)
         await state.update_data(phone=phone)
         await state.set_state(ParserStates.waiting_code)
         await message.answer('📩 <b>Код отправлен</b>\n\nВведите код из Telegram.\n\n⚠️ Новый код автоматически запрашиваться не будет.', reply_markup=parser_kb.parser_cancel_keyboard())
@@ -135,11 +136,17 @@ async def parser_phone_handler(message: Message, state: FSMContext, db):
 
 @router.message(ParserStates.waiting_code)
 async def parser_code_handler(message: Message, state: FSMContext, db):
+    global parser_client
     if message.text == '✖️ Отмена':
         if parser_client: await parser_client.disconnect()
         await state.clear(); return await parser_menu_handler(message, state, db)
     if not parser_client:
-        await state.clear(); return await message.answer('❌ Сессия авторизации потеряна. Начните подключение заново.')
+        pending = db.get_parser_session()
+        if pending and pending.get('auth_phone') and pending.get('auth_phone_code_hash') and int(pending.get('owner_id') or 0) == int(message.from_user.id):
+            parser_client = ParserClient()
+            await parser_client.start_auth(pending['auth_phone'], pending['auth_phone_code_hash'])
+        else:
+            await state.clear(); return await message.answer('❌ Активная попытка входа не найдена. Нажмите подключение и запросите один новый код.')
     code = ''.join(ch for ch in (message.text or '') if ch.isdigit())
     result = await parser_client.verify_code(code)
     if result.get('need_2fa'):
@@ -173,6 +180,7 @@ async def save_session(message, state, db, client):
         return await message.answer('❌ Telegram не вернул сохранённую сессию. Попробуйте подключить аккаунт ещё раз.')
     data = await state.get_data()
     db.save_parser_session(message.from_user.id, session_string, data.get('phone'), me.get('username'), me.get('user_id'), me.get('first_name'))
+    db.clear_pending_parser_auth()
     db.set_parser_active(True)
     await load_chats(client, db)
     await state.clear()
