@@ -32,6 +32,10 @@ scan_task = None
 def _session_owned(session, uid):
     return bool(session and int(session.get('owner_id') or 0) == int(uid))
 
+def _parser_access_allowed(db, uid):
+    return (not db.parser_admin_only()) or _session_owned(db.get_parser_session(), uid)
+
+
 
 def format_parser_menu(session_data, mode='all'):
     if session_data and session_data.get('is_active'):
@@ -102,6 +106,8 @@ async def restore_saved_parser_session(db):
 
 @router.message(F.text == '🔎 Парсинг по чатам')
 async def parser_menu_handler(message: Message, state: FSMContext, db):
+    if not _parser_access_allowed(db, message.from_user.id):
+        return await message.answer('🔒 Парсер доступен только администратору.')
     await state.clear()
     session = db.get_parser_session()
     if session and session.get('is_active'):
@@ -115,6 +121,8 @@ async def parser_menu_handler(message: Message, state: FSMContext, db):
 
 @router.callback_query(F.data == 'parser:menu')
 async def parser_menu_callback(call: CallbackQuery, state: FSMContext, db):
+    if not _parser_access_allowed(db, call.from_user.id):
+        return await call.answer('Только для администратора', show_alert=True)
     await state.clear()
     session = db.get_parser_session()
     await call.message.edit_text(format_parser_menu(session), reply_markup=parser_kb.parser_main_menu(bool(session and session.get('is_active'))))
@@ -172,6 +180,36 @@ async def parser_connect_handler(call: CallbackQuery, state: FSMContext, db):
 # Phone/code/2FA handlers intentionally removed.
 # Parser authentication is performed once outside the bot and injected as
 # PARSER_SESSION_STRING.
+
+async def resume_interrupted_scan(db):
+    """Resume a scan left in 'running' state after a container/process restart."""
+    global scanner, scan_task
+    state = db.get_parser_scan_state()
+    if not state or state.get('status') != 'running':
+        return False
+    session = db.get_parser_session()
+    if not session or not session.get('session_string'):
+        return False
+    try:
+        client = await ensure_client(db)
+        owner_id = int(state['owner_id'])
+        mode = state.get('mode') or 'all'
+        limit = int(state.get('max_users') or 100)
+        async def on_result(user, gifts):
+            for gift in gifts[:5]:
+                try:
+                    card = format_gift_card(user, gift)
+                    await bot.send_message(owner_id, card, reply_markup=parser_kb.parser_gift_kb({**gift, 'username': user.get('username'), 'user_id': user.get('user_id')}))
+                except Exception:
+                    log.exception('Failed to send resumed result')
+        scanner = ChatScanner(client, db, result_callback=on_result)
+        scan_task = asyncio.create_task(scanner.start_scan(mode=mode, max_users=limit))
+        log.info('Resumed interrupted parser scan: owner=%s mode=%s limit=%s', owner_id, mode, limit)
+        return True
+    except Exception:
+        log.exception('Failed to resume parser scan')
+        return False
+
 
 async def save_session(message, state, db, client):
     global parser_client
@@ -326,6 +364,7 @@ async def start_scan_with_limit(message, uid, state, db, limit, call):
             card = format_gift_card(user, gift)
             await origin_message.answer(card, reply_markup=parser_kb.parser_gift_kb({**gift, 'username': user.get('username'), 'user_id': user.get('user_id')}))
 
+    db.save_parser_scan_state(uid, mode, limit, 'running')
     scanner = ChatScanner(client, db, result_callback=on_result)
     scan_task = asyncio.create_task(scanner.start_scan(mode=mode, max_users=limit))
     label = '🎁 любые NFT' if mode == 'all' else '💎 неулучшенные NFT'

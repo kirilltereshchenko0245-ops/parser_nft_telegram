@@ -1,4 +1,4 @@
-"""Thorough, sequential chat member scanner."""
+"""Long-running, sequential Telegram chat/NFT scanner."""
 import asyncio
 import logging
 import random
@@ -9,9 +9,10 @@ log = logging.getLogger('giftparser.parser')
 
 MIN_DELAY = 2.5
 MAX_DELAY = 5.5
-BATCH_DELAY_MIN = 8
-BATCH_DELAY_MAX = 18
-RECHECK_AFTER_HOURS = 168  # повторная полная проверка не чаще раза в 7 дней
+BATCH_DELAY_MIN = 10
+BATCH_DELAY_MAX = 30
+RECHECK_AFTER_HOURS = 168
+MAX_RETRIES = 5
 
 
 class ChatScanner:
@@ -23,12 +24,9 @@ class ChatScanner:
         self.stop_flag = False
         self.mode = 'all'
         self.max_users = 100
-        self.stats = {
-            'total_checked': 0, 'total_found': 0, 'total_new_gifts': 0,
-            'current_chat': None, 'current_chat_title': '',
-            'chat_checked': 0, 'chat_found': 0, 'start_time': None,
-            'limit': 0,
-        }
+        self.stats = {'total_checked': 0, 'total_found': 0, 'total_new_gifts': 0,
+                      'current_chat': None, 'current_chat_title': '',
+                      'start_time': None, 'limit': 0}
         self._checked_this_run = set()
 
     async def start_scan(self, mode='all', max_users=100):
@@ -41,12 +39,12 @@ class ChatScanner:
         self.stats['start_time'] = datetime.now()
         self.stats['limit'] = self.max_users
         self._checked_this_run.clear()
-
         enabled_chats = self.db.get_enabled_parser_chats()
         if not enabled_chats:
             self.is_running = False
+            self.db.set_parser_scan_status('idle')
             return False
-
+        interrupted = False
         try:
             for chat in enabled_chats:
                 if self.stop_flag or self.stats['total_checked'] >= self.max_users:
@@ -55,11 +53,19 @@ class ChatScanner:
                     await self._scan_chat(chat)
                 except FloodWaitError as e:
                     log.warning('FloodWait in chat %s: %ss', chat['title'], e.seconds)
-                    await asyncio.sleep(e.seconds)
+                    await asyncio.sleep(e.seconds + random.uniform(1, 3))
                 except Exception:
-                    log.exception('Error scanning chat %s', chat['title'])
+                    log.exception('Error scanning chat %s; continuing with next chat', chat['title'])
+                    await asyncio.sleep(3)
+        except asyncio.CancelledError:
+            interrupted = True
+            self.db.set_parser_scan_status('running')
+            raise
         finally:
             self.is_running = False
+            if not interrupted:
+                status = 'stopped' if self.stop_flag else 'completed'
+                self.db.set_parser_scan_status(status)
             log.info('Scan finished: checked=%s found=%s new_gifts=%s',
                      self.stats['total_checked'], self.stats['total_found'], self.stats['total_new_gifts'])
         return True
@@ -70,89 +76,108 @@ class ChatScanner:
         self.stats['current_chat_title'] = chat['title']
         self.stats['chat_checked'] = 0
         self.stats['chat_found'] = 0
-
         progress = self.db.get_parser_progress(chat_id)
-        offset = progress['last_user_offset'] if progress else 0
-        checked = progress['checked_count'] if progress else 0
-        found = progress['found_count'] if progress else 0
-        self.db.update_parser_progress(chat_id, offset, checked, found, 'running')
+        offset = int(progress['last_user_offset']) if progress else 0
+        checked_before = int(progress['checked_count']) if progress else 0
+        found_before = int(progress['found_count']) if progress else 0
+        self.db.update_parser_progress(chat_id, offset, checked_before, found_before, 'running')
+        processed_since_pause = 0
 
-        batch_size = 50
-        since_batch = 0
-        while not self.stop_flag and self.stats['total_checked'] < self.max_users:
-            participants = await self.client.get_participants(chat_id, limit=batch_size, offset=offset)
-            if not participants:
-                self.db.update_parser_progress(chat_id, offset, checked, found, 'completed')
+        # Do not pass offset to Telethon: current installed versions reject it.
+        # We consume the iterator once and locally skip the saved position.
+        index = 0
+        async for user in self.client.iter_participants(chat_id, limit=None):
+            if self.stop_flag or self.stats['total_checked'] >= self.max_users:
                 break
+            if index < offset:
+                index += 1
+                continue
+            index += 1
+            offset = index
 
-            for user in participants:
-                if self.stop_flag or self.stats['total_checked'] >= self.max_users:
-                    break
-                user_id = user['user_id']
-                offset += 1
+            if getattr(user, 'bot', False) or getattr(user, 'deleted', False):
+                continue
+            user_data = {
+                'user_id': user.id,
+                'username': getattr(user, 'username', None),
+                'first_name': getattr(user, 'first_name', None),
+                'last_name': getattr(user, 'last_name', None),
+                'is_bot': bool(getattr(user, 'bot', False)),
+            }
+            user_id = user_data['user_id']
+            if user_id in self._checked_this_run or self.db.is_user_checked(user_id, hours=RECHECK_AFTER_HOURS):
+                continue
 
-                if user_id in self._checked_this_run:
-                    continue
-                if self.db.is_user_checked(user_id, hours=RECHECK_AFTER_HOURS):
-                    continue
+            self._checked_this_run.add(user_id)
+            self.stats['total_checked'] += 1
+            self.stats['chat_checked'] += 1
+            processed_since_pause += 1
 
-                self._checked_this_run.add(user_id)
-                since_batch += 1
-                self.stats['total_checked'] += 1
-                self.stats['chat_checked'] += 1
+            gifts = await self._check_user_gifts(user_data)
+            matched = self._filter_mode(gifts)
+            has_gifts = bool(matched)
+            if has_gifts:
+                self.stats['total_found'] += 1
+                self.stats['chat_found'] += 1
 
-                gifts = await self._check_user_gifts(user, chat_id)
-                matched = self._filter_mode(gifts)
-                has_gifts = bool(matched)
-                if has_gifts:
-                    self.stats['total_found'] += 1
-                    self.stats['chat_found'] += 1
-
-                self.db.add_parser_user(
-                    user_id, user.get('username'), user.get('first_name'),
-                    user.get('last_name'), has_gifts
-                )
-
-                new_gifts = []
-                for gift in matched:
+            self.db.add_parser_user(user_id, user_data.get('username'), user_data.get('first_name'),
+                                    user_data.get('last_name'), has_gifts)
+            new_gifts = []
+            for gift in matched:
+                try:
                     if self.db.add_parser_gift(user_id, chat_id, gift):
                         new_gifts.append(gift)
                         self.stats['total_new_gifts'] += 1
+                except Exception:
+                    log.exception('Failed saving gift for user %s; continuing', user_id)
 
-                if new_gifts and self.result_callback:
-                    await self.result_callback(user, new_gifts)
+            if new_gifts and self.result_callback:
+                try:
+                    await self.result_callback(user_data, new_gifts)
+                except Exception:
+                    log.exception('Result callback failed for user %s; scanner continues', user_id)
 
-                self.db.update_parser_progress(chat_id, offset, checked + self.stats['chat_checked'], found + self.stats['chat_found'], 'running')
+            self.db.update_parser_progress(chat_id, offset,
+                                           checked_before + self.stats['chat_checked'],
+                                           found_before + self.stats['chat_found'], 'running')
+            await self._polite_delay()
+            if processed_since_pause >= 20 and not self.stop_flag:
+                await asyncio.sleep(random.uniform(BATCH_DELAY_MIN, BATCH_DELAY_MAX))
+                processed_since_pause = 0
 
-                # Deliberately slow and sequential: quality before speed.
-                await self._polite_delay()
+        status = 'stopped' if self.stop_flag else 'completed'
+        self.db.update_parser_progress(chat_id, offset,
+                                       checked_before + self.stats['chat_checked'],
+                                       found_before + self.stats['chat_found'], status)
 
-                if since_batch >= 20 and not self.stop_flag:
-                    await asyncio.sleep(random.uniform(BATCH_DELAY_MIN, BATCH_DELAY_MAX))
-                    since_batch = 0
-
-        status = 'stopped' if self.stop_flag else ('completed' if self.stats['total_checked'] >= self.max_users else 'completed')
-        self.db.update_parser_progress(chat_id, offset, checked + self.stats['chat_checked'], found + self.stats['chat_found'], status)
-
-    async def _check_user_gifts(self, user, chat_id):
-        """Fetch the complete available gift list for this profile, with retries."""
-        for attempt in range(3):
+    async def _check_user_gifts(self, user):
+        for attempt in range(1, MAX_RETRIES + 1):
             try:
                 return await self.client.get_user_gifts(user['user_id'], limit=1000)
             except FloodWaitError as e:
                 log.warning('FloodWait checking user %s: %ss', user['user_id'], e.seconds)
-                await asyncio.sleep(e.seconds)
+                await asyncio.sleep(e.seconds + random.uniform(1, 3))
+            except (ConnectionError, TimeoutError) as e:
+                log.warning('Network error for %s (%s/%s): %s', user['user_id'], attempt, MAX_RETRIES, e)
+                await self._recover_connection()
+                await asyncio.sleep(min(60, 3 * attempt))
             except Exception as e:
-                if attempt == 2:
-                    log.warning('Gift lookup failed for %s: %s', user['user_id'], e)
+                if attempt == MAX_RETRIES:
+                    log.warning('Gift lookup failed for %s after %s attempts: %s', user['user_id'], attempt, e)
                     return []
-                await asyncio.sleep(5 * (attempt + 1))
+                await asyncio.sleep(min(60, 4 * attempt))
         return []
+
+    async def _recover_connection(self):
+        try:
+            if not self.client.is_connected():
+                await self.client.connect()
+        except Exception:
+            log.exception('Telegram reconnect failed; retrying later')
 
     def _filter_mode(self, gifts):
         if self.mode == 'all':
             return gifts
-        # "Неулучшенные": обычные received gifts, not collectible/unique.
         return [g for g in gifts if not g.get('is_upgraded') and not g.get('is_collectible')]
 
     async def _polite_delay(self):

@@ -1,0 +1,7 @@
+GiftParser 6.6 Overnight
+- Fixed Telethon iter_participants offset incompatibility.
+- Persistent per-chat progress.
+- Persistent scan state and automatic resume after process/container restart.
+- FloodWait/network retry handling.
+- Admin-only parser access toggle.
+- Custom parser limit flow.

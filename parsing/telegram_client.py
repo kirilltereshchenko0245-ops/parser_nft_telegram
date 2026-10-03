@@ -130,20 +130,37 @@ class ParserClient:
                 })
         return dialogs
 
-    async def get_participants(self, chat_id, limit=None, offset=0):
+    async def iter_participants(self, chat_id, limit=None):
+        """Yield participants using Telethon's supported iterator signature."""
         if not self.client:
             raise RuntimeError('Клиент не подключён')
-        participants = []
-        async for user in self.client.iter_participants(chat_id, limit=limit, offset=offset):
+        count = 0
+        async for user in self.client.iter_participants(chat_id, limit=limit):
             if getattr(user, 'bot', False) or getattr(user, 'deleted', False):
                 continue
-            participants.append({
+            yield {
                 'user_id': user.id,
                 'username': getattr(user, 'username', None),
                 'first_name': getattr(user, 'first_name', None),
                 'last_name': getattr(user, 'last_name', None),
                 'is_bot': bool(getattr(user, 'bot', False)),
-            })
+            }
+            count += 1
+            if limit is not None and count >= limit:
+                break
+
+    async def get_participants(self, chat_id, limit=None, offset=0):
+        """Compatibility wrapper; offset is applied locally because Telethon's
+        installed iter_participants does not accept an offset keyword."""
+        participants = []
+        skipped = 0
+        async for user in self.iter_participants(chat_id, limit=None):
+            if skipped < max(0, int(offset or 0)):
+                skipped += 1
+                continue
+            participants.append(user)
+            if limit is not None and len(participants) >= limit:
+                break
         return participants
 
     async def get_user_gifts(self, user_id: int, limit: int = 1000):

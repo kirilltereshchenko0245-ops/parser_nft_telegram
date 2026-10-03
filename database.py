@@ -114,6 +114,18 @@ class Database:
                 status TEXT DEFAULT 'idle',
                 updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)''')
 
+            c.execute('''CREATE TABLE IF NOT EXISTS parser_settings(
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL)''')
+            c.execute('''CREATE TABLE IF NOT EXISTS parser_scan_state(
+                id INTEGER PRIMARY KEY CHECK(id=1),
+                owner_id INTEGER NOT NULL,
+                mode TEXT NOT NULL DEFAULT 'all',
+                max_users INTEGER NOT NULL DEFAULT 100,
+                status TEXT NOT NULL DEFAULT 'idle',
+                started_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)''')
+
             # Миграция старой таблицы parser_gifts: раньше UNIQUE(user_id, gift_id)
             # ошибочно удалял разные экземпляры одного типа подарка.
             table_sql = c.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name='parser_gifts'").fetchone()
@@ -340,6 +352,41 @@ class Database:
         with self._db() as c:
             c.execute('UPDATE parser_session SET is_active=?, updated_at=CURRENT_TIMESTAMP WHERE id=1', (int(active),))
     
+
+    # ───────────── Parser settings / overnight state ─────────────
+    def get_parser_setting(self, key, default=None):
+        row = self._one('SELECT value FROM parser_settings WHERE key=?', (key,))
+        return row['value'] if row else default
+
+    def set_parser_setting(self, key, value):
+        with self._db() as c:
+            c.execute('INSERT INTO parser_settings(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value', (key, str(value)))
+
+    def parser_admin_only(self):
+        return self.get_parser_setting('admin_only', '0') == '1'
+
+    def set_parser_admin_only(self, value):
+        self.set_parser_setting('admin_only', '1' if value else '0')
+
+    def save_parser_scan_state(self, owner_id, mode, max_users, status='running'):
+        with self._db() as c:
+            c.execute('''INSERT INTO parser_scan_state(id,owner_id,mode,max_users,status,started_at,updated_at)
+                VALUES(1,?,?,?,?,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)
+                ON CONFLICT(id) DO UPDATE SET owner_id=excluded.owner_id, mode=excluded.mode,
+                max_users=excluded.max_users, status=excluded.status, updated_at=CURRENT_TIMESTAMP''',
+                      (owner_id, mode, int(max_users), status))
+
+    def get_parser_scan_state(self):
+        return self._one('SELECT * FROM parser_scan_state WHERE id=1')
+
+    def set_parser_scan_status(self, status):
+        with self._db() as c:
+            c.execute('UPDATE parser_scan_state SET status=?, updated_at=CURRENT_TIMESTAMP WHERE id=1', (status,))
+
+    def clear_parser_scan_state(self):
+        with self._db() as c:
+            c.execute('DELETE FROM parser_scan_state WHERE id=1')
+
     # ───────────── Parser Chats ─────────────
     def add_parser_chat(self, chat_id, title, username, chat_type, total_participants=0):
         with self._db() as c:

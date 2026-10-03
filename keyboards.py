@@ -24,13 +24,14 @@ LIST_PER_PAGE = 8
 
 
 # ───────────── reply-клавиатуры ─────────────
-def main_menu(admin=False, premium=False):
+def main_menu(admin=False, premium=False, parser_visible=True):
     b = ReplyKeyboardBuilder()
     b.row(KeyboardButton(text=BTN_SEARCH), KeyboardButton(text=BTN_ID))
     b.row(KeyboardButton(text=BTN_RANDOM), KeyboardButton(text=BTN_MODELS))
     b.row(KeyboardButton(text=BTN_HISTORY), KeyboardButton(text=BTN_FAVS))
     b.row(KeyboardButton(text=BTN_PROFILE), KeyboardButton(text=BTN_HELP))
-    b.row(KeyboardButton(text=BTN_PARSER))  # Новая кнопка парсера
+    if parser_visible:
+        b.row(KeyboardButton(text=BTN_PARSER))
     extra = []
     if not premium:
         extra.append(KeyboardButton(text=BTN_PREMIUM))

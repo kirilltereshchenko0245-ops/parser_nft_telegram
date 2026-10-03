@@ -78,7 +78,7 @@ def is_unlimited(uid):
 
 
 def user_menu(uid):
-    return kb.main_menu(is_admin(uid), bool((db.get_user(uid) or {}).get('is_premium')))
+    return kb.main_menu(is_admin(uid), bool((db.get_user(uid) or {}).get('is_premium')), (not db.parser_admin_only()) or is_admin(uid))
 
 
 def trial_left(uid):
@@ -783,6 +783,7 @@ def admin_home_kb():
         [InlineKeyboardButton(text='🔎 Найти пользователя', callback_data='adm:userfind')],
         [InlineKeyboardButton(text='🔎 Последние поиски', callback_data='adm:searches')],
         [InlineKeyboardButton(text='📜 Логи', callback_data='adm:logs')],
+        [InlineKeyboardButton(text='🔐 Доступ к парсеру', callback_data='adm:parser_access')],
         [InlineKeyboardButton(text='🔄 Обновить', callback_data='adm:home')],
     ])
 
@@ -815,6 +816,17 @@ def stats_text():
         ui.kv('🎁', 'Находок', ui.num(s['found'])),
         ui.kv('⚡', 'Активных поисков', len(ACTIVE))))
 
+
+@dp.callback_query(F.data == 'adm:parser_access')
+async def adm_parser_access(c: CallbackQuery):
+    if not is_admin(c.from_user.id):
+        return await c.answer('Нет доступа', show_alert=True)
+    enabled = db.parser_admin_only()
+    db.set_parser_admin_only(not enabled)
+    state = '🔒 Только администратор' if not enabled else '🌐 Доступ разрешён пользователям'
+    await audit('Изменён доступ к парсеру', c.from_user.id, f'Режим: <b>{state}</b>')
+    await c.answer(state, show_alert=True)
+    await c.message.edit_reply_markup(reply_markup=admin_home_kb())
 
 @dp.callback_query(F.data == 'adm:stats')
 async def adm_stats(c: CallbackQuery):
@@ -1018,6 +1030,9 @@ async def main():
     try:
         restored = await parser_handlers.restore_saved_parser_session(db)
         log.info('Saved parser session restore: %s', restored)
+        if restored:
+            resumed = await parser_handlers.resume_interrupted_scan(db)
+            log.info('Interrupted parser scan resume: %s', resumed)
     except Exception:
         log.exception('Failed to restore saved parser session')
 
