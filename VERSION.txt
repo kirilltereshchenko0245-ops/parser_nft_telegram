@@ -1,1 +1,1 @@
-GiftParser 7.4.1 — safe speed/entity fix + final NFT user list
+GiftParser 7.4.2 — hidden-chat anti-stall / round-robin scheduler fix

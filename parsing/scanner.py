@@ -16,6 +16,8 @@ BATCH_DELAY_MAX = float(os.getenv('PARSER_BATCH_DELAY_MAX', '8'))
 RECHECK_AFTER_HOURS = 168
 MAX_RETRIES = 4
 CHAT_QUOTA = 2  # Exactly two profiles per enabled chat per round.
+MAX_SKIPS_PER_CHAT_ROUND = int(os.getenv('PARSER_MAX_SKIPS_PER_CHAT_ROUND', '100'))
+MAX_IDLE_ROUNDS = int(os.getenv('PARSER_MAX_IDLE_ROUNDS', '8'))
 
 
 class ChatScanner:
@@ -103,6 +105,7 @@ class ChatScanner:
         log.info('Round-robin scan initialized: chats=%s quota_per_chat=%s limit=%s',
                  len(active), CHAT_QUOTA, self.max_users)
 
+        idle_rounds = 0
         while active and not self.stop_flag and self.stats['total_checked'] < self.max_users:
             next_active = []
             made_progress = False
@@ -127,8 +130,13 @@ class ChatScanner:
                          self.stats['total_checked'], self.max_users)
             active = next_active
             if active and not made_progress:
-                log.warning('Round-robin made no progress; stopping to avoid an infinite loop')
-                break
+                idle_rounds += 1
+                log.warning('Round-robin idle round=%s/%s; all chats yielded only previously scanned users or no candidates', idle_rounds, MAX_IDLE_ROUNDS)
+                if idle_rounds >= MAX_IDLE_ROUNDS:
+                    log.warning('Round-robin stopping after %s idle rounds; no new profiles were available', idle_rounds)
+                    break
+            else:
+                idle_rounds = 0
 
         for state in states:
             self._save_state(state, 'stopped' if self.stop_flag else 'completed')
@@ -167,11 +175,19 @@ class ChatScanner:
             'iter': user_iter,
             'exhausted': False,
             'hidden': hidden,
+            'deferred_this_round': False,
         }
         self.db.update_parser_progress(chat_id, offset, checked_before, found_before, 'running')
         return state
 
     async def _next_user(self, state):
+        # Hidden chats can expose thousands of message authors that were already
+        # scanned in previous runs. Never spend an entire round walking through
+        # them: after a bounded number of skips, yield control back to the
+        # round-robin scheduler so other chats continue immediately. The async
+        # generator stays alive, so the next round resumes from the next author.
+        skipped = 0
+        state['deferred_this_round'] = False
         while not state['exhausted']:
             try:
                 user = await state['iter'].__anext__()
@@ -202,12 +218,21 @@ class ChatScanner:
                 log.info('Skipping parser account itself: %s', user_id)
                 continue
             if int(user_id) in self._checked_this_run:
+                skipped += 1
+                if skipped >= MAX_SKIPS_PER_CHAT_ROUND:
+                    state['deferred_this_round'] = True
+                    log.info('Deferring chat=%s after %s already-scanned candidates; will resume next round', state['chat_id'], skipped)
+                    return None
                 continue
             # Persistent global de-duplication: a user already checked in a previous
             # run is never selected again, even after a bot restart, provided the DB
             # itself is persistent (Railway Volume / external DB).
             if hasattr(self.db, 'is_parser_user_seen') and self.db.is_parser_user_seen(user_id):
-                log.info('Skipping previously scanned user=%s chat=%s', user_id, state['chat_id'])
+                skipped += 1
+                if skipped >= MAX_SKIPS_PER_CHAT_ROUND:
+                    state['deferred_this_round'] = True
+                    log.info('Deferring chat=%s after %s previously scanned users; will resume next round', state['chat_id'], skipped)
+                    return None
                 continue
             return user_data
         return None
