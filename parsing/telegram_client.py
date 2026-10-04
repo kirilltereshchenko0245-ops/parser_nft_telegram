@@ -183,6 +183,7 @@ class ParserClient:
                     continue
                 yield {
                     'user_id': uid,
+                    'access_hash': getattr(user, 'access_hash', None),
                     'username': getattr(user, 'username', None),
                     'first_name': getattr(user, 'first_name', None),
                     'last_name': getattr(user, 'last_name', None),
@@ -260,6 +261,7 @@ class ParserClient:
                 seen_ids.add(uid)
                 authors.append({
                     'user_id': uid,
+                    'access_hash': getattr(user, 'access_hash', None),
                     'username': getattr(sender, 'username', None),
                     'first_name': getattr(sender, 'first_name', None),
                     'last_name': getattr(sender, 'last_name', None),
@@ -295,6 +297,7 @@ class ParserClient:
                 continue
             yield {
                 'user_id': user.id,
+                'access_hash': getattr(user, 'access_hash', None),
                 'username': getattr(user, 'username', None),
                 'first_name': getattr(user, 'first_name', None),
                 'last_name': getattr(user, 'last_name', None),
@@ -375,7 +378,7 @@ class ParserClient:
                 break
         return participants
 
-    async def get_user_gifts(self, user_id: int, limit: int = 1000, only_unupgraded: bool = False):
+    async def get_user_gifts(self, user, limit: int = 1000, only_unupgraded: bool = False):
         """Return relevant gifts owned by a Telegram user.
 
         For the unupgraded mode Telegram can filter server-side:
@@ -386,7 +389,16 @@ class ParserClient:
         if not self.client:
             raise RuntimeError('Клиент не подключён')
 
-        peer = await self.client.get_input_entity(user_id)
+        if isinstance(user, dict):
+            user_id = int(user['user_id'])
+            access_hash = user.get('access_hash')
+        else:
+            user_id = int(user)
+            access_hash = None
+        if access_hash:
+            peer = types.InputPeerUser(user_id=user_id, access_hash=int(access_hash))
+        else:
+            peer = await self.client.get_input_entity(user_id)
         offset = ''
         result = []
         seen = set()

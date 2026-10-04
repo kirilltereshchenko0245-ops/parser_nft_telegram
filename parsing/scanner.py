@@ -33,6 +33,8 @@ class ChatScanner:
         self._checked_this_run = set()
         self._sent_this_run = set()
         self.self_user_id = None
+        self._gift_sem = asyncio.Semaphore(max(1, int(os.getenv('PARSER_GIFT_CONCURRENCY', '3'))))
+        self._found_profiles = {}
 
     async def start_scan(self, mode='all', max_users=100):
         if self.is_running:
@@ -50,6 +52,7 @@ class ChatScanner:
         self.stats['total_new_gifts'] = 0
         self._checked_this_run.clear()
         self._sent_this_run.clear()
+        self._found_profiles.clear()
 
         try:
             me = await self.client.get_me()
@@ -58,6 +61,8 @@ class ChatScanner:
         except Exception:
             log.exception('Could not determine parser account id; self-account protection is unavailable')
             self.self_user_id = None
+        self._gift_sem = asyncio.Semaphore(max(1, int(os.getenv('PARSER_GIFT_CONCURRENCY', '3'))))
+        self._found_profiles = {}
 
         enabled_chats = self.db.get_enabled_parser_chats()
         if not enabled_chats:
@@ -107,17 +112,25 @@ class ChatScanner:
             for state in active:
                 if self.stop_flag or self.stats['total_checked'] >= self.max_users:
                     break
-                processed_here = 0
+                users = []
                 for _ in range(CHAT_QUOTA):
-                    if self.stop_flag or self.stats['total_checked'] >= self.max_users:
+                    if self.stop_flag or self.stats['total_checked'] + len(users) >= self.max_users:
                         break
                     user = await self._next_user(state)
                     if user is None:
                         break
-                    processed = await self._process_user(state, user)
-                    if processed:
-                        made_progress = True
-                        processed_here += 1
+                    users.append(user)
+                if users:
+                    results = await asyncio.gather(
+                        *(self._process_user(state, user) for user in users),
+                        return_exceptions=True
+                    )
+                    for processed in results:
+                        if isinstance(processed, Exception):
+                            log.exception('Parallel profile check failed', exc_info=processed)
+                        elif processed:
+                            made_progress = True
+                            processed_here += 1
                 if not state['exhausted']:
                     next_active.append(state)
                 log.info('Round chat=%s checked_this_round=%s total=%s/%s',
@@ -245,12 +258,18 @@ class ChatScanner:
                  self.stats['total_checked'], self.max_users, state['chat_id'],
                  user_id, user_data.get('username'))
 
-        gifts = await self._check_user_gifts(user_data)
+        async with self._gift_sem:
+            gifts = await self._check_user_gifts(user_data)
         matched = self._filter_mode(gifts)
         has_gifts = bool(matched)
         if has_gifts:
             self.stats['total_found'] += 1
             state['chat_found'] += 1
+            self._found_profiles[int(user_id)] = {
+                'username': user_data.get('username'),
+                'user_id': int(user_id),
+                'gift_count': len(matched),
+            }
 
         self.db.add_parser_user(user_id, user_data.get('username'), user_data.get('first_name'),
                                 user_data.get('last_name'), has_gifts)
@@ -289,7 +308,7 @@ class ChatScanner:
                 log.exception('Result callback failed for user %s; scanner continues', user_id)
 
         self._save_state(state, 'running')
-        await asyncio.sleep(random.uniform(MIN_DELAY, MAX_DELAY))
+        await asyncio.sleep(random.uniform(0.15, 0.35))
         return True
 
     def _save_state(self, state, status='running'):
@@ -301,7 +320,7 @@ class ChatScanner:
     async def _check_user_gifts(self, user):
         for attempt in range(1, MAX_RETRIES + 1):
             try:
-                return await self.client.get_user_gifts(user['user_id'], limit=1000, only_unupgraded=(self.mode == 'unupgraded'))
+                return await self.client.get_user_gifts(user, limit=1000, only_unupgraded=(self.mode == 'unupgraded'))
             except FloodWaitError as e:
                 log.warning('FloodWait checking user %s: %ss', user['user_id'], e.seconds)
                 await asyncio.sleep(e.seconds + random.uniform(1, 3))
