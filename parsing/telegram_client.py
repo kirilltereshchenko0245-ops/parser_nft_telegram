@@ -183,11 +183,11 @@ class ParserClient:
                     continue
                 yield {
                     'user_id': uid,
-                    'access_hash': getattr(user, 'access_hash', None),
                     'username': getattr(user, 'username', None),
                     'first_name': getattr(user, 'first_name', None),
                     'last_name': getattr(user, 'last_name', None),
                     'is_bot': bool(getattr(user, 'bot', False)),
+                    'access_hash': getattr(user, 'access_hash', None),
                 }
 
     async def iter_random_message_authors(self, chat_id, max_messages=50000):
@@ -261,11 +261,11 @@ class ParserClient:
                 seen_ids.add(uid)
                 authors.append({
                     'user_id': uid,
-                    'access_hash': getattr(user, 'access_hash', None),
                     'username': getattr(sender, 'username', None),
                     'first_name': getattr(sender, 'first_name', None),
                     'last_name': getattr(sender, 'last_name', None),
                     'is_bot': bool(getattr(sender, 'bot', False)),
+                    'access_hash': getattr(sender, 'access_hash', None),
                 })
 
             log.info('History batch chat=%s batch=%s messages=%s new_authors=%s',
@@ -297,11 +297,11 @@ class ParserClient:
                 continue
             yield {
                 'user_id': user.id,
-                'access_hash': getattr(user, 'access_hash', None),
                 'username': getattr(user, 'username', None),
                 'first_name': getattr(user, 'first_name', None),
                 'last_name': getattr(user, 'last_name', None),
                 'is_bot': bool(getattr(user, 'bot', False)),
+                'access_hash': getattr(user, 'access_hash', None),
             }
             count += 1
             if limit is not None and count >= limit:
@@ -378,7 +378,7 @@ class ParserClient:
                 break
         return participants
 
-    async def get_user_gifts(self, user, limit: int = 1000, only_unupgraded: bool = False):
+    async def get_user_gifts(self, user_id: int, limit: int = 1000, only_unupgraded: bool = False, access_hash: int | None = None):
         """Return relevant gifts owned by a Telegram user.
 
         For the unupgraded mode Telegram can filter server-side:
@@ -389,14 +389,8 @@ class ParserClient:
         if not self.client:
             raise RuntimeError('Клиент не подключён')
 
-        if isinstance(user, dict):
-            user_id = int(user['user_id'])
-            access_hash = user.get('access_hash')
-        else:
-            user_id = int(user)
-            access_hash = None
         if access_hash:
-            peer = types.InputPeerUser(user_id=user_id, access_hash=int(access_hash))
+            peer = types.InputPeerUser(user_id=int(user_id), access_hash=int(access_hash))
         else:
             peer = await self.client.get_input_entity(user_id)
         offset = ''

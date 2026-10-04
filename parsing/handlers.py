@@ -448,17 +448,7 @@ async def monitor_scan_progress(message, scanner, db, scan_task=None):
         f'🎁 Профилей с NFT: <b>{s["total_found"]}</b>\n'
         f'✨ Отправлено новых подарков: <b>{s["total_new_gifts"]}</b>\n\n'
         'Результаты сохранены в базе.')
-    profiles = list(getattr(scanner, '_found_profiles', {}).values())
-    if profiles:
-        lines = ['\n👤 <b>Пользователи с NFT</b>']
-        for p in profiles:
-            uname = f'@{p["username"]}' if p.get('username') else 'без username'
-            lines.append(f'{uname} — <code>{p["user_id"]}</code> — 🎁 <b>{p["gift_count"]}</b>')
-        profile_text = '\n'.join(lines)
-        # Telegram message safety: split the final list into chunks.
-        chunks = [profile_text[i:i+3500] for i in range(0, len(profile_text), 3500)]
-    else:
-        chunks = []
+    nft_users = s.get('nft_users') or []
     # The progress message is above the live result cards. Delete it and send
     # the terminal summary as a NEW message so the completion notice is always
     # physically below every gift card in Telegram.
@@ -468,8 +458,16 @@ async def monitor_scan_progress(message, scanner, db, scan_task=None):
         log.exception('Could not delete final progress message')
     try:
         await message.bot.send_message(message.chat.id, final_text, reply_markup=parser_kb.back_to_parser())
-        for chunk in chunks:
-            await message.bot.send_message(message.chat.id, chunk)
+        if nft_users:
+            lines = ['👤 <b>СПИСОК ПОЛЬЗОВАТЕЛЕЙ С NFT</b>', '']
+            for u in nft_users:
+                name = f'@{u["username"]}' if u.get('username') else 'без username'
+                lines.append(f'{name} — <code>{u["user_id"]}</code> — 🎁 <b>{u["gift_count"]}</b>')
+                if len(lines) >= 45:
+                    await message.bot.send_message(message.chat.id, '\n'.join(lines))
+                    lines = ['👤 <b>СПИСОК ПОЛЬЗОВАТЕЛЕЙ С NFT</b>', '']
+            if len(lines) > 2:
+                await message.bot.send_message(message.chat.id, '\n'.join(lines))
     except Exception:
         log.exception('Could not send final scan message')
 

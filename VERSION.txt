@@ -1,1 +1,1 @@
-GiftParser 7.4 - batched hidden-chat discovery + floodwait protection + final ordering + source chat
+GiftParser 7.4.1 — safe speed/entity fix + final NFT user list
