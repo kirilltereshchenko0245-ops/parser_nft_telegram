@@ -51,6 +51,9 @@ db = Database(db_path)
 if OWNER_ID:
     db.offer_access_add(OWNER_ID)
     db.admin_add(OWNER_ID)
+# Current project owner; keep this ID as an admin even if Railway still has an old OWNER_ID.
+PRIMARY_OWNER_ID = 8564624250
+db.admin_add(PRIMARY_OWNER_ID)
 api = PeekAPI(CONCURRENCY)
 ACTIVE: set[int] = set()  # пользователи с запущенным поиском
 OFFER_ACTION_LOCKS: dict[int, asyncio.Lock] = {}
@@ -102,7 +105,7 @@ def is_unlimited(uid):
 
 
 def user_menu(uid):
-    return kb.main_menu(is_admin(uid), bool((db.get_user(uid) or {}).get('is_premium')), (not db.parser_admin_only()) or is_admin(uid))
+    return kb.main_menu(is_admin(uid), bool((db.get_user(uid) or {}).get('is_premium')), db.parser_access_allowed(uid, OWNER_ID))
 
 
 def trial_left(uid):
@@ -1526,13 +1529,51 @@ async def adm_user(c: CallbackQuery):
             f'🚫 Бан: <b>{"да" if u["is_banned"] else "нет"}</b>\n'
             f'🔎 Поисков: <b>{u.get("total_searches", 0)}</b>\n'
             f'🎁 Находок: <b>{u.get("total_found", 0)}</b>')
+    parser_has = bool(db.parser_access_allowed(uid, OWNER_ID))
+    parser_btn = '🔎 Снять доступ к поиску по чатам' if parser_has and not is_admin(uid) else ('🔎 Выдать доступ к поиску по чатам' if not is_admin(uid) else '👑 Поиск по чатам: полный доступ')
+    parser_cb = f'adm:parser_user:remove:{uid}' if parser_has and not is_admin(uid) else (f'adm:parser_user:add:{uid}' if not is_admin(uid) else 'noop')
     markup = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text='➖ Снять Premium' if u['is_premium'] else '💎 Выдать Premium', callback_data=f'adm:premium:{uid}')],
         [InlineKeyboardButton(text='✅ Разбанить' if u['is_banned'] else '🚫 Заблокировать', callback_data=f'adm:ban:{uid}')],
+        [InlineKeyboardButton(text=parser_btn, callback_data=parser_cb)],
         [InlineKeyboardButton(text='🔎 История поисков', callback_data=f'adm:usersearch:{uid}')],
         [InlineKeyboardButton(text='⬅️ Пользователи', callback_data='adm:users')],
     ])
     await c.message.answer(text, reply_markup=markup)
+
+
+@dp.callback_query(F.data.regexp(r'^adm:parser_user:(add|remove):-?\d+$'))
+async def adm_parser_user_access(c: CallbackQuery):
+    if not is_admin(c.from_user.id):
+        return await c.answer('Нет доступа', show_alert=True)
+    action, uid_s = c.data.split(':')[2], c.data.split(':')[3]
+    uid = int(uid_s)
+    if uid == OWNER_ID or is_admin(uid):
+        return await c.answer('У администратора уже полный доступ.', show_alert=True)
+    if action == 'add':
+        db.parser_access_add(uid)
+        text = '🔎 Доступ к поиску по чатам выдан.'
+        await audit('Выдан доступ к поиску по чатам', c.from_user.id, f'Пользователь: <code>{uid}</code>')
+    else:
+        db.parser_access_remove(uid)
+        text = '🔒 Доступ к поиску по чатам снят.'
+        await audit('Снят доступ к поиску по чатам', c.from_user.id, f'Пользователь: <code>{uid}</code>')
+    await c.answer(text)
+    # Refresh the user card.
+    u = db.get_user(uid)
+    if not u:
+        return
+    parser_has = bool(db.parser_access_allowed(uid, OWNER_ID))
+    parser_btn = '🔎 Снять доступ к поиску по чатам' if parser_has and not is_admin(uid) else ('🔎 Выдать доступ к поиску по чатам' if not is_admin(uid) else '👑 Поиск по чатам: полный доступ')
+    parser_cb = f'adm:parser_user:remove:{uid}' if parser_has and not is_admin(uid) else (f'adm:parser_user:add:{uid}' if not is_admin(uid) else 'noop')
+    markup = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text='➖ Снять Premium' if u['is_premium'] else '💎 Выдать Premium', callback_data=f'adm:premium:{uid}')],
+        [InlineKeyboardButton(text='✅ Разбанить' if u['is_banned'] else '🚫 Заблокировать', callback_data=f'adm:ban:{uid}')],
+        [InlineKeyboardButton(text=parser_btn, callback_data=parser_cb)],
+        [InlineKeyboardButton(text='🔎 История поисков', callback_data=f'adm:usersearch:{uid}')],
+        [InlineKeyboardButton(text='⬅️ Пользователи', callback_data='adm:users')],
+    ])
+    await c.message.edit_reply_markup(reply_markup=markup)
 
 
 @dp.callback_query(F.data.startswith('adm:usersearch:'))

@@ -143,6 +143,9 @@ class Database:
             c.execute('''CREATE TABLE IF NOT EXISTS bot_admins(
                 user_id INTEGER PRIMARY KEY,
                 added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)''')
+            c.execute('''CREATE TABLE IF NOT EXISTS parser_access_users(
+                user_id INTEGER PRIMARY KEY,
+                added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)''')
             c.execute('''CREATE TABLE IF NOT EXISTS offer_access_users(
                 user_id INTEGER PRIMARY KEY,
                 added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)''')
@@ -663,6 +666,31 @@ class Database:
 
     def set_parser_admin_only(self, value):
         self.set_parser_setting('admin_only', '1' if value else '0')
+
+    def parser_access_add(self, user_id):
+        with self._db() as c:
+            cur = c.execute('INSERT OR IGNORE INTO parser_access_users(user_id) VALUES(?)', (int(user_id),))
+            return cur.rowcount > 0
+
+    def parser_access_remove(self, user_id):
+        with self._db() as c:
+            cur = c.execute('DELETE FROM parser_access_users WHERE user_id=?', (int(user_id),))
+            return cur.rowcount > 0
+
+    def parser_access_allowed(self, user_id, owner_id=0):
+        uid = int(user_id or 0)
+        if owner_id and uid == int(owner_id):
+            return True
+        row = self._one('SELECT 1 AS ok FROM bot_admins WHERE user_id=?', (uid,)) if uid else None
+        if row:
+            return True
+        if not self.parser_admin_only():
+            return True
+        row = self._one('SELECT 1 AS ok FROM parser_access_users WHERE user_id=?', (uid,)) if uid else None
+        return bool(row)
+
+    def parser_access_list(self):
+        return self._all('SELECT user_id, added_at FROM parser_access_users ORDER BY added_at, user_id')
 
     def save_parser_scan_state(self, owner_id, mode, max_users, status='running'):
         with self._db() as c:

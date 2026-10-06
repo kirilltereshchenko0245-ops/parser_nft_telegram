@@ -33,13 +33,11 @@ def _session_owned(session, uid):
     return bool(session and int(session.get('owner_id') or 0) == int(uid))
 
 def _parser_access_allowed(db, uid):
-    # Администраторы имеют полный доступ к парсеру. Для обычных пользователей
-    # сохраняется прежняя логика: либо доступ открыт всем, либо нужен владелец
-    # сохранённой parser-сессии.
+    # Единая проверка: владелец/админы всегда имеют доступ; при закрытом
+    # режиме доступ выдаётся адресно через админку. Старая привязка только
+    # к владельцу parser-сессии больше не блокирует выданных пользователей.
     owner_id = int(os.getenv('OWNER_ID') or '8564624250')
-    if db.admin_allowed(uid, owner_id):
-        return True
-    return (not db.parser_admin_only()) or _session_owned(db.get_parser_session(), uid)
+    return db.parser_access_allowed(uid, owner_id)
 
 
 
