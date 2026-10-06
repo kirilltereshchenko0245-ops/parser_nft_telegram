@@ -109,7 +109,7 @@ def keyboard(offer_id: int, locale: str, status: str = STATUS_PENDING):
 
 
 def transfer_keyboard(offer: dict, locale: str):
-    buyer_url = offer.get('buyer_url')
+    buyer_url = offer.get('transfer_profile_url') or offer.get('buyer_url')
     help_url = os.getenv('OFFER_HELP_URL', '').strip()
     rows = []
     if buyer_url:
@@ -139,8 +139,11 @@ def build_offer_text(offer: dict, locale: str, remaining_seconds=None, **_ignore
     """Text for the first offer screenshot."""
     title = _linked_title(offer)
     amount = format_amount(offer['amount'], offer['currency'], locale)
-    sender = (offer.get('seller_username') or '').strip().lstrip('@')
-    sender_html = f'Пользователь <b>@{esc(sender)}</b>' if sender else 'Пользователь'
+    sender = (offer.get('seller_username') or '').strip()
+    # seller_username historically stored @username. For the offer UI we now
+    # deliberately store/render the profile display name (first/last name),
+    # never the @username.
+    sender_html = f'Пользователь <b>{esc(sender)}</b>' if sender else '<b>Пользователь</b>'
     if remaining_seconds is None:
         remaining_seconds = 6 * 3600
     mins = max(0, int(remaining_seconds) // 60)

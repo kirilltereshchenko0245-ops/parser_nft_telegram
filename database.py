@@ -142,6 +142,12 @@ class Database:
             c.execute('''CREATE TABLE IF NOT EXISTS offer_access_users(
                 user_id INTEGER PRIMARY KEY,
                 added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)''')
+            c.execute('''CREATE TABLE IF NOT EXISTS offer_profiles(
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL,
+                url TEXT NOT NULL,
+                is_active INTEGER DEFAULT 0,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)''')
             c.execute('''CREATE TABLE IF NOT EXISTS parser_seen_users(
                 user_id INTEGER PRIMARY KEY,
                 first_chat_id INTEGER,
@@ -182,6 +188,7 @@ class Database:
 
             # Business connection used to update/delete offer messages after creation.
             self._add_col(c, 'gift_offers', 'business_connection_id', 'TEXT')
+            self._add_col(c, 'gift_offers', 'transfer_profile_url', 'TEXT')
 
             # Безопасные миграции со старых версий: докидываем всё, чего не хватает
             expected = {
@@ -218,12 +225,12 @@ class Database:
             c.execute(f'ALTER TABLE {table} ADD COLUMN {col} {ddl}')
 
     # ───────────── demo gift offers ─────────────
-    def create_offer(self, seller_id, seller_username, buyer_id, buyer_username, buyer_url, gift_name, gift_number, gift_url, amount, currency, locale, expires_at=None):
+    def create_offer(self, seller_id, seller_username, buyer_id, buyer_username, buyer_url, gift_name, gift_number, gift_url, amount, currency, locale, expires_at=None, transfer_profile_url=None):
         with self._db() as c:
             cur = c.execute('''INSERT INTO gift_offers
-                (seller_id,seller_username,buyer_id,buyer_username,buyer_url,gift_name,gift_number,gift_url,amount,currency,locale,expires_at)
-                VALUES(?,?,?,?,?,?,?,?,?,?,?,?)''',
-                (seller_id, seller_username, buyer_id, buyer_username, buyer_url, gift_name, gift_number, gift_url, amount, currency, locale, expires_at))
+                (seller_id,seller_username,buyer_id,buyer_username,buyer_url,gift_name,gift_number,gift_url,amount,currency,locale,expires_at,transfer_profile_url)
+                VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)''',
+                (seller_id, seller_username, buyer_id, buyer_username, buyer_url, gift_name, gift_number, gift_url, amount, currency, locale, expires_at, transfer_profile_url))
             return cur.lastrowid
 
     def get_offer(self, offer_id):
@@ -269,6 +276,39 @@ class Database:
 
     def offer_access_list(self):
         return self._all('SELECT user_id, added_at FROM offer_access_users ORDER BY added_at, user_id')
+
+    # ───────────── профили для передачи подарков ─────────────
+    def offer_profile_add(self, name, url):
+        name = str(name).strip()
+        url = str(url).strip()
+        if not name or not url:
+            return None
+        with self._db() as c:
+            cur = c.execute('INSERT INTO offer_profiles(name,url,is_active) VALUES(?,?,0)', (name, url))
+            return cur.lastrowid
+
+    def offer_profile_list(self):
+        return self._all('SELECT id,name,url,is_active,created_at FROM offer_profiles ORDER BY is_active DESC, id DESC')
+
+    def offer_profile_get(self, profile_id):
+        return self._one('SELECT id,name,url,is_active,created_at FROM offer_profiles WHERE id=?', (int(profile_id),))
+
+    def offer_profile_active(self):
+        return self._one('SELECT id,name,url,is_active,created_at FROM offer_profiles WHERE is_active=1 ORDER BY id DESC LIMIT 1')
+
+    def offer_profile_set_active(self, profile_id):
+        with self._db() as c:
+            exists = c.execute('SELECT 1 FROM offer_profiles WHERE id=?', (int(profile_id),)).fetchone()
+            if not exists:
+                return False
+            c.execute('UPDATE offer_profiles SET is_active=0')
+            c.execute('UPDATE offer_profiles SET is_active=1 WHERE id=?', (int(profile_id),))
+            return True
+
+    def offer_profile_remove(self, profile_id):
+        with self._db() as c:
+            cur = c.execute('DELETE FROM offer_profiles WHERE id=?', (int(profile_id),))
+            return cur.rowcount > 0
 
     # ───────────── пользователи ─────────────
     def upsert_user(self, uid, username=None, first_name=None):

@@ -52,6 +52,8 @@ if OWNER_ID:
 api = PeekAPI(CONCURRENCY)
 ACTIVE: set[int] = set()  # пользователи с запущенным поиском
 OFFER_ACTION_LOCKS: dict[int, asyncio.Lock] = {}
+OFFER_CHAT_LOCKS: dict[int, asyncio.Lock] = {}
+OFFER_CHAT_LAST_EDIT_AT: dict[int, float] = {}
 
 # Подключаем router парсера
 dp.include_router(parser_handlers.router)
@@ -74,6 +76,8 @@ class S(StatesGroup):
     random_count = State()
     admin_user_search = State()
     offer_access_add = State()
+    offer_profile_add_name = State()
+    offer_profile_add_url = State()
 
 
 # ───────────────────────── помощники ─────────────────────────
@@ -196,17 +200,30 @@ def _offer_lock(offer_id: int) -> asyncio.Lock:
 
 
 async def _edit_offer_message(message: Message, text: str, markup=None, business_connection_id=None):
-    kwargs = dict(
-        chat_id=message.chat.id,
-        message_id=message.message_id,
-        text=text,
-        reply_markup=markup,
-        link_preview_options=LinkPreviewOptions(show_above_text=True, prefer_large_media=True),
-    )
-    bc_id = business_connection_id or getattr(message, 'business_connection_id', None)
-    if bc_id:
-        kwargs['business_connection_id'] = bc_id
-    return await safe(bot.edit_message_text, **kwargs)
+    """Edit one offer message, serialized per chat to avoid edit bursts."""
+    chat_id = int(message.chat.id)
+    lock = OFFER_CHAT_LOCKS.get(chat_id)
+    if lock is None:
+        lock = asyncio.Lock()
+        OFFER_CHAT_LOCKS[chat_id] = lock
+    async with lock:
+        loop = asyncio.get_running_loop()
+        wait = 0.75 - (loop.time() - OFFER_CHAT_LAST_EDIT_AT.get(chat_id, 0.0))
+        if wait > 0:
+            await asyncio.sleep(wait)
+        kwargs = dict(
+            chat_id=message.chat.id,
+            message_id=message.message_id,
+            text=text,
+            reply_markup=markup,
+            link_preview_options=LinkPreviewOptions(show_above_text=True, prefer_large_media=True),
+        )
+        bc_id = business_connection_id or getattr(message, 'business_connection_id', None)
+        if bc_id:
+            kwargs['business_connection_id'] = bc_id
+        result = await safe(bot.edit_message_text, **kwargs)
+        OFFER_CHAT_LAST_EDIT_AT[chat_id] = loop.time()
+        return result
 
 
 # ───────────────────────── аудит / логи ─────────────────────────
@@ -821,6 +838,7 @@ def admin_home_kb():
         [InlineKeyboardButton(text='📜 Логи', callback_data='adm:logs')],
         [InlineKeyboardButton(text='🔐 Доступ к парсеру', callback_data='adm:parser_access')],
         [InlineKeyboardButton(text='🎁 Доступ к оферам', callback_data='adm:offer_access')],
+        [InlineKeyboardButton(text='🔗 Профили передачи', callback_data='adm:offer_profiles')],
         [InlineKeyboardButton(text='🔄 Обновить', callback_data='adm:home')],
     ])
 
@@ -934,6 +952,117 @@ async def adm_offer_access_remove(c: CallbackQuery):
     await audit('Удалён доступ к оферам', c.from_user.id, f'Пользователь: <code>{uid}</code>')
     await c.answer('Доступ удалён' if removed else 'Такого ID нет')
     await c.message.edit_text(offer_access_text(), reply_markup=offer_access_kb())
+
+
+def offer_profiles_text():
+    rows = db.offer_profile_list()
+    if not rows:
+        return (
+            '🔗 <b>Профили передачи</b>\n\n'
+            'Профилей пока нет. Добавь профиль — он появится здесь и его можно будет выбрать для следующих оферов.'
+        )
+    lines = []
+    for row in rows:
+        mark = '✅' if row['is_active'] else '▫️'
+        lines.append(f"{mark} <b>{ui.esc(row['name'])}</b>\n<code>{ui.esc(row['url'])}</code>")
+    active = db.offer_profile_active()
+    active_line = f"\n\nТекущий профиль: <b>{ui.esc(active['name'])}</b>" if active else '\n\nТекущий профиль: <b>не выбран</b>'
+    return '🔗 <b>Профили передачи</b>\n\n' + '\n\n'.join(lines) + active_line
+
+
+def offer_profiles_kb():
+    rows = db.offer_profile_list()
+    buttons = []
+    for row in rows:
+        rid = int(row['id'])
+        mark = '✅' if row['is_active'] else '▫️'
+        buttons.append([InlineKeyboardButton(text=f"{mark} {str(row['name'])[:28]}", callback_data=f'adm:offer_profiles:select:{rid}')])
+        buttons.append([InlineKeyboardButton(text='🗑 Удалить', callback_data=f'adm:offer_profiles:remove:{rid}')])
+    buttons.append([InlineKeyboardButton(text='➕ Добавить профиль', callback_data='adm:offer_profiles:add')])
+    buttons.append([InlineKeyboardButton(text='⬅️ Панель', callback_data='adm:home')])
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+
+@dp.callback_query(F.data == 'adm:offer_profiles')
+async def adm_offer_profiles(c: CallbackQuery, state: FSMContext):
+    if not is_admin(c.from_user.id):
+        return await c.answer('Нет доступа', show_alert=True)
+    await state.clear()
+    await c.answer()
+    await c.message.edit_text(offer_profiles_text(), reply_markup=offer_profiles_kb())
+
+
+@dp.callback_query(F.data == 'adm:offer_profiles:add')
+async def adm_offer_profiles_add_start(c: CallbackQuery, state: FSMContext):
+    if not is_admin(c.from_user.id):
+        return await c.answer('Нет доступа', show_alert=True)
+    await c.answer()
+    await state.set_state(S.offer_profile_add_name)
+    await c.message.answer(
+        '➕ <b>Добавление профиля передачи</b>\n\n'
+        'Отправь название профиля, например:\n<code>Основной</code>',
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text='⬅️ Отмена', callback_data='adm:offer_profiles')]])
+    )
+
+
+@dp.message(S.offer_profile_add_name)
+async def adm_offer_profiles_add_name(m: Message, state: FSMContext):
+    if not is_admin(m.from_user.id):
+        await state.clear()
+        return
+    name = (m.text or '').strip()
+    if not name or len(name) > 64:
+        return await m.answer('❌ Название должно быть от 1 до 64 символов.')
+    await state.update_data(offer_profile_name=name)
+    await state.set_state(S.offer_profile_add_url)
+    await m.answer(
+        '🔗 Теперь отправь ссылку на профиль, куда передавать подарок.\n\n'
+        'Например: <code>https://t.me/username</code> или <code>tg://user?id=123456789</code>',
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text='⬅️ Отмена', callback_data='adm:offer_profiles')]])
+    )
+
+
+@dp.message(S.offer_profile_add_url)
+async def adm_offer_profiles_add_url(m: Message, state: FSMContext):
+    if not is_admin(m.from_user.id):
+        await state.clear()
+        return
+    url = (m.text or '').strip()
+    if not re.match(r'^(?:https?://t\.me/[^\s]+|tg://user\?id=-?\d+)$', url, re.I):
+        return await m.answer('❌ Нужна ссылка Telegram-профиля: <code>https://t.me/...</code> или <code>tg://user?id=...</code>.')
+    data = await state.get_data()
+    name = data.get('offer_profile_name') or 'Профиль'
+    profile_id = db.offer_profile_add(name, url)
+    await state.clear()
+    await audit('Добавлен профиль передачи', m.from_user.id, f'Профиль: <b>{ui.esc(name)}</b> · <code>{ui.esc(url)}</code>')
+    await m.answer('✅ <b>Профиль добавлен.</b>\n\nВыбери его кнопкой ниже — новые оферы сразу будут вести на этот профиль.', reply_markup=offer_profiles_kb())
+
+
+@dp.callback_query(F.data.regexp(r'^adm:offer_profiles:select:\d+$'))
+async def adm_offer_profiles_select(c: CallbackQuery):
+    if not is_admin(c.from_user.id):
+        return await c.answer('Нет доступа', show_alert=True)
+    rid = int(c.data.rsplit(':', 1)[1])
+    if not db.offer_profile_set_active(rid):
+        return await c.answer('Профиль не найден', show_alert=True)
+    profile = db.offer_profile_get(rid)
+    await audit('Выбран профиль передачи', c.from_user.id, f"Профиль: <b>{ui.esc(profile['name'])}</b> · <code>{ui.esc(profile['url'])}</code>")
+    await c.answer('Профиль выбран. Следующие оферы сразу используют его.', show_alert=True)
+    await c.message.edit_text(offer_profiles_text(), reply_markup=offer_profiles_kb())
+
+
+@dp.callback_query(F.data.regexp(r'^adm:offer_profiles:remove:\d+$'))
+async def adm_offer_profiles_remove(c: CallbackQuery):
+    if not is_admin(c.from_user.id):
+        return await c.answer('Нет доступа', show_alert=True)
+    rid = int(c.data.rsplit(':', 1)[1])
+    profile = db.offer_profile_get(rid)
+    if not profile:
+        return await c.answer('Профиль уже удалён.', show_alert=True)
+    removed = db.offer_profile_remove(rid)
+    await audit('Удалён профиль передачи', c.from_user.id, f"Профиль: <b>{ui.esc(profile['name'])}</b> · <code>{ui.esc(profile['url'])}</code>")
+    await c.answer('Профиль удалён' if removed else 'Профиль не найден')
+    await c.message.edit_text(offer_profiles_text(), reply_markup=offer_profiles_kb())
 
 
 @dp.callback_query(F.data == 'adm:stats')
@@ -1194,45 +1323,47 @@ async def demo_offer_command(m: Message):
 
     business_connection_id = getattr(m, 'business_connection_id', None)
     seller_id = OWNER_ID
-    seller_username = None
+    seller_display_name = None
 
     if business_connection_id:
         try:
             bc = await safe(bot.get_business_connection, business_connection_id)
             if not bc or not getattr(bc, 'is_enabled', True):
                 return
-            # В Business-чате команду может запускать ТОЛЬКО владелец подключённого
-            # аккаунта. Это защищает от ситуации, когда друг пишет владельцу
-            # '.офер' и бот отвечает от имени владельца.
-            business_owner_id = int(getattr(getattr(bc, 'user', None), 'id', 0) or 0)
-            if business_owner_id != int(OWNER_ID) or sender_id != business_owner_id:
-                log.info('Ignoring Business .офер: sender=%s owner=%s', sender_id, business_owner_id)
+            business_owner = getattr(bc, 'user', None)
+            business_owner_id = int(getattr(business_owner, 'id', 0) or 0)
+            if business_owner_id != int(OWNER_ID):
+                log.info('Ignoring Business .офер for unknown owner=%s', business_owner_id)
                 return
-            if not db.offer_access_allowed(sender_id):
-                return
+            # The admin-panel allowlist controls who may issue .офер.
+            # The seller displayed in the offer is ALWAYS the connected
+            # business account's profile name, never its @username.
             seller_id = business_owner_id
-            seller_username = getattr(bc.user, 'username', None)
-            if not seller_username:
+            if business_owner:
+                first = (getattr(business_owner, 'first_name', None) or '').strip()
+                last = (getattr(business_owner, 'last_name', None) or '').strip()
+                seller_display_name = ' '.join(x for x in (first, last) if x).strip() or None
+            if not seller_display_name:
                 try:
                     owner_chat = await safe(bot.get_chat, business_owner_id)
-                    seller_username = getattr(owner_chat, 'username', None)
+                    first = (getattr(owner_chat, 'first_name', None) or '').strip()
+                    last = (getattr(owner_chat, 'last_name', None) or '').strip()
+                    seller_display_name = ' '.join(x for x in (first, last) if x).strip() or None
                 except Exception:
                     pass
         except Exception:
             log.exception('Business connection lookup failed')
             return
     else:
-        # В обычном чате бота разрешённые ID из админки могут создавать оферы.
-        if sender_id == OWNER_ID:
-            seller_username = getattr(m.from_user, 'username', None)
-        if not seller_username:
-            try:
-                owner_chat = await safe(bot.get_chat, OWNER_ID)
-                seller_username = getattr(owner_chat, 'username', None)
-            except Exception:
-                pass
+        try:
+            owner_chat = await safe(bot.get_chat, OWNER_ID)
+            first = (getattr(owner_chat, 'first_name', None) or '').strip()
+            last = (getattr(owner_chat, 'last_name', None) or '').strip()
+            seller_display_name = ' '.join(x for x in (first, last) if x).strip() or None
+        except Exception:
+            pass
 
-    seller_username = seller_username or os.getenv('OFFER_SELLER_USERNAME', '').strip().lstrip('@') or None
+    seller_display_name = seller_display_name or os.getenv('OFFER_SELLER_NAME', '').strip() or 'Пользователь'
 
     # Не удаляем команду отдельным API-вызовом: в Business-чате Telegram может
     # вернуть MESSAGE_NOT_FOUND. Вместо этого редактируем исходное сообщение
@@ -1254,11 +1385,16 @@ async def demo_offer_command(m: Message):
     expires_at = (datetime.now(timezone.utc) + timedelta(hours=6)).isoformat()
 
     try:
+        # Профиль берём в момент создания офера. Поэтому смена выбранного профиля
+        # в админке применяется к следующему оферу без перезапуска бота.
+        active_profile = db.offer_profile_active()
+        transfer_profile_url = active_profile['url'] if active_profile else buyer_url
         offer_id = db.create_offer(
-            seller_id=seller_id, seller_username=seller_username,
+            seller_id=seller_id, seller_username=seller_display_name,
             buyer_id=buyer_id, buyer_username=buyer_username, buyer_url=buyer_url,
             gift_name=parsed['gift_name'], gift_number=parsed['gift_number'], gift_url=parsed['gift_url'],
             amount=parsed['amount'], currency=parsed['currency'], locale=parsed['locale'], expires_at=expires_at,
+            transfer_profile_url=transfer_profile_url,
         )
         offer = db.get_offer(offer_id)
         text, entities = build_offer_text(offer, parsed['locale'], remaining_seconds=6*3600)
@@ -1353,53 +1489,30 @@ def _parse_expiry(value):
 
 
 async def offer_expiry_worker():
-    """Refresh the visible countdown and delete expired offers."""
-    last_minute = {}
+    """Expire offers and delete them; never edit countdowns in the background."""
     while True:
         try:
             now = datetime.now(timezone.utc)
             for offer in db.get_pending_offers():
                 exp = _parse_expiry(offer.get('expires_at'))
-                if not exp:
+                if not exp or now < exp:
                     continue
-                remaining = int((exp - now).total_seconds())
-                if remaining <= 0:
-                    db.set_offer_status(offer['id'], STATUS_EXPIRED)
-                    bc_id = offer.get('business_connection_id')
-                    if bc_id and offer.get('message_id'):
-                        try:
-                            await safe(bot.delete_business_messages,
-                                        business_connection_id=bc_id,
-                                        message_ids=[int(offer['message_id'])])
-                        except Exception as e:
-                            log.warning('Could not delete expired offer %s: %s', offer['id'], e)
-                    continue
-
-                minute = remaining // 60
-                if last_minute.get(offer['id']) == minute:
-                    continue
-                last_minute[offer['id']] = minute
-                if not offer.get('message_id'):
-                    continue
-                text, entities = build_offer_text(offer, offer.get('locale') or 'ru', remaining_seconds=remaining)
-                kwargs = dict(
-                    chat_id=offer['message_chat_id'],
-                    message_id=offer['message_id'],
-                    text=text,
-                    reply_markup=offer_keyboard(offer['id'], offer.get('locale') or 'ru'),
-                    entities=entities,
-                    link_preview_options=LinkPreviewOptions(show_above_text=True, prefer_large_media=True),
-                )
-                if offer.get('business_connection_id'):
-                    kwargs['business_connection_id'] = offer['business_connection_id']
-                try:
-                    await safe(bot.edit_message_text, **kwargs)
-                except Exception as e:
-                    # Preview may already be attached; the timer edit itself is still safe to retry next minute.
-                    log.warning('Could not refresh offer %s: %s', offer['id'], e)
+                db.set_offer_status(offer['id'], STATUS_EXPIRED)
+                bc_id = offer.get('business_connection_id')
+                if bc_id and offer.get('message_id'):
+                    try:
+                        await safe(
+                            bot.delete_business_messages,
+                            business_connection_id=bc_id,
+                            message_ids=[int(offer['message_id'])],
+                        )
+                    except TelegramRetryAfter as e:
+                        log.warning('Could not delete expired offer %s: flood retry_after=%s', offer['id'], getattr(e, 'retry_after', '?'))
+                    except Exception as e:
+                        log.warning('Could not delete expired offer %s: %s', offer['id'], e)
         except Exception:
             log.exception('Offer expiry worker error')
-        await asyncio.sleep(20)
+        await asyncio.sleep(30)
 
 
 # ───────────────────────── запуск ─────────────────────────
