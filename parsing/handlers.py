@@ -33,7 +33,7 @@ def _session_owned(session, uid):
     return bool(session and int(session.get('owner_id') or 0) == int(uid))
 
 CANONICAL_OWNER_ID = 8564624250
-PARSER_ACCESS_VERSION = 'V22'
+PARSER_ACCESS_VERSION = 'V23'
 
 def _parser_access_allowed(db, uid):
     # Абсолютный bypass для владельца проекта. Никакая настройка БД,
@@ -258,28 +258,28 @@ async def _show_chats(call, db, page=0):
 @router.callback_query(F.data == 'parser:chats')
 async def parser_chats_handler(call, db):
     session = db.get_parser_session()
-    if not _session_owned(session, call.from_user.id): return await call.answer('Нет доступа', show_alert=True)
+    if not _parser_access_allowed(db, call.from_user.id): return await call.answer('🔒 Нет доступа к поиску по чатам.', show_alert=True)
     await _show_chats(call, db, 0); await call.answer()
 
 
 @router.callback_query(F.data.startswith('parser:chats:'))
 async def parser_chats_page(call, db):
     session = db.get_parser_session()
-    if not _session_owned(session, call.from_user.id): return await call.answer('Нет доступа', show_alert=True)
+    if not _parser_access_allowed(db, call.from_user.id): return await call.answer('🔒 Нет доступа к поиску по чатам.', show_alert=True)
     await _show_chats(call, db, int(call.data.split(':')[2])); await call.answer()
 
 
 @router.callback_query(F.data.startswith('parser:toggle:'))
 async def parser_toggle_chat(call, db):
     session = db.get_parser_session()
-    if not _session_owned(session, call.from_user.id): return await call.answer('Нет доступа', show_alert=True)
+    if not _parser_access_allowed(db, call.from_user.id): return await call.answer('🔒 Нет доступа к поиску по чатам.', show_alert=True)
     db.toggle_parser_chat(int(call.data.split(':')[2])); await _show_chats(call, db, 0); await call.answer('Изменено')
 
 
 @router.callback_query(F.data.startswith('parser:chats_all:'))
 async def parser_toggle_all(call, db):
     session = db.get_parser_session()
-    if not _session_owned(session, call.from_user.id): return await call.answer('Нет доступа', show_alert=True)
+    if not _parser_access_allowed(db, call.from_user.id): return await call.answer('🔒 Нет доступа к поиску по чатам.', show_alert=True)
     value = call.data.endswith(':on')
     db.set_all_parser_chats(value)
     await _show_chats(call, db, 0); await call.answer('Обновлено')
@@ -288,7 +288,7 @@ async def parser_toggle_all(call, db):
 @router.callback_query(F.data == 'parser:refresh_chats')
 async def parser_refresh_chats(call, db):
     session = db.get_parser_session()
-    if not _session_owned(session, call.from_user.id): return await call.answer('Нет доступа', show_alert=True)
+    if not _parser_access_allowed(db, call.from_user.id): return await call.answer('🔒 Нет доступа к поиску по чатам.', show_alert=True)
     try:
         client = await ensure_client(db)
         await load_chats(client, db)
@@ -300,7 +300,7 @@ async def parser_refresh_chats(call, db):
 @router.callback_query(F.data == 'parser:stats')
 async def parser_stats_handler(call, db):
     session = db.get_parser_session()
-    if not _session_owned(session, call.from_user.id): return await call.answer('Нет доступа', show_alert=True)
+    if not _parser_access_allowed(db, call.from_user.id): return await call.answer('🔒 Нет доступа к поиску по чатам.', show_alert=True)
     s = db.get_parser_stats()
     text = ('📊 <b>СТАТИСТИКА</b>\n\n'
             f'📂 Чатов: <b>{s["total_chats"]}</b>\n'
@@ -315,7 +315,7 @@ async def parser_stats_handler(call, db):
 @router.callback_query(F.data.startswith('parser:mode:'))
 async def parser_mode_handler(call: CallbackQuery, state: FSMContext, db):
     session = db.get_parser_session()
-    if not _session_owned(session, call.from_user.id): return await call.answer('Нет доступа', show_alert=True)
+    if not _parser_access_allowed(db, call.from_user.id): return await call.answer('🔒 Нет доступа к поиску по чатам.', show_alert=True)
     mode = call.data.split(':')[2]
     await state.update_data(scan_mode=mode)
     label = '🎁 Любые NFT' if mode == 'all' else '💎 Только неулучшенные NFT'
@@ -326,7 +326,7 @@ async def parser_mode_handler(call: CallbackQuery, state: FSMContext, db):
 @router.callback_query(F.data == 'parser:start')
 async def parser_start_handler(call: CallbackQuery, state: FSMContext, db):
     session = db.get_parser_session()
-    if not _session_owned(session, call.from_user.id): return await call.answer('Нет доступа', show_alert=True)
+    if not _parser_access_allowed(db, call.from_user.id): return await call.answer('🔒 Нет доступа к поиску по чатам.', show_alert=True)
     try:
         await ensure_client(db)
     except Exception as e:
@@ -492,8 +492,8 @@ def datetime_delta(dt):
 async def parser_stop_handler(call, db):
     global scanner, scan_task
     session = db.get_parser_session()
-    if not _session_owned(session, call.from_user.id):
-        return await call.answer('Нет доступа', show_alert=True)
+    if not _parser_access_allowed(db, call.from_user.id):
+        return await call.answer('🔒 Нет доступа к поиску по чатам.', show_alert=True)
     if not scanner or not scanner.is_running:
         return await call.answer('Парсинг не запущен', show_alert=True)
 
@@ -517,7 +517,7 @@ async def parser_stop_handler(call, db):
 @router.callback_query(F.data == 'parser:account')
 async def parser_account_handler(call, db):
     session = db.get_parser_session()
-    if not _session_owned(session, call.from_user.id): return await call.answer('Нет доступа', show_alert=True)
+    if not _parser_access_allowed(db, call.from_user.id): return await call.answer('🔒 Нет доступа к поиску по чатам.', show_alert=True)
     text = ('⚙️ <b>АККАУНТ ПАРСЕРА</b>\n\n'
             f'👤 @{session.get("username") or "без username"}\n'
             f'🆔 <code>{session.get("user_id")}</code>\n'
@@ -538,7 +538,7 @@ async def parser_reconnect_existing(call, db):
 async def parser_disconnect_handler(call, db):
     global parser_client
     session = db.get_parser_session()
-    if not _session_owned(session, call.from_user.id): return await call.answer('Нет доступа', show_alert=True)
+    if not _parser_access_allowed(db, call.from_user.id): return await call.answer('🔒 Нет доступа к поиску по чатам.', show_alert=True)
     if parser_client: await parser_client.disconnect()
     parser_client = None
     db.clear_parser_session()

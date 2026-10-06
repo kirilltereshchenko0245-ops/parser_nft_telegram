@@ -31,7 +31,7 @@ log = logging.getLogger('giftparser')
 
 TOKEN = os.getenv('BOT_TOKEN')
 PRIMARY_OWNER_ID = 8564624250
-APP_VERSION = 'V22_PARSER_ACCESS_FIX'
+APP_VERSION = 'V23_PARSER_ACCESS_SINGLE_SOURCE'
 # Canonical project owner. This is intentionally independent of a stale Railway OWNER_ID.
 OWNER_ID = PRIMARY_OWNER_ID
 CONCURRENCY = int(os.getenv('PEEK_CONCURRENCY') or 1)  # По 1 ID последовательно
@@ -55,6 +55,8 @@ if OWNER_ID:
     db.offer_access_add(OWNER_ID)
     db.admin_add(OWNER_ID)
 db.admin_add(PRIMARY_OWNER_ID)
+db.parser_access_add(PRIMARY_OWNER_ID)
+log.info('PARSER ACCESS BOOT version=%s owner=%s db=%s', APP_VERSION, PRIMARY_OWNER_ID, os.path.abspath(db_path))
 api = PeekAPI(CONCURRENCY)
 ACTIVE: set[int] = set()  # пользователи с запущенным поиском
 OFFER_ACTION_LOCKS: dict[int, asyncio.Lock] = {}
@@ -1560,13 +1562,19 @@ async def adm_parser_user_access(c: CallbackQuery):
         return await c.answer('У владельца и администраторов полный доступ.', show_alert=True)
     if action == 'add':
         db.parser_access_add(uid)
-        text = '🔎 Доступ к поиску по чатам выдан.'
-        await audit('Выдан доступ к поиску по чатам', c.from_user.id, f'Пользователь: <code>{uid}</code>')
+        direct = bool(db._one('SELECT 1 AS ok FROM parser_access_users WHERE user_id=?', (uid,)))
+        allowed_now = db.parser_access_allowed(uid, PRIMARY_OWNER_ID)
+        if not direct:
+            return await c.answer(f'ОШИБКА: запись для ID {uid} не сохранилась в БД.', show_alert=True)
+        text = f'🔎 Доступ выдан. ID: {uid} | БД: ✅ | проверка: {"✅" if allowed_now else "❌"}'
+        await audit('Выдан доступ к поиску по чатам', c.from_user.id, f'Пользователь: <code>{uid}</code> · DB=OK · allowed={allowed_now}')
     else:
         db.parser_access_remove(uid)
-        text = '🔒 Доступ к поиску по чатам снят.'
-        await audit('Снят доступ к поиску по чатам', c.from_user.id, f'Пользователь: <code>{uid}</code>')
-    await c.answer(text)
+        direct = bool(db._one('SELECT 1 AS ok FROM parser_access_users WHERE user_id=?', (uid,)))
+        allowed_now = db.parser_access_allowed(uid, PRIMARY_OWNER_ID)
+        text = f'🔒 Доступ снят. ID: {uid} | БД: {"❌" if not direct else "⚠️"} | проверка: {"✅" if allowed_now else "❌"}'
+        await audit('Снят доступ к поиску по чатам', c.from_user.id, f'Пользователь: <code>{uid}</code> · DB_direct={direct} · allowed={allowed_now}')
+    await c.answer(text, show_alert=True)
     # Refresh the user card.
     u = db.get_user(uid)
     if not u:
