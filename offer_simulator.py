@@ -140,7 +140,7 @@ def build_offer_text(offer: dict, locale: str, remaining_seconds=None, **_ignore
     title = _linked_title(offer)
     amount = format_amount(offer['amount'], offer['currency'], locale)
     sender = (offer.get('seller_username') or '').strip().lstrip('@')
-    sender_html = f'<b>@{esc(sender)}</b>' if sender else '<b>пользователь</b>'
+    sender_html = f'Пользователь <b>@{esc(sender)}</b>' if sender else 'Пользователь'
     if remaining_seconds is None:
         remaining_seconds = 6 * 3600
     mins = max(0, int(remaining_seconds) // 60)

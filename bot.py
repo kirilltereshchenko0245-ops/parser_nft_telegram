@@ -51,6 +51,7 @@ if OWNER_ID:
     db.offer_access_add(OWNER_ID)
 api = PeekAPI(CONCURRENCY)
 ACTIVE: set[int] = set()  # пользователи с запущенным поиском
+OFFER_ACTION_LOCKS: dict[int, asyncio.Lock] = {}
 
 # Подключаем router парсера
 dp.include_router(parser_handlers.router)
@@ -184,6 +185,28 @@ async def send_card(target: Message, uid: int, g: dict, large=False):
 
 def no_preview():
     return LinkPreviewOptions(is_disabled=True)
+
+
+def _offer_lock(offer_id: int) -> asyncio.Lock:
+    lock = OFFER_ACTION_LOCKS.get(offer_id)
+    if lock is None:
+        lock = asyncio.Lock()
+        OFFER_ACTION_LOCKS[offer_id] = lock
+    return lock
+
+
+async def _edit_offer_message(message: Message, text: str, markup=None, business_connection_id=None):
+    kwargs = dict(
+        chat_id=message.chat.id,
+        message_id=message.message_id,
+        text=text,
+        reply_markup=markup,
+        link_preview_options=LinkPreviewOptions(show_above_text=True, prefer_large_media=True),
+    )
+    bc_id = business_connection_id or getattr(message, 'business_connection_id', None)
+    if bc_id:
+        kwargs['business_connection_id'] = bc_id
+    return await safe(bot.edit_message_text, **kwargs)
 
 
 # ───────────────────────── аудит / логи ─────────────────────────
@@ -1211,18 +1234,20 @@ async def demo_offer_command(m: Message):
 
     seller_username = seller_username or os.getenv('OFFER_SELLER_USERNAME', '').strip().lstrip('@') or None
 
-    # Hide the command only after access has been verified.
-    try:
-        await safe(m.delete)
-    except Exception as e:
-        log.warning('Could not delete offer command message %s: %s', getattr(m, 'message_id', '?'), e)
-
+    # Не удаляем команду отдельным API-вызовом: в Business-чате Telegram может
+    # вернуть MESSAGE_NOT_FOUND. Вместо этого редактируем исходное сообщение
+    # прямо на месте — в чате остаётся ровно ОДНО сообщение офера.
     if parsed.get('error'):
-        return await m.answer(offer_help_text(parsed.get('locale', 'ru')))
+        help_text = offer_help_text(parsed.get('locale', 'ru'))
+        try:
+            await _edit_offer_message(m, help_text, business_connection_id=business_connection_id)
+        except Exception as e:
+            log.warning('Could not edit invalid offer command %s: %s', getattr(m, 'message_id', '?'), e)
+        return
 
     buyer = m.chat
     if not buyer or not buyer.id:
-        return await m.answer('❌ Не удалось определить получателя офера.')
+        return
     buyer_id = int(buyer.id)
     buyer_username = getattr(buyer, 'username', None)
     buyer_url = f'https://t.me/{buyer_username}' if buyer_username else f'tg://user?id={buyer_id}'
@@ -1237,26 +1262,20 @@ async def demo_offer_command(m: Message):
         )
         offer = db.get_offer(offer_id)
         text, entities = build_offer_text(offer, parsed['locale'], remaining_seconds=6*3600)
-        kwargs = dict(
-            chat_id=m.chat.id, text=text, reply_markup=offer_keyboard(offer_id, parsed['locale']),
-            link_preview_options=LinkPreviewOptions(show_above_text=True, prefer_large_media=True),
-            entities=entities,
-        )
-        if business_connection_id:
-            kwargs['business_connection_id'] = business_connection_id
-        sent = await safe(bot.send_message, **kwargs)
-        db.update_offer_message(offer_id, sent.chat.id, sent.message_id, business_connection_id)
-        try:
-            await audit('Создан DEMO-офер', sender_id, f'Offer: <code>{offer_id}</code> · Buyer: <code>{buyer_id}</code> · Gift: <code>{ui.esc(parsed["gift_name"])}-{parsed["gift_number"]}</code>')
-        except TelegramRetryAfter as e:
-            log.warning('Offer created, but audit log was rate-limited for %ss', getattr(e, 'retry_after', '?'))
+        markup = offer_keyboard(offer_id, parsed['locale'])
+        # Важно: редактируем исходное сообщение .офер, а не отправляем новое.
+        # Это одновременно убирает дубликат и сильно снижает риск SendMessage flood.
+        sent = await _edit_offer_message(m, text, markup, business_connection_id=business_connection_id)
+        db.update_offer_message(offer_id, m.chat.id, m.message_id, business_connection_id)
+        log.info('Created DEMO offer %s in-place from message %s', offer_id, m.message_id)
+    except TelegramRetryAfter as e:
+        if 'offer_id' in locals():
+            db.set_offer_status(offer_id, STATUS_EXPIRED)
+        log.warning('Offer %s was not rendered because Telegram flood control is active: retry_after=%s', locals().get('offer_id'), getattr(e, 'retry_after', '?'))
     except Exception as e:
-        log.exception('Failed to create demo offer')
-        # If this is a Business message, reply on behalf of the same connection.
-        err_kwargs = dict(chat_id=m.chat.id, text=f'❌ Не удалось создать DEMO-офер: <code>{ui.esc(str(e)[:300])}</code>')
-        if business_connection_id:
-            err_kwargs['business_connection_id'] = business_connection_id
-        await safe(bot.send_message, **err_kwargs)
+        if 'offer_id' in locals():
+            db.set_offer_status(offer_id, STATUS_EXPIRED)
+        log.exception('Failed to create/render demo offer')
 
 
 @dp.callback_query(F.data.regexp(r'^of:(accept|decline):\d+$'))
@@ -1266,63 +1285,61 @@ async def demo_offer_action(c: CallbackQuery):
         offer_id = int(raw_id)
     except Exception:
         return await c.answer('Некорректный офер', show_alert=True)
-    offer = db.get_offer(offer_id)
-    if not offer:
-        return await c.answer('Офер не найден', show_alert=True)
-    if offer['status'] != STATUS_PENDING:
-        return await c.answer('Офер уже обработан.', show_alert=True)
 
-    # Anyone who can press the button may accept/decline it.
-    expires = _parse_expiry(offer.get('expires_at'))
-    if expires and datetime.now(timezone.utc) >= expires:
-        db.set_offer_status(offer_id, STATUS_EXPIRED)
-        try:
-            if c.message:
-                await safe(bot.delete_business_messages,
-                            business_connection_id=offer.get('business_connection_id') or getattr(c.message, 'business_connection_id', None),
-                            message_ids=[c.message.message_id])
-        except Exception:
-            pass
-        return await c.answer('Срок действия офера истёк.', show_alert=True)
+    lock = _offer_lock(offer_id)
+    async with lock:
+        offer = db.get_offer(offer_id)
+        if not offer:
+            return await c.answer('Офер не найден', show_alert=True)
+        if offer['status'] != STATUS_PENDING:
+            return await c.answer('Офер уже обработан.', show_alert=True)
 
-    new_status = STATUS_ACCEPTED if action == 'accept' else STATUS_DECLINED
-    db.set_offer_status(offer_id, new_status)
-    locale = offer['locale'] or 'ru'
+        expires = _parse_expiry(offer.get('expires_at'))
+        if expires and datetime.now(timezone.utc) >= expires:
+            db.set_offer_status(offer_id, STATUS_EXPIRED)
+            try:
+                if c.message:
+                    bc_id = offer.get('business_connection_id') or getattr(c.message, 'business_connection_id', None)
+                    if bc_id:
+                        await safe(bot.delete_business_messages, business_connection_id=bc_id, message_ids=[c.message.message_id])
+                    else:
+                        await safe(bot.delete_message, chat_id=c.message.chat.id, message_id=c.message.message_id)
+            except Exception:
+                pass
+            return await c.answer('Срок действия офера истёк.', show_alert=True)
 
-    bc_id = offer.get('business_connection_id') or (getattr(c.message, 'business_connection_id', None) if c.message else None)
+        locale = offer['locale'] or 'ru'
+        bc_id = offer.get('business_connection_id') or (getattr(c.message, 'business_connection_id', None) if c.message else None)
+        if not c.message:
+            return await c.answer('Сообщение офера недоступно.', show_alert=True)
 
-    if new_status == STATUS_ACCEPTED:
-        await c.answer(accepted_alert_text(offer, locale), show_alert=True)
-        text = final_offer_text(offer, locale)
-        markup = transfer_keyboard(offer, locale)
+        if action == 'accept':
+            # Сначала реально меняем сообщение. Только после успешного edit фиксируем
+            # статус. Поэтому первый клик больше не даст alert «успешно принято»,
+            # оставив старую кнопку из-за FloodWait.
+            try:
+                await _edit_offer_message(c.message, final_offer_text(offer, locale), transfer_keyboard(offer, locale), bc_id)
+            except TelegramRetryAfter as e:
+                log.warning('Accept offer %s blocked by flood control: retry_after=%s', offer_id, getattr(e, 'retry_after', '?'))
+                return await c.answer('Telegram временно ограничил обновление сообщения. Попробуйте позже.', show_alert=True)
+            except Exception as e:
+                log.exception('Could not edit accepted offer message %s: %s', offer_id, e)
+                return await c.answer('Не удалось обновить офер. Попробуйте ещё раз.', show_alert=True)
+            db.set_offer_status(offer_id, STATUS_ACCEPTED)
+            return await c.answer(accepted_alert_text(offer, locale), show_alert=True)
+
+        # Отказ тоже делаем редактированием существующего сообщения — без второго
+        # SendMessage в тот же чат, чтобы не создавать новый flood.
         try:
-            kwargs = dict(
-                chat_id=c.message.chat.id, message_id=c.message.message_id, text=text, reply_markup=markup,
-                link_preview_options=LinkPreviewOptions(show_above_text=True, prefer_large_media=True),
-            )
-            if bc_id:
-                kwargs['business_connection_id'] = bc_id
-            await safe(bot.edit_message_text, **kwargs)
-        except Exception:
-            log.exception('Could not edit accepted offer message %s', offer_id)
-    else:
-        # The declined offer is removed, then a short confirmation is sent as a new message.
-        try:
-            if bc_id and c.message:
-                await safe(bot.delete_business_messages, business_connection_id=bc_id, message_ids=[c.message.message_id])
-            elif c.message:
-                await safe(bot.delete_message, chat_id=c.message.chat.id, message_id=c.message.message_id)
-        except Exception:
-            log.exception('Could not delete declined offer %s', offer_id)
-        try:
-            send_kwargs = dict(chat_id=c.message.chat.id, text=declined_text(offer, locale))
-            if bc_id:
-                send_kwargs['business_connection_id'] = bc_id
-            await safe(bot.send_message, **send_kwargs)
-        except Exception:
-            log.exception('Could not send declined offer confirmation %s', offer_id)
+            await _edit_offer_message(c.message, declined_text(offer, locale), None, bc_id)
+        except TelegramRetryAfter as e:
+            log.warning('Decline offer %s blocked by flood control: retry_after=%s', offer_id, getattr(e, 'retry_after', '?'))
+            return await c.answer('Telegram временно ограничил обновление сообщения. Попробуйте позже.', show_alert=True)
+        except Exception as e:
+            log.exception('Could not edit declined offer %s: %s', offer_id, e)
+            return await c.answer('Не удалось обновить офер. Попробуйте ещё раз.', show_alert=True)
+        db.set_offer_status(offer_id, STATUS_DECLINED)
         await c.answer()
-
 
 def _parse_expiry(value):
     if not value:

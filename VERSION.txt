@@ -1,1 +1,1 @@
-DEMO Business Offers v3 — flood-control / owner-only Business fix
+DEMO Business Offers v4 — in-place offer messages / flood-safe callbacks
