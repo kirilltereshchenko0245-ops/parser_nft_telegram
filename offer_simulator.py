@@ -136,34 +136,25 @@ def _linked_title(offer: dict):
 
 
 def build_offer_text(offer: dict, locale: str, remaining_seconds=None, **_ignored):
-    """Exact visual text layout for the first screenshot.
-
-    Telegram controls the actual typeface; <b> gives the same bold emphasis.
-    The NFT title is a blue clickable link to the supplied t.me/nft URL.
-    """
+    """Text for the first offer screenshot."""
     title = _linked_title(offer)
     amount = format_amount(offer['amount'], offer['currency'], locale)
     sender = (offer.get('seller_username') or '').strip().lstrip('@')
-    sender_html = f'@{esc(sender)}' if sender else ''
-    if locale == LOCALE_EN:
-        # English counterpart keeps the same visual structure.
-        if remaining_seconds is None:
-            remaining_seconds = 6 * 3600
-        mins = max(0, int(remaining_seconds) // 60)
-        time_part = f'{mins // 60}h {mins % 60}m'
-        return (
-            f'User {sender_html} offers you <b>{esc(amount)}</b> for the gift {title}.\n\n'
-            f'Offer expires in <b>{time_part}</b>.'
-        ), None
+    sender_html = f'<b>@{esc(sender)}</b>' if sender else '<b>пользователь</b>'
     if remaining_seconds is None:
         remaining_seconds = 6 * 3600
     mins = max(0, int(remaining_seconds) // 60)
+    if locale == LOCALE_EN:
+        time_part = f'{mins // 60}h {mins % 60}m'
+        return (
+            f'{sender_html} offers you <b>{esc(amount)}</b> for the gift {title}.\n\n'
+            f'Offer expires in <b>{time_part}</b>.'
+        ), None
     time_part = f'{mins // 60}ч {mins % 60}м'
     return (
-        f'Пользователь {sender_html} предлагает Вам <b>{esc(amount)}</b> за подарок {title}.\n\n'
+        f'{sender_html} предлагает Вам <b>{esc(amount)}</b> за подарок {title}.\n\n'
         f'Предложение действует ещё <b>{time_part}</b>.'
     ), None
-
 
 def accepted_alert_text(offer: dict, locale: str):
     title = gift_title(offer['gift_name'], offer['gift_number'])
@@ -189,7 +180,6 @@ def final_offer_text(offer: dict, locale: str):
 
 
 def declined_text(offer: dict, locale: str):
-    title = _linked_title(offer)
     if locale == LOCALE_EN:
-        return f'Offer for {title} was declined.'
-    return f'Предложение на {title} отклонено.'
+        return f'<tg-emoji emoji-id="{DECLINE_EMOJI_ID}">❌</tg-emoji> <b>Offer declined.</b>'
+    return f'<tg-emoji emoji-id="{DECLINE_EMOJI_ID}">❌</tg-emoji> <b>Предложение отклонено.</b>'

@@ -140,3 +140,10 @@ Required Business permissions: **Messages** / reply access. The connection itsel
 in Telegram: Settings → Telegram for Business → Chatbots.
 
 The offer flow remains a simulation: it never transfers Stars or Gram automatically.
+
+## DEMO Offers v3 fixes
+- Business `.офер` commands are accepted only when the sender is the connected Business account owner.
+- Allowed offer IDs still work in direct bot chats; Business chats are owner-only to prevent friends from triggering offers on behalf of the owner.
+- Owner username is resolved from the BusinessConnection / owner chat instead of falling back to the literal `пользователь` when possible.
+- Removed per-message and generic callback audit spam that could trigger Telegram `SendMessage` flood control.
+- Long `TelegramRetryAfter` values are no longer slept through inside handlers; short waits are retried, long waits are surfaced/logged instead of making the offer appear frozen for minutes.

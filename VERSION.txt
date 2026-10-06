@@ -1,1 +1,1 @@
-GiftParser 7.4.2 — hidden-chat anti-stall / round-robin scheduler fix
+DEMO Business Offers v3 — flood-control / owner-only Business fix

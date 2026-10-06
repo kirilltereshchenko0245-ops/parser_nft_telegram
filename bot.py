@@ -47,6 +47,8 @@ bot = Bot(TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 dp = Dispatcher(storage=MemoryStorage())
 db_path = os.getenv('DATABASE_PATH') or (os.path.join(os.getenv('RAILWAY_VOLUME_MOUNT_PATH'), 'bot_database.db') if os.getenv('RAILWAY_VOLUME_MOUNT_PATH') else 'bot_database.db')
 db = Database(db_path)
+if OWNER_ID:
+    db.offer_access_add(OWNER_ID)
 api = PeekAPI(CONCURRENCY)
 ACTIVE: set[int] = set()  # пользователи с запущенным поиском
 
@@ -70,6 +72,7 @@ class S(StatesGroup):
     random_model = State()
     random_count = State()
     admin_user_search = State()
+    offer_access_add = State()
 
 
 # ───────────────────────── помощники ─────────────────────────
@@ -94,13 +97,22 @@ def allowed(uid, count):
 
 
 async def safe(fn, *args, **kwargs):
-    """Вызов Telegram API с обработкой flood-ограничения."""
-    for _ in range(4):
+    """Вызов Telegram API без блокировки обработчика на длинный FloodWait.
+
+    Короткие серверные паузы повторяем автоматически. Длинные (например 121s)
+    не заставляют офер "висеть" внутри handler: ошибка логируется и
+    возвращается вызывающему коду. Основная защита от таких 429 — не спамить
+    один чат и не писать аудит на каждое входящее сообщение.
+    """
+    for attempt in range(2):
         try:
             return await fn(*args, **kwargs)
         except TelegramRetryAfter as e:
-            await asyncio.sleep(e.retry_after + 0.5)
-    return await fn(*args, **kwargs)
+            retry_after = int(getattr(e, 'retry_after', 0) or 0)
+            if retry_after <= 3 and attempt == 0:
+                await asyncio.sleep(retry_after + 0.15)
+                continue
+            raise
 
 
 async def peek_get_gift(model: str, number: int):
@@ -196,8 +208,6 @@ async def access_message(handler, event: Message, data):
             await audit('Заблокированный пользователь попытался выполнить действие', uid, f'Текст: <code>{ui.esc(event.text or "")}</code>')
             await event.answer('🚫 <b>Доступ ограничен.</b>')
             return
-        if event.text and not event.text.startswith('/'):
-            await audit('Сообщение пользователя', uid, f'Текст: <code>{ui.esc(event.text[:700])}</code>')
     return await handler(event, data)
 
 
@@ -207,7 +217,6 @@ async def access_callback(handler, event: CallbackQuery, data):
         await audit('Заблокированный пользователь нажал кнопку', event.from_user.id, f'Callback: <code>{ui.esc(event.data or "")}</code>')
         await event.answer('🚫 Доступ ограничен', show_alert=True)
         return
-    await audit('Нажата кнопка', event.from_user.id, f'Callback: <code>{ui.esc(event.data or "")}</code>')
     return await handler(event, data)
 
 
@@ -788,6 +797,7 @@ def admin_home_kb():
         [InlineKeyboardButton(text='🔎 Последние поиски', callback_data='adm:searches')],
         [InlineKeyboardButton(text='📜 Логи', callback_data='adm:logs')],
         [InlineKeyboardButton(text='🔐 Доступ к парсеру', callback_data='adm:parser_access')],
+        [InlineKeyboardButton(text='🎁 Доступ к оферам', callback_data='adm:offer_access')],
         [InlineKeyboardButton(text='🔄 Обновить', callback_data='adm:home')],
     ])
 
@@ -831,6 +841,77 @@ async def adm_parser_access(c: CallbackQuery):
     await audit('Изменён доступ к парсеру', c.from_user.id, f'Режим: <b>{state}</b>')
     await c.answer(state, show_alert=True)
     await c.message.edit_reply_markup(reply_markup=admin_home_kb())
+
+def offer_access_kb():
+    rows = db.offer_access_list()
+    buttons = []
+    for row in rows:
+        uid = int(row['user_id'])
+        label = f'👑 {uid}' if uid == OWNER_ID else f'👤 {uid}'
+        buttons.append([InlineKeyboardButton(text=label, callback_data=f'adm:offer_access:remove:{uid}')])
+    buttons.append([InlineKeyboardButton(text='➕ Добавить Telegram ID', callback_data='adm:offer_access:add')])
+    buttons.append([InlineKeyboardButton(text='⬅️ Панель', callback_data='adm:home')])
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+
+def offer_access_text():
+    rows = db.offer_access_list()
+    lines = []
+    for row in rows:
+        uid = int(row['user_id'])
+        tag = 'владелец' if uid == OWNER_ID else 'разрешён'
+        lines.append(f'• <code>{uid}</code> — {tag}')
+    body = '\n'.join(lines) if lines else 'Список пуст.'
+    return '🎁 <b>Доступ к оферам</b>\n\nКто может запускать команды <code>.офер</code>:\n\n' + body + '\n\nНажми на ID, чтобы удалить доступ.'
+
+
+@dp.callback_query(F.data == 'adm:offer_access')
+async def adm_offer_access(c: CallbackQuery, state: FSMContext):
+    if not is_admin(c.from_user.id):
+        return await c.answer('Нет доступа', show_alert=True)
+    await state.clear()
+    await c.answer()
+    await c.message.edit_text(offer_access_text(), reply_markup=offer_access_kb())
+
+
+@dp.callback_query(F.data == 'adm:offer_access:add')
+async def adm_offer_access_add_start(c: CallbackQuery, state: FSMContext):
+    if not is_admin(c.from_user.id):
+        return await c.answer('Нет доступа', show_alert=True)
+    await c.answer()
+    await state.set_state(S.offer_access_add)
+    await c.message.answer('➕ <b>Добавление доступа к оферам</b>\n\nОтправь Telegram ID пользователя, например:\n<code>123456789</code>', reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text='⬅️ Отмена', callback_data='adm:offer_access')]]))
+
+
+@dp.message(S.offer_access_add)
+async def adm_offer_access_add_value(m: Message, state: FSMContext):
+    if not is_admin(m.from_user.id):
+        await state.clear()
+        return
+    raw = (m.text or '').strip()
+    if not raw.lstrip('-').isdigit():
+        return await m.answer('❌ Нужен именно Telegram ID, например <code>123456789</code>.')
+    uid = int(raw)
+    if uid <= 0:
+        return await m.answer('❌ Некорректный Telegram ID.')
+    db.offer_access_add(uid)
+    await state.clear()
+    await audit('Добавлен доступ к оферам', m.from_user.id, f'Пользователь: <code>{uid}</code>')
+    await m.answer('✅ <b>Доступ к оферам добавлен.</b>\n\n' + offer_access_text(), reply_markup=offer_access_kb())
+
+
+@dp.callback_query(F.data.regexp(r'^adm:offer_access:remove:-?\d+$'))
+async def adm_offer_access_remove(c: CallbackQuery):
+    if not is_admin(c.from_user.id):
+        return await c.answer('Нет доступа', show_alert=True)
+    uid = int(c.data.rsplit(':', 1)[1])
+    if uid == OWNER_ID:
+        return await c.answer('Владельца удалить нельзя.', show_alert=True)
+    removed = db.offer_access_remove(uid)
+    await audit('Удалён доступ к оферам', c.from_user.id, f'Пользователь: <code>{uid}</code>')
+    await c.answer('Доступ удалён' if removed else 'Такого ID нет')
+    await c.message.edit_text(offer_access_text(), reply_markup=offer_access_kb())
+
 
 @dp.callback_query(F.data == 'adm:stats')
 async def adm_stats(c: CallbackQuery):
@@ -1079,38 +1160,66 @@ async def offer_emoji_helper(m: Message):
 @dp.message(F.text.regexp(r'^\s*\.офер(?:\s|$)'))
 @dp.business_message(F.text.regexp(r'^\s*\.офер(?:\s|$)'))
 async def demo_offer_command(m: Message):
-    # The trigger itself is hidden immediately; the user only sees the finished card.
+    parsed = parse_offer_command(m.text or '')
+    if not parsed:
+        return
+
+    sender_id = int(m.from_user.id) if m.from_user else 0
+    if not db.offer_access_allowed(sender_id):
+        log.info('Ignoring .офер from unauthorized user %s', sender_id)
+        return
+
+    business_connection_id = getattr(m, 'business_connection_id', None)
+    seller_id = OWNER_ID
+    seller_username = None
+
+    if business_connection_id:
+        try:
+            bc = await safe(bot.get_business_connection, business_connection_id)
+            if not bc or not getattr(bc, 'is_enabled', True):
+                return
+            # В Business-чате команду может запускать ТОЛЬКО владелец подключённого
+            # аккаунта. Это защищает от ситуации, когда друг пишет владельцу
+            # '.офер' и бот отвечает от имени владельца.
+            business_owner_id = int(getattr(getattr(bc, 'user', None), 'id', 0) or 0)
+            if business_owner_id != int(OWNER_ID) or sender_id != business_owner_id:
+                log.info('Ignoring Business .офер: sender=%s owner=%s', sender_id, business_owner_id)
+                return
+            if not db.offer_access_allowed(sender_id):
+                return
+            seller_id = business_owner_id
+            seller_username = getattr(bc.user, 'username', None)
+            if not seller_username:
+                try:
+                    owner_chat = await safe(bot.get_chat, business_owner_id)
+                    seller_username = getattr(owner_chat, 'username', None)
+                except Exception:
+                    pass
+        except Exception:
+            log.exception('Business connection lookup failed')
+            return
+    else:
+        # В обычном чате бота разрешённые ID из админки могут создавать оферы.
+        if sender_id == OWNER_ID:
+            seller_username = getattr(m.from_user, 'username', None)
+        if not seller_username:
+            try:
+                owner_chat = await safe(bot.get_chat, OWNER_ID)
+                seller_username = getattr(owner_chat, 'username', None)
+            except Exception:
+                pass
+
+    seller_username = seller_username or os.getenv('OFFER_SELLER_USERNAME', '').strip().lstrip('@') or None
+
+    # Hide the command only after access has been verified.
     try:
         await safe(m.delete)
     except Exception as e:
         log.warning('Could not delete offer command message %s: %s', getattr(m, 'message_id', '?'), e)
 
-    parsed = parse_offer_command(m.text or '')
-    if not parsed:
-        return
-
-    seller_username = os.getenv('OFFER_SELLER_USERNAME', '').strip().lstrip('@') or None
-    seller_id = OWNER_ID
-    business_connection_id = getattr(m, 'business_connection_id', None)
-
-    if business_connection_id:
-        try:
-            bc = await safe(bot.get_business_connection, business_connection_id)
-            if int(bc.user.id) != OWNER_ID:
-                return await m.answer('❌ Эта Business-связь не принадлежит владельцу бота.')
-            # Always read the current username from Telegram, so a username change is reflected.
-            seller_username = bc.user.username or seller_username
-        except Exception as e:
-            log.exception('Business connection lookup failed')
-            return await m.answer(f'❌ Не удалось проверить Business-связь: <code>{ui.esc(str(e)[:220])}</code>')
-    elif not is_admin(m.from_user.id):
-        return await m.answer('❌ Для DEMO-оферов используй подключённый Telegram Business-чат владельца.')
-
     if parsed.get('error'):
         return await m.answer(offer_help_text(parsed.get('locale', 'ru')))
 
-    # The Business chat is the buyer peer. The buyer restriction is deliberately
-    # NOT enforced: any user who can see the offer can press Accept/Decline.
     buyer = m.chat
     if not buyer or not buyer.id:
         return await m.answer('❌ Не удалось определить получателя офера.')
@@ -1121,38 +1230,33 @@ async def demo_offer_command(m: Message):
 
     try:
         offer_id = db.create_offer(
-            seller_id=seller_id,
-            seller_username=seller_username,
-            buyer_id=buyer_id,
-            buyer_username=buyer_username,
-            buyer_url=buyer_url,
-            gift_name=parsed['gift_name'],
-            gift_number=parsed['gift_number'],
-            gift_url=parsed['gift_url'],
-            amount=parsed['amount'],
-            currency=parsed['currency'],
-            locale=parsed['locale'],
-            expires_at=expires_at,
+            seller_id=seller_id, seller_username=seller_username,
+            buyer_id=buyer_id, buyer_username=buyer_username, buyer_url=buyer_url,
+            gift_name=parsed['gift_name'], gift_number=parsed['gift_number'], gift_url=parsed['gift_url'],
+            amount=parsed['amount'], currency=parsed['currency'], locale=parsed['locale'], expires_at=expires_at,
         )
         offer = db.get_offer(offer_id)
         text, entities = build_offer_text(offer, parsed['locale'], remaining_seconds=6*3600)
-        lp = LinkPreviewOptions(show_above_text=True, prefer_large_media=True)
         kwargs = dict(
-            chat_id=m.chat.id,
-            text=text,
-            reply_markup=offer_keyboard(offer_id, parsed['locale']),
-            link_preview_options=lp,
+            chat_id=m.chat.id, text=text, reply_markup=offer_keyboard(offer_id, parsed['locale']),
+            link_preview_options=LinkPreviewOptions(show_above_text=True, prefer_large_media=True),
             entities=entities,
         )
         if business_connection_id:
             kwargs['business_connection_id'] = business_connection_id
         sent = await safe(bot.send_message, **kwargs)
         db.update_offer_message(offer_id, sent.chat.id, sent.message_id, business_connection_id)
-        await audit('Создан DEMO-офер', seller_id,
-                    f'Offer: <code>{offer_id}</code> · Buyer: <code>{buyer_id}</code> · Gift: <code>{ui.esc(parsed["gift_name"])}-{parsed["gift_number"]}</code>')
+        try:
+            await audit('Создан DEMO-офер', sender_id, f'Offer: <code>{offer_id}</code> · Buyer: <code>{buyer_id}</code> · Gift: <code>{ui.esc(parsed["gift_name"])}-{parsed["gift_number"]}</code>')
+        except TelegramRetryAfter as e:
+            log.warning('Offer created, but audit log was rate-limited for %ss', getattr(e, 'retry_after', '?'))
     except Exception as e:
         log.exception('Failed to create demo offer')
-        await m.answer(f'❌ Не удалось создать DEMO-офер: <code>{ui.esc(str(e)[:300])}</code>')
+        # If this is a Business message, reply on behalf of the same connection.
+        err_kwargs = dict(chat_id=m.chat.id, text=f'❌ Не удалось создать DEMO-офер: <code>{ui.esc(str(e)[:300])}</code>')
+        if business_connection_id:
+            err_kwargs['business_connection_id'] = business_connection_id
+        await safe(bot.send_message, **err_kwargs)
 
 
 @dp.callback_query(F.data.regexp(r'^of:(accept|decline):\d+$'))
@@ -1185,25 +1289,39 @@ async def demo_offer_action(c: CallbackQuery):
     db.set_offer_status(offer_id, new_status)
     locale = offer['locale'] or 'ru'
 
+    bc_id = offer.get('business_connection_id') or (getattr(c.message, 'business_connection_id', None) if c.message else None)
+
     if new_status == STATUS_ACCEPTED:
-        # Screenshot #2: native-style alert, then replace the same message.
         await c.answer(accepted_alert_text(offer, locale), show_alert=True)
         text = final_offer_text(offer, locale)
         markup = transfer_keyboard(offer, locale)
+        try:
+            kwargs = dict(
+                chat_id=c.message.chat.id, message_id=c.message.message_id, text=text, reply_markup=markup,
+                link_preview_options=LinkPreviewOptions(show_above_text=True, prefer_large_media=True),
+            )
+            if bc_id:
+                kwargs['business_connection_id'] = bc_id
+            await safe(bot.edit_message_text, **kwargs)
+        except Exception:
+            log.exception('Could not edit accepted offer message %s', offer_id)
     else:
-        text = declined_text(offer, locale)
-        markup = None
-        await c.answer('Отклонено', show_alert=False)
-
-    try:
-        kwargs = dict(chat_id=c.message.chat.id, message_id=c.message.message_id, text=text, reply_markup=markup)
-        bc_id = offer.get('business_connection_id') or (getattr(c.message, 'business_connection_id', None) if c.message else None)
-        if bc_id:
-            kwargs['business_connection_id'] = bc_id
-        await safe(bot.edit_message_text, **kwargs)
-    except Exception:
-        # The requested flow is edit-in-place. This fallback is only for Telegram permission/API failures.
-        log.exception('Could not edit offer message %s', offer_id)
+        # The declined offer is removed, then a short confirmation is sent as a new message.
+        try:
+            if bc_id and c.message:
+                await safe(bot.delete_business_messages, business_connection_id=bc_id, message_ids=[c.message.message_id])
+            elif c.message:
+                await safe(bot.delete_message, chat_id=c.message.chat.id, message_id=c.message.message_id)
+        except Exception:
+            log.exception('Could not delete declined offer %s', offer_id)
+        try:
+            send_kwargs = dict(chat_id=c.message.chat.id, text=declined_text(offer, locale))
+            if bc_id:
+                send_kwargs['business_connection_id'] = bc_id
+            await safe(bot.send_message, **send_kwargs)
+        except Exception:
+            log.exception('Could not send declined offer confirmation %s', offer_id)
+        await c.answer()
 
 
 def _parse_expiry(value):

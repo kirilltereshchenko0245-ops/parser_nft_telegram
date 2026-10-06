@@ -139,6 +139,9 @@ class Database:
             c.execute('''CREATE TABLE IF NOT EXISTS bot_settings(
                 key TEXT PRIMARY KEY,
                 value TEXT NOT NULL)''')
+            c.execute('''CREATE TABLE IF NOT EXISTS offer_access_users(
+                user_id INTEGER PRIMARY KEY,
+                added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)''')
             c.execute('''CREATE TABLE IF NOT EXISTS parser_seen_users(
                 user_id INTEGER PRIMARY KEY,
                 first_chat_id INTEGER,
@@ -248,6 +251,24 @@ class Database:
     def set_setting(self, key, value):
         with self._db() as c:
             c.execute('INSERT INTO bot_settings(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value', (key, str(value)))
+
+    # ───────────── DEMO offer access ─────────────
+    def offer_access_add(self, user_id):
+        with self._db() as c:
+            c.execute('INSERT OR IGNORE INTO offer_access_users(user_id) VALUES(?)', (int(user_id),))
+            return c.rowcount > 0
+
+    def offer_access_remove(self, user_id):
+        with self._db() as c:
+            c.execute('DELETE FROM offer_access_users WHERE user_id=?', (int(user_id),))
+            return c.rowcount > 0
+
+    def offer_access_allowed(self, user_id):
+        row = self._one('SELECT 1 AS ok FROM offer_access_users WHERE user_id=?', (int(user_id),))
+        return bool(row)
+
+    def offer_access_list(self):
+        return self._all('SELECT user_id, added_at FROM offer_access_users ORDER BY added_at, user_id')
 
     # ───────────── пользователи ─────────────
     def upsert_user(self, uid, username=None, first_name=None):
