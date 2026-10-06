@@ -127,3 +127,16 @@ Examples:
 ```
 
 Set `OFFER_HELP_URL` to your Telegr.ph instruction page. For a Telegram custom emoji, send the bot (as the owner) a message containing `.эмодзи` followed by the desired custom emoji. The bot stores its `custom_emoji_id` and uses it in DEMO offer messages.
+
+
+## Telegram Business / Secretary Mode
+
+The DEMO offer handler supports both ordinary bot messages and Telegram Business messages.
+When the bot is connected to the owner account through BotFather **Secretary Mode / Business Mode**,
+`.офер ...` sent in a managed Business chat is received as a `business_message` update and the
+reply is sent on behalf of the connected account using `business_connection_id`.
+
+Required Business permissions: **Messages** / reply access. The connection itself is configured
+in Telegram: Settings → Telegram for Business → Chatbots.
+
+The offer flow remains a simulation: it never transfers Stars or Gram automatically.

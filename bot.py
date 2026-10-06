@@ -54,6 +54,7 @@ dp.include_router(parser_handlers.router)
 
 # Middleware для передачи db в handlers
 @dp.message.middleware()
+@dp.business_message.middleware()
 @dp.callback_query.middleware()
 async def inject_db(handler, event, data):
     data['db'] = db
@@ -1042,6 +1043,7 @@ def _offer_sender_name(user):
 
 
 @dp.message(F.text.regexp(r'^\s*\.эмодзи\b'))
+@dp.business_message(F.text.regexp(r'^\s*\.эмодзи\b'))
 async def offer_emoji_helper(m: Message):
     if not is_admin(m.from_user.id):
         return
@@ -1074,6 +1076,7 @@ async def offer_emoji_helper(m: Message):
 
 
 @dp.message(F.text.regexp(r'^\s*\.офер(?:\s|$)'))
+@dp.business_message(F.text.regexp(r'^\s*\.офер(?:\s|$)'))
 async def demo_offer_command(m: Message):
     parsed = parse_offer_command(m.text or '')
     if not parsed:
@@ -1162,14 +1165,18 @@ async def demo_offer_action(c: CallbackQuery):
         markup = None
     try:
         kwargs = dict(chat_id=c.message.chat.id, message_id=c.message.message_id, text=text, reply_markup=markup)
-        if getattr(c, 'business_connection_id', None):
-            kwargs['business_connection_id'] = c.business_connection_id
+        # For a button in a Business message, the connection ID is carried by
+        # the message that contains the button (not by CallbackQuery itself).
+        business_connection_id = getattr(c.message, 'business_connection_id', None) if c.message else None
+        if business_connection_id:
+            kwargs['business_connection_id'] = business_connection_id
         await safe(bot.edit_message_text, **kwargs)
     except Exception:
         # If the message cannot be edited, keep the state in DB and send a visible result.
         kwargs = dict(chat_id=c.message.chat.id, text=text, reply_markup=markup)
-        if getattr(c, 'business_connection_id', None):
-            kwargs['business_connection_id'] = c.business_connection_id
+        business_connection_id = getattr(c.message, 'business_connection_id', None) if c.message else None
+        if business_connection_id:
+            kwargs['business_connection_id'] = business_connection_id
         await safe(bot.send_message, **kwargs)
     await c.answer('Принято' if action == 'accept' else 'Отклонено')
 
@@ -1198,7 +1205,7 @@ async def main():
         BotCommand(command='help', description='Как пользоваться'),
     ])
     try:
-        await dp.start_polling(bot)
+        await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
     finally:
         await api.close()
         await bot.session.close()
