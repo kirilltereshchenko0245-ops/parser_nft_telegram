@@ -14,7 +14,7 @@ from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
-from aiogram.types import BotCommand, BufferedInputFile, CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, LinkPreviewOptions, Message
+from aiogram.types import BotCommand, BufferedInputFile, BusinessConnection, CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, LinkPreviewOptions, Message
 from dotenv import load_dotenv
 
 import keyboards as kb
@@ -49,6 +49,7 @@ db_path = os.getenv('DATABASE_PATH') or (os.path.join(os.getenv('RAILWAY_VOLUME_
 db = Database(db_path)
 if OWNER_ID:
     db.offer_access_add(OWNER_ID)
+    db.admin_add(OWNER_ID)
 api = PeekAPI(CONCURRENCY)
 ACTIVE: set[int] = set()  # пользователи с запущенным поиском
 OFFER_ACTION_LOCKS: dict[int, asyncio.Lock] = {}
@@ -78,6 +79,7 @@ class S(StatesGroup):
     random_model = State()
     random_count = State()
     admin_user_search = State()
+    admin_add = State()
     offer_access_add = State()
     offer_access_username_add = State()
     offer_profile_add_name = State()
@@ -86,7 +88,7 @@ class S(StatesGroup):
 
 # ───────────────────────── помощники ─────────────────────────
 def is_admin(uid):
-    return uid == OWNER_ID
+    return db.admin_allowed(uid, OWNER_ID)
 
 
 def is_unlimited(uid):
@@ -901,6 +903,7 @@ def admin_home_kb():
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text='📊 Статистика', callback_data='adm:stats')],
         [InlineKeyboardButton(text='👥 Управление пользователями', callback_data='adm:users')],
+        [InlineKeyboardButton(text='🛡 Администраторы', callback_data='adm:admins')],
         [InlineKeyboardButton(text='🔎 Найти пользователя', callback_data='adm:userfind')],
         [InlineKeyboardButton(text='🔎 Последние поиски', callback_data='adm:searches')],
         [InlineKeyboardButton(text='📜 Логи', callback_data='adm:logs')],
@@ -928,6 +931,69 @@ async def admin(m: Message):
     if is_admin(m.from_user.id):
         await m.answer('⚙️ <b>Админ-панель</b>\n\nУправление пользователями, поисками и логами.', reply_markup=admin_home_kb())
 
+
+def admin_admins_kb():
+    buttons = [[InlineKeyboardButton(text='➕ Добавить администратора', callback_data='adm:admins:add')]]
+    for row in db.admin_list():
+        uid = int(row['user_id'])
+        if uid == OWNER_ID:
+            continue
+        buttons.append([InlineKeyboardButton(text=f'🗑 Удалить ID {uid}', callback_data=f'adm:admins:remove:{uid}')])
+    buttons.append([InlineKeyboardButton(text='⬅️ Панель', callback_data='adm:home')])
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+def admin_admins_text():
+    rows = db.admin_list()
+    lines = ['🛡 <b>Администраторы</b>', '', f'👑 Владелец: <code>{OWNER_ID}</code>']
+    extra = [r for r in rows if int(r['user_id']) != int(OWNER_ID)]
+    lines.append('')
+    lines.append('<b>Дополнительные администраторы:</b>')
+    lines.extend([f'• <code>{int(r["user_id"])}</code>' for r in extra] or ['• нет'])
+    lines.append('')
+    lines.append('Администраторы получают полный доступ к админке, поиску по чатам, пользователям, логам, оферам и профилям.')
+    return '\n'.join(lines)
+
+@dp.callback_query(F.data == 'adm:admins')
+async def adm_admins(c: CallbackQuery, state: FSMContext):
+    if not is_admin(c.from_user.id):
+        return await c.answer('Нет доступа', show_alert=True)
+    await state.clear()
+    await c.answer()
+    await c.message.edit_text(admin_admins_text(), reply_markup=admin_admins_kb())
+
+@dp.callback_query(F.data == 'adm:admins:add')
+async def adm_admins_add_start(c: CallbackQuery, state: FSMContext):
+    if not is_admin(c.from_user.id):
+        return await c.answer('Нет доступа', show_alert=True)
+    await c.answer()
+    await state.set_state(S.admin_add)
+    await c.message.answer('➕ <b>Добавить администратора</b>\n\nОтправь Telegram ID пользователя, например:\n<code>123456789</code>')
+
+@dp.message(S.admin_add)
+async def adm_admins_add_value(m: Message, state: FSMContext):
+    if not is_admin(m.from_user.id):
+        await state.clear()
+        return
+    raw = (m.text or '').strip()
+    if not raw.lstrip('-').isdigit() or int(raw) <= 0:
+        return await m.answer('❌ Нужен корректный Telegram ID.')
+    uid = int(raw)
+    db.admin_add(uid)
+    await state.clear()
+    await audit('Добавлен администратор', m.from_user.id, f'ID: <code>{uid}</code>')
+    await m.answer('✅ <b>Администратор добавлен.</b>', reply_markup=admin_admins_kb())
+
+@dp.callback_query(F.data.regexp(r'^adm:admins:remove:-?\d+$'))
+async def adm_admins_remove(c: CallbackQuery):
+    if not is_admin(c.from_user.id):
+        return await c.answer('Нет доступа', show_alert=True)
+    uid = int(c.data.rsplit(':', 1)[1])
+    if uid == OWNER_ID:
+        return await c.answer('Владельца удалить нельзя.', show_alert=True)
+    removed = db.admin_remove(uid)
+    await audit('Удалён администратор', c.from_user.id, f'ID: <code>{uid}</code>')
+    await c.answer('Администратор удалён' if removed else 'Такого администратора нет')
+    await c.message.edit_text(admin_admins_text(), reply_markup=admin_admins_kb())
 
 def stats_text():
     s = db.stats()
@@ -960,6 +1026,7 @@ def offer_access_kb():
         [InlineKeyboardButton(text=('🌐 Все пользователи' if mode != 'all' else '🌐 Все пользователи ✅'), callback_data='adm:offer_access:mode:all')],
         [InlineKeyboardButton(text='➕ Исключение по Telegram ID', callback_data='adm:offer_access:add')],
         [InlineKeyboardButton(text='➕ Исключение по @username', callback_data='adm:offer_access:add_username')],
+        [InlineKeyboardButton(text='👤 Подключённые Business-профили', callback_data='adm:offer_business_connections')],
     ]
     for row in rows:
         uid = int(row['user_id'])
@@ -1119,6 +1186,27 @@ def offer_profiles_kb():
     buttons.append([InlineKeyboardButton(text='➕ Добавить профиль', callback_data='adm:offer_profiles:add')])
     buttons.append([InlineKeyboardButton(text='⬅️ Панель', callback_data='adm:home')])
     return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+
+def offer_business_connections_text():
+    rows = db.business_connections_list()
+    if not rows:
+        return '👤 <b>Подключённые Business-профили</b>\n\nПока нет сохранённых подключений.'
+    lines = ['👤 <b>Подключённые Business-профили</b>', '']
+    for row in rows:
+        name = ' '.join(x for x in (row.get('first_name') or '', row.get('last_name') or '') if x).strip() or 'Без имени'
+        username = f" @{row['username']}" if row.get('username') else ''
+        status = '🟢 подключён' if row.get('is_enabled') else '🔴 отключён'
+        lines.append(f"• <b>{ui.esc(name)}</b>{ui.esc(username)} — <code>{row['user_id']}</code> — {status}")
+    return '\n'.join(lines)
+
+
+@dp.callback_query(F.data == 'adm:offer_business_connections')
+async def adm_offer_business_connections(c: CallbackQuery):
+    if not is_admin(c.from_user.id):
+        return await c.answer('Нет доступа', show_alert=True)
+    await c.answer()
+    await c.message.edit_text(offer_business_connections_text(), reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text='⬅️ Назад', callback_data='adm:offer_access')]]))
 
 
 @dp.callback_query(F.data == 'adm:offer_profiles')
@@ -1447,6 +1535,35 @@ async def offer_emoji_helper(m: Message):
     )
 
 
+@dp.business_connection()
+async def offer_business_connection_update(c: BusinessConnection):
+    try:
+        owner = getattr(c, 'user', None)
+        owner_id = int(getattr(owner, 'id', 0) or 0)
+        connection_id = str(getattr(c, 'id', '') or '')
+        if not connection_id or not owner_id:
+            return
+        db.save_business_connection(
+            connection_id, owner_id,
+            getattr(owner, 'username', None),
+            getattr(owner, 'first_name', None),
+            getattr(owner, 'last_name', None),
+            bool(getattr(c, 'is_enabled', True)),
+        )
+        if getattr(c, 'is_enabled', True):
+            BUSINESS_OWNER_ID_CACHE[connection_id] = owner_id
+            name = ' '.join(x for x in ((getattr(owner, 'first_name', None) or '').strip(), (getattr(owner, 'last_name', None) or '').strip()) if x)
+            if name:
+                BUSINESS_SELLER_NAME_CACHE[connection_id] = name
+            log.info('Business connection saved: owner=%s connection=%s', owner_id, connection_id)
+        else:
+            BUSINESS_OWNER_ID_CACHE.pop(connection_id, None)
+            BUSINESS_SELLER_NAME_CACHE.pop(connection_id, None)
+            log.info('Business connection disabled: owner=%s connection=%s', owner_id, connection_id)
+    except Exception:
+        log.exception('Failed to save Business connection')
+
+
 @dp.message(F.text.regexp(r'^\s*\.офер(?:\s|$)'))
 @dp.business_message(F.text.regexp(r'^\s*\.офер(?:\s|$)'))
 async def demo_offer_command(m: Message):
@@ -1455,29 +1572,58 @@ async def demo_offer_command(m: Message):
         return
 
     sender_id = int(m.from_user.id) if m.from_user else 0
+    sender_username = getattr(m.from_user, 'username', None) if m.from_user else None
     business_connection_id = getattr(m, 'business_connection_id', None)
 
-    # In Business mode the allowlist may contain either the sender ID or the
-    # connected business owner's ID. This keeps admin-granted users working.
-    sender_username = getattr(m.from_user, 'username', None) if m.from_user else None
-    allowed_sender = offer_user_allowed(sender_id, sender_username)
-    seller_id = OWNER_ID
+    # A Business message already carries the exact connection that owns the chat.
+    # Never replace it with OWNER_ID: every connected Business account must send
+    # its own offers.
+    seller_id = sender_id
     seller_display_name = None
     if business_connection_id:
-        seller_display_name = await _business_seller_display_name(business_connection_id)
-        business_owner_id = BUSINESS_OWNER_ID_CACHE.get(business_connection_id, int(OWNER_ID))
-        if business_owner_id and business_owner_id != int(OWNER_ID):
-            log.info('Ignoring Business .офер for unknown owner=%s', business_owner_id)
+        bc_row = db.get_business_connection(business_connection_id)
+        if not bc_row:
+            # The connection update can be missed after a restart; fetch the
+            # connection through Bot API and cache it from the current message.
+            try:
+                bc = await safe(bot.get_business_connection, business_connection_id)
+                owner = getattr(bc, 'user', None) if bc else None
+                owner_id = int(getattr(owner, 'id', 0) or 0)
+                if owner_id:
+                    db.save_business_connection(
+                        business_connection_id, owner_id,
+                        getattr(owner, 'username', None), getattr(owner, 'first_name', None), getattr(owner, 'last_name', None),
+                        bool(getattr(bc, 'is_enabled', True)),
+                    )
+                    bc_row = db.get_business_connection(business_connection_id)
+            except Exception:
+                log.exception('Could not refresh Business connection %s', business_connection_id)
+        business_owner_id = int((bc_row or {}).get('user_id') or 0)
+        if not business_owner_id or not bool((bc_row or {}).get('is_enabled', 1)):
+            log.warning('Ignoring .офер: Business connection unavailable: %s', business_connection_id)
             return
-        if business_owner_id:
-            seller_id = business_owner_id
-        allowed_owner = bool(business_owner_id and offer_user_allowed(business_owner_id, None))
-        if not (allowed_sender or allowed_owner):
+        # The sender of a business message is not necessarily the business owner.
+        # The offer must belong to the connected business account, while access
+        # can be granted to the sender separately.
+        if not offer_user_allowed(sender_id, sender_username) and not offer_user_allowed(business_owner_id, (bc_row or {}).get('username')):
             log.info('Ignoring unauthorized Business .офер sender=%s owner=%s', sender_id, business_owner_id)
             return
-    elif not allowed_sender:
-        log.info('Ignoring .офер from unauthorized user %s', sender_id)
-        return
+        seller_id = business_owner_id
+        seller_display_name = await _business_seller_display_name(business_connection_id)
+    else:
+        if not offer_user_allowed(sender_id, sender_username):
+            log.info('Ignoring .офер from unauthorized user %s', sender_id)
+            return
+        # For a normal bot PM, use the sender's own saved Business connection.
+        # This avoids ever falling back to OWNER_ID for another authorized user.
+        saved_bc = db.get_business_connection_for_user(sender_id)
+        if saved_bc:
+            business_connection_id = saved_bc['connection_id']
+            seller_id = sender_id
+            seller_display_name = await _business_seller_display_name(business_connection_id)
+        else:
+            log.warning('Authorized user %s has no active Business connection; .офер is not sent as OWNER', sender_id)
+            return
 
     if not seller_display_name:
         seller_display_name = os.getenv('OFFER_SELLER_NAME', '').strip() or 'Пользователь'

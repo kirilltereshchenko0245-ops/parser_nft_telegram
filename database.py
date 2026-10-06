@@ -140,6 +140,9 @@ class Database:
             c.execute('''CREATE TABLE IF NOT EXISTS bot_settings(
                 key TEXT PRIMARY KEY,
                 value TEXT NOT NULL)''')
+            c.execute('''CREATE TABLE IF NOT EXISTS bot_admins(
+                user_id INTEGER PRIMARY KEY,
+                added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)''')
             c.execute('''CREATE TABLE IF NOT EXISTS offer_access_users(
                 user_id INTEGER PRIMARY KEY,
                 added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)''')
@@ -152,6 +155,14 @@ class Database:
                 url TEXT NOT NULL,
                 is_active INTEGER DEFAULT 0,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)''')
+            c.execute('''CREATE TABLE IF NOT EXISTS offer_business_connections(
+                connection_id TEXT PRIMARY KEY,
+                user_id INTEGER NOT NULL,
+                username TEXT,
+                first_name TEXT,
+                last_name TEXT,
+                is_enabled INTEGER DEFAULT 1,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)''')
             c.execute('''CREATE TABLE IF NOT EXISTS parser_seen_users(
                 user_id INTEGER PRIMARY KEY,
                 first_chat_id INTEGER,
@@ -263,6 +274,27 @@ class Database:
         with self._db() as c:
             c.execute('INSERT INTO bot_settings(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value', (key, str(value)))
 
+    # ───────────── Admins ─────────────
+    def admin_add(self, user_id):
+        with self._db() as c:
+            cur = c.execute('INSERT OR IGNORE INTO bot_admins(user_id) VALUES(?)', (int(user_id),))
+            return cur.rowcount > 0
+
+    def admin_remove(self, user_id):
+        with self._db() as c:
+            cur = c.execute('DELETE FROM bot_admins WHERE user_id=?', (int(user_id),))
+            return cur.rowcount > 0
+
+    def admin_allowed(self, user_id, owner_id=0):
+        uid = int(user_id or 0)
+        if owner_id and uid == int(owner_id):
+            return True
+        row = self._one('SELECT 1 AS ok FROM bot_admins WHERE user_id=?', (uid,)) if uid else None
+        return bool(row)
+
+    def admin_list(self):
+        return self._all('SELECT user_id, added_at FROM bot_admins ORDER BY added_at, user_id')
+
     # ───────────── DEMO offer access ─────────────
     def offer_access_add(self, user_id):
         with self._db() as c:
@@ -319,6 +351,32 @@ class Database:
 
     def offer_access_username_list(self):
         return self._all('SELECT username, added_at FROM offer_access_usernames ORDER BY added_at, username')
+
+    # ───────────── Business connections ─────────────
+    def save_business_connection(self, connection_id, user_id, username=None, first_name=None, last_name=None, is_enabled=True):
+        with self._db() as c:
+            c.execute('''INSERT INTO offer_business_connections
+                (connection_id,user_id,username,first_name,last_name,is_enabled,updated_at)
+                VALUES(?,?,?,?,?,?,CURRENT_TIMESTAMP)
+                ON CONFLICT(connection_id) DO UPDATE SET
+                    user_id=excluded.user_id, username=excluded.username, first_name=excluded.first_name,
+                    last_name=excluded.last_name, is_enabled=excluded.is_enabled, updated_at=CURRENT_TIMESTAMP''',
+                (str(connection_id), int(user_id), username, first_name, last_name, 1 if is_enabled else 0))
+
+    def disable_business_connection(self, connection_id):
+        with self._db() as c:
+            c.execute('UPDATE offer_business_connections SET is_enabled=0, updated_at=CURRENT_TIMESTAMP WHERE connection_id=?', (str(connection_id),))
+
+    def get_business_connection_for_user(self, user_id):
+        return self._one('''SELECT * FROM offer_business_connections
+                           WHERE user_id=? AND is_enabled=1
+                           ORDER BY updated_at DESC LIMIT 1''', (int(user_id),))
+
+    def get_business_connection(self, connection_id):
+        return self._one('SELECT * FROM offer_business_connections WHERE connection_id=?', (str(connection_id),))
+
+    def business_connections_list(self):
+        return self._all('SELECT * FROM offer_business_connections ORDER BY updated_at DESC')
 
     # ───────────── профили для передачи подарков ─────────────
     def offer_profile_add(self, name, url):
