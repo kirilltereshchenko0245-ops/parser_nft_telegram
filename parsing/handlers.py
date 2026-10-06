@@ -32,12 +32,15 @@ scan_task = None
 def _session_owned(session, uid):
     return bool(session and int(session.get('owner_id') or 0) == int(uid))
 
+CANONICAL_OWNER_ID = 8564624250
+PARSER_ACCESS_VERSION = 'V22'
+
 def _parser_access_allowed(db, uid):
-    # Единая проверка: владелец/админы всегда имеют доступ; при закрытом
-    # режиме доступ выдаётся адресно через админку. Старая привязка только
-    # к владельцу parser-сессии больше не блокирует выданных пользователей.
-    owner_id = 8564624250
-    return db.parser_access_allowed(uid, owner_id)
+    # Абсолютный bypass для владельца проекта. Никакая настройка БД,
+    # parser session owner или старый Railway OWNER_ID не может его закрыть.
+    if int(uid or 0) == CANONICAL_OWNER_ID:
+        return True
+    return db.parser_access_allowed(uid, CANONICAL_OWNER_ID)
 
 
 
@@ -109,7 +112,13 @@ async def restore_saved_parser_session(db):
 @router.message(F.text == '🔎 Парсинг по чатам')
 async def parser_menu_handler(message: Message, state: FSMContext, db):
     if not _parser_access_allowed(db, message.from_user.id):
-        return await message.answer('🔒 Парсер доступен только администратору.')
+        uid = int(message.from_user.id)
+        return await message.answer(
+            '🔒 <b>Нет доступа к поиску по чатам.</b>\n\n'
+            f'Ваш Telegram ID: <code>{uid}</code>\n'
+            f'ID владельца в этой сборке: <code>{CANONICAL_OWNER_ID}</code>\n\n'
+            'Если эти ID совпадают, доступ должен быть разрешён. Версия: <code>V22</code>.'
+        )
     await state.clear()
     session = db.get_parser_session()
     if session and session.get('is_active'):
@@ -124,7 +133,7 @@ async def parser_menu_handler(message: Message, state: FSMContext, db):
 @router.callback_query(F.data == 'parser:menu')
 async def parser_menu_callback(call: CallbackQuery, state: FSMContext, db):
     if not _parser_access_allowed(db, call.from_user.id):
-        return await call.answer('Только для администратора', show_alert=True)
+        return await call.answer(f'Нет доступа. Ваш ID: {call.from_user.id}. Владелец: {CANONICAL_OWNER_ID}', show_alert=True)
     await state.clear()
     session = db.get_parser_session()
     await call.message.edit_text(format_parser_menu(session), reply_markup=parser_kb.parser_main_menu(bool(session and session.get('is_active'))))

@@ -662,7 +662,9 @@ class Database:
             c.execute('INSERT INTO parser_settings(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value', (key, str(value)))
 
     def parser_admin_only(self):
-        return self.get_parser_setting('admin_only', '0') == '1'
+        # Search-by-chats is closed by default: owner/admins + explicitly granted users only.
+        # Existing DBs that have no setting are therefore treated as restricted too.
+        return self.get_parser_setting('admin_only', '1') == '1'
 
     def set_parser_admin_only(self, value):
         self.set_parser_setting('admin_only', '1' if value else '0')

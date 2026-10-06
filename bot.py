@@ -31,6 +31,7 @@ log = logging.getLogger('giftparser')
 
 TOKEN = os.getenv('BOT_TOKEN')
 PRIMARY_OWNER_ID = 8564624250
+APP_VERSION = 'V22_PARSER_ACCESS_FIX'
 # Canonical project owner. This is intentionally independent of a stale Railway OWNER_ID.
 OWNER_ID = PRIMARY_OWNER_ID
 CONCURRENCY = int(os.getenv('PEEK_CONCURRENCY') or 1)  # По 1 ID последовательно
@@ -96,8 +97,11 @@ class S(StatesGroup):
 
 
 # ───────────────────────── помощники ─────────────────────────
+def is_owner(uid):
+    return int(uid or 0) == PRIMARY_OWNER_ID
+
 def is_admin(uid):
-    return db.admin_allowed(uid, OWNER_ID)
+    return is_owner(uid) or db.admin_allowed(uid, OWNER_ID)
 
 
 def is_unlimited(uid):
@@ -105,7 +109,8 @@ def is_unlimited(uid):
 
 
 def user_menu(uid):
-    return kb.main_menu(is_admin(uid), bool((db.get_user(uid) or {}).get('is_premium')), db.parser_access_allowed(uid, OWNER_ID))
+    parser_visible = is_owner(uid) or is_admin(uid) or db.parser_access_allowed(uid, OWNER_ID)
+    return kb.main_menu(is_admin(uid), bool((db.get_user(uid) or {}).get('is_premium')), parser_visible)
 
 
 def trial_left(uid):
@@ -1115,9 +1120,10 @@ def stats_text():
 async def adm_parser_access(c: CallbackQuery):
     if not is_admin(c.from_user.id):
         return await c.answer('Нет доступа', show_alert=True)
-    enabled = db.parser_admin_only()
-    db.set_parser_admin_only(not enabled)
-    state = '🔒 Только администратор' if not enabled else '🌐 Доступ разрешён пользователям'
+    # This setting means whether access is restricted to owner/admins + explicit grants.
+    restricted = db.parser_admin_only()
+    db.set_parser_admin_only(not restricted)
+    state = '🌐 Все пользователи' if restricted else '🔒 Только владелец/админы + выданный доступ'
     await audit('Изменён доступ к парсеру', c.from_user.id, f'Режим: <b>{state}</b>')
     await c.answer(state, show_alert=True)
     await c.message.edit_reply_markup(reply_markup=admin_home_kb())
@@ -2007,6 +2013,7 @@ async def main():
     except Exception:
         log.exception('Failed to restore saved parser session')
 
+    log.info('STARTED %s | PRIMARY_OWNER_ID=%s | OWNER_ID=%s | DB=%s', APP_VERSION, PRIMARY_OWNER_ID, OWNER_ID, db_path)
     log.info('Log channel configured: %s (startup audit disabled to avoid unnecessary SendMessage)', LOG_CHANNEL_ID)
     await bot.set_my_commands([
         BotCommand(command='start', description='Главное меню'),
