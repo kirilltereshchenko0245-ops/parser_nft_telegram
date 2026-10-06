@@ -1,8 +1,7 @@
-"""Safe Telegram Gift offer simulator.
+"""DEMO Telegram Business offer UI.
 
-This module intentionally never calls Telegram payment/gift-offer methods.
-It creates an ordinary bot message with inline buttons and stores state in SQLite.
-The message is clearly marked as DEMO so it cannot be mistaken for a real sale.
+This module only simulates an offer visually. It never transfers Stars/Gram and
+never calls Telegram payment/gift transfer APIs.
 """
 import os
 import re
@@ -21,6 +20,11 @@ STATUS_ACCEPTED = 'accepted'
 STATUS_DECLINED = 'declined'
 STATUS_EXPIRED = 'expired'
 
+DECLINE_EMOJI_ID = '5778527486270770928'
+ACCEPT_EMOJI_ID = '5776375003280838798'
+TRANSFER_EMOJI_ID = '5879770735999717115'
+GIFT_EMOJI_ID = '6032937473162614352'
+
 
 def _currency(raw: str):
     x = raw.lower().replace('ё', 'е')
@@ -30,7 +34,6 @@ def _currency(raw: str):
 
 
 def parse_offer_command(text: str):
-    """Parse .офер [ру|англ] <gift url> <amount> <currency>."""
     text = (text or '').strip()
     m = re.match(r'^\.офер(?:\s+(.+))?$', text, re.I)
     if not m:
@@ -38,7 +41,6 @@ def parse_offer_command(text: str):
     tail = (m.group(1) or '').strip()
     locale = LOCALE_RU
     if re.match(r'^ру(?:с)?\b', tail, re.I):
-        locale = LOCALE_RU
         tail = re.sub(r'^ру(?:с)?\s*', '', tail, flags=re.I)
     elif re.match(r'^англ(?:ийский)?\b', tail, re.I):
         locale = LOCALE_EN
@@ -65,7 +67,7 @@ def parse_offer_command(text: str):
     }
 
 
-def format_amount(amount, currency, locale):
+def format_amount(amount, currency, locale='ru'):
     value = f'{amount:g}'
     if locale == LOCALE_EN:
         return f'{value} Gram' if currency == 'gram' else f'{value} Stars'
@@ -79,35 +81,31 @@ def gift_title(name, number):
 def offer_help_text(locale=LOCALE_RU):
     if locale == LOCALE_EN:
         return (
-            '<b>Demo offer simulator</b>\n\n'
-            'Usage:\n'
+            '<b>Usage</b>\n\n'
             '<code>.офер https://t.me/nft/PartySparkler-140864 150 gram</code>\n'
             '<code>.офер ру https://t.me/nft/PartySparkler-140864 4500 зв</code>\n'
-            '<code>.офер англ https://t.me/nft/PartySparkler-140864 4500 stars</code>\n\n'
-            'This simulator never transfers Stars or Gram.'
+            '<code>.офер англ https://t.me/nft/PartySparkler-140864 4500 stars</code>'
         )
     return (
-        '<b>🧪 DEMO — симулятор оферов</b>\n\n'
-        'Использование:\n'
+        '<b>Использование</b>\n\n'
         '<code>.офер https://t.me/nft/PartySparkler-140864 150 грам</code>\n'
         '<code>.офер ру https://t.me/nft/PartySparkler-140864 4500 зв</code>\n'
-        '<code>.офер англ https://t.me/nft/PartySparkler-140864 4500 stars</code>\n\n'
-        'Stars/Gram автоматически не списываются и не передаются.'
+        '<code>.офер англ https://t.me/nft/PartySparkler-140864 4500 stars</code>'
     )
 
 
 def keyboard(offer_id: int, locale: str, status: str = STATUS_PENDING):
-    if status == STATUS_PENDING:
-        if locale == LOCALE_EN:
-            return InlineKeyboardMarkup(inline_keyboard=[[
-                InlineKeyboardButton(text='✕ Decline', callback_data=f'of:decline:{offer_id}'),
-                InlineKeyboardButton(text='✓ Accept', callback_data=f'of:accept:{offer_id}'),
-            ]])
+    if status != STATUS_PENDING:
+        return None
+    if locale == LOCALE_EN:
         return InlineKeyboardMarkup(inline_keyboard=[[
-            InlineKeyboardButton(text='❌ Отклонить', callback_data=f'of:decline:{offer_id}'),
-            InlineKeyboardButton(text='✅ Принять', callback_data=f'of:accept:{offer_id}'),
+            InlineKeyboardButton(text='Отклонить', icon_custom_emoji_id=DECLINE_EMOJI_ID, callback_data=f'of:decline:{offer_id}'),
+            InlineKeyboardButton(text='Принять', icon_custom_emoji_id=ACCEPT_EMOJI_ID, callback_data=f'of:accept:{offer_id}'),
         ]])
-    return None
+    return InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text='Отклонить', icon_custom_emoji_id=DECLINE_EMOJI_ID, callback_data=f'of:decline:{offer_id}'),
+        InlineKeyboardButton(text='Принять', icon_custom_emoji_id=ACCEPT_EMOJI_ID, callback_data=f'of:accept:{offer_id}'),
+    ]])
 
 
 def transfer_keyboard(offer: dict, locale: str):
@@ -115,71 +113,83 @@ def transfer_keyboard(offer: dict, locale: str):
     help_url = os.getenv('OFFER_HELP_URL', '').strip()
     rows = []
     if buyer_url:
-        rows.append([InlineKeyboardButton(text='Передать подарок' if locale == LOCALE_RU else 'Transfer gift', url=buyer_url)])
+        rows.append([InlineKeyboardButton(
+            text='Передать' if locale == LOCALE_RU else 'Transfer',
+            icon_custom_emoji_id=TRANSFER_EMOJI_ID,
+            url=buyer_url,
+        )])
     if help_url:
-        rows.append([InlineKeyboardButton(text='Как передать?' if locale == LOCALE_RU else 'How to transfer?', url=help_url)])
+        rows.append([InlineKeyboardButton(
+            text='Как передать?' if locale == LOCALE_RU else 'How to transfer?',
+            url=help_url,
+        )])
     return InlineKeyboardMarkup(inline_keyboard=rows) if rows else None
 
 
-def build_offer_text(offer: dict, locale: str, custom_emoji_id: str | None = None, custom_emoji_alt: str = '🎁'):
-    name = gift_title(offer['gift_name'], offer['gift_number'])
-    amount = format_amount(offer['amount'], offer['currency'], locale)
-    # Keep the NFT URL as a real HTML link entity. This lets Telegram discover
-    # the preview without forcing LinkPreviewOptions(url=...), which can return
-    # WEBPAGE_URL_INVALID for t.me/nft links in Business messages.
-    gift_url = offer.get('gift_url') or ''
-    preview_link = f'<a href=\"{esc(gift_url)}\">\u200b</a>' if gift_url else ''
-    sender = offer.get('seller_username') or str(offer.get('seller_id'))
-    if sender and not str(sender).startswith('@') and not str(sender).isdigit():
-        sender = '@' + str(sender)
+def _linked_title(offer: dict):
+    name = esc(pretty(offer['gift_name']))
+    number = num(offer['gift_number'])
+    url = esc(offer.get('gift_url') or '')
+    if not url:
+        return f'{name} #{number}'
+    return f'<a href="{url}">{name} #{number}</a>'
 
-    # The custom emoji entity is applied to the leading regular emoji.
-    lead = '🎁'
+
+def build_offer_text(offer: dict, locale: str, remaining_seconds=None, **_ignored):
+    """Exact visual text layout for the first screenshot.
+
+    Telegram controls the actual typeface; <b> gives the same bold emphasis.
+    The NFT title is a blue clickable link to the supplied t.me/nft URL.
+    """
+    title = _linked_title(offer)
+    amount = format_amount(offer['amount'], offer['currency'], locale)
+    sender = (offer.get('seller_username') or '').strip().lstrip('@')
+    sender_html = f'@{esc(sender)}' if sender else ''
     if locale == LOCALE_EN:
-        text = (
-            (preview_link + '\n' if preview_link else '') +
-            f'{lead} <b>Demo Telegram Gift Offer</b>\n'
-            f'<b>{esc(name)}</b>\n\n'
-            f'<b>DEMO — NOT A REAL TELEGRAM TRANSACTION</b>\n\n'
-            f'User {esc(sender)} offers you <b>{esc(amount)}</b> for the gift <b>{esc(name)}</b>.\n\n'
-            'This simulator does not charge, reserve, or transfer Stars/Gram.'
-        )
-    else:
-        text = (
-            (preview_link + '\n' if preview_link else '') +
-            f'{lead} <b>Telegram Gift Offer · DEMO</b>\n'
-            f'<b>{esc(name)}</b>\n\n'
-            f'⚠️ <b>ДЕМО — НЕ РЕАЛЬНАЯ СДЕЛКА TELEGRAM</b>\n\n'
-            f'Пользователь {esc(sender)} предлагает Вам <b>{esc(amount)}</b> за подарок <b>{esc(name)}</b>.\n\n'
-            'Stars/Gram не списываются, не резервируются и автоматически не передаются.'
-        )
-
-    if custom_emoji_id:
-        # Bot API HTML supports <tg-emoji ...> and keeps normal HTML formatting intact.
-        alt = custom_emoji_alt or lead
-        text = text.replace(lead, f'<tg-emoji emoji-id="{esc(custom_emoji_id)}">{esc(alt)}</tg-emoji>', 1)
-    return text, None
+        # English counterpart keeps the same visual structure.
+        if remaining_seconds is None:
+            remaining_seconds = 6 * 3600
+        mins = max(0, int(remaining_seconds) // 60)
+        time_part = f'{mins // 60}h {mins % 60}m'
+        return (
+            f'User {sender_html} offers you <b>{esc(amount)}</b> for the gift {title}.\n\n'
+            f'Offer expires in <b>{time_part}</b>.'
+        ), None
+    if remaining_seconds is None:
+        remaining_seconds = 6 * 3600
+    mins = max(0, int(remaining_seconds) // 60)
+    time_part = f'{mins // 60}ч {mins % 60}м'
+    return (
+        f'Пользователь {sender_html} предлагает Вам <b>{esc(amount)}</b> за подарок {title}.\n\n'
+        f'Предложение действует ещё <b>{time_part}</b>.'
+    ), None
 
 
-def accepted_text(offer: dict, locale: str):
-    name = gift_title(offer['gift_name'], offer['gift_number'])
+def accepted_alert_text(offer: dict, locale: str):
+    title = gift_title(offer['gift_name'], offer['gift_number'])
     amount = format_amount(offer['amount'], offer['currency'], locale)
+    if locale == LOCALE_EN:
+        return f'Offer to sell {title} was successfully accepted.\n\nTransfer the gift to the buyer to receive {amount} on your balance.'
+    return f'Предложение о продаже {title} успешно принято.\n\nПередайте подарок покупателю для зачисления {amount} на ваш баланс.'
+
+
+def final_offer_text(offer: dict, locale: str):
+    title = _linked_title(offer)
+    amount = format_amount(offer['amount'], offer['currency'], locale)
+    gift_emoji = f'<tg-emoji emoji-id="{GIFT_EMOJI_ID}">🎁</tg-emoji>'
     if locale == LOCALE_EN:
         return (
-            f'🧪 <b>Demo offer for {esc(name)} accepted.</b>\n\n'
-            f'Buyer agreed to <b>{esc(amount)}</b>.\n\n'
-            '<b>No Stars or Gram were transferred.</b>\n'
-            'The seller must complete any real transfer manually.'
+            f'{gift_emoji} Gift: {title} successfully sold!\n\n'
+            f'<b>• Transfer the gift to the buyer to receive {esc(amount)} on your balance.</b>'
         )
     return (
-        f'🧪 <b>ДЕМО-офер на {esc(name)} принят.</b>\n\n'
-        f'Покупатель согласился на <b>{esc(amount)}</b>.\n\n'
-        '<b>Stars/Gram не передавались.</b>\n'
-        'Любую реальную передачу продавец выполняет вручную.'
+        f'{gift_emoji} Gift: {title} успешно продан!\n\n'
+        f'<b>• Передайте подарок покупателю для зачисления {esc(amount)} на ваш баланс.</b>'
     )
 
 
 def declined_text(offer: dict, locale: str):
-    name = gift_title(offer['gift_name'], offer['gift_number'])
-    return (f'🧪 <b>Demo offer for {esc(name)} declined.</b>' if locale == LOCALE_EN
-            else f'🧪 <b>ДЕМО-офер на {esc(name)} отклонён.</b>')
+    title = _linked_title(offer)
+    if locale == LOCALE_EN:
+        return f'Offer for {title} was declined.'
+    return f'Предложение на {title} отклонено.'

@@ -4,6 +4,7 @@ import os
 import random
 import re
 import time
+from datetime import datetime, timezone, timedelta
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.client.default import DefaultBotProperties
@@ -21,7 +22,7 @@ import ui
 from database import Database
 from peek_api import AVAILABLE_MODELS, PeekAPI, gift_url, is_known_model, normalize_model_name, suggest_models
 from parsing import handlers as parser_handlers
-from offer_simulator import (parse_offer_command, offer_help_text, keyboard as offer_keyboard, build_offer_text, accepted_text, declined_text, transfer_keyboard, STATUS_PENDING, STATUS_ACCEPTED, STATUS_DECLINED, STATUS_EXPIRED)
+from offer_simulator import (parse_offer_command, offer_help_text, keyboard as offer_keyboard, build_offer_text, accepted_alert_text, final_offer_text, declined_text, transfer_keyboard, STATUS_PENDING, STATUS_ACCEPTED, STATUS_DECLINED, STATUS_EXPIRED)
 
 load_dotenv()
 os.makedirs('logs', exist_ok=True)
@@ -1078,30 +1079,27 @@ async def offer_emoji_helper(m: Message):
 @dp.message(F.text.regexp(r'^\s*\.офер(?:\s|$)'))
 @dp.business_message(F.text.regexp(r'^\s*\.офер(?:\s|$)'))
 async def demo_offer_command(m: Message):
-    # The command is only a trigger. Delete it immediately so the chat shows
-    # only the finished offer card. Message.delete() carries the Business
-    # connection automatically in aiogram.
+    # The trigger itself is hidden immediately; the user only sees the finished card.
     try:
         await safe(m.delete)
     except Exception as e:
-        # Deletion needs the matching Business Messages permission. Keep the
-        # offer flow working even if the permission has not been enabled yet.
         log.warning('Could not delete offer command message %s: %s', getattr(m, 'message_id', '?'), e)
 
     parsed = parse_offer_command(m.text or '')
     if not parsed:
         return
 
-    # In a Telegram Business chat, from_user is the customer. Verify that the
-    # Business Connection belongs to OWNER_ID before allowing offer creation.
     seller_username = os.getenv('OFFER_SELLER_USERNAME', '').strip().lstrip('@') or None
     seller_id = OWNER_ID
-    if getattr(m, 'business_connection_id', None):
+    business_connection_id = getattr(m, 'business_connection_id', None)
+
+    if business_connection_id:
         try:
-            bc = await safe(bot.get_business_connection, m.business_connection_id)
+            bc = await safe(bot.get_business_connection, business_connection_id)
             if int(bc.user.id) != OWNER_ID:
                 return await m.answer('❌ Эта Business-связь не принадлежит владельцу бота.')
-            seller_username = seller_username or bc.user.username
+            # Always read the current username from Telegram, so a username change is reflected.
+            seller_username = bc.user.username or seller_username
         except Exception as e:
             log.exception('Business connection lookup failed')
             return await m.answer(f'❌ Не удалось проверить Business-связь: <code>{ui.esc(str(e)[:220])}</code>')
@@ -1111,15 +1109,16 @@ async def demo_offer_command(m: Message):
     if parsed.get('error'):
         return await m.answer(offer_help_text(parsed.get('locale', 'ru')))
 
-    # In a Business chat, the chat itself is the customer peer. This also works
-    # when the command is sent by the business owner as an outgoing message: from_user
-    # may then be the owner, while m.chat identifies the buyer.
+    # The Business chat is the buyer peer. The buyer restriction is deliberately
+    # NOT enforced: any user who can see the offer can press Accept/Decline.
     buyer = m.chat
     if not buyer or not buyer.id:
         return await m.answer('❌ Не удалось определить получателя офера.')
     buyer_id = int(buyer.id)
     buyer_username = getattr(buyer, 'username', None)
     buyer_url = f'https://t.me/{buyer_username}' if buyer_username else f'tg://user?id={buyer_id}'
+    expires_at = (datetime.now(timezone.utc) + timedelta(hours=6)).isoformat()
+
     try:
         offer_id = db.create_offer(
             seller_id=seller_id,
@@ -1133,19 +1132,22 @@ async def demo_offer_command(m: Message):
             amount=parsed['amount'],
             currency=parsed['currency'],
             locale=parsed['locale'],
+            expires_at=expires_at,
         )
         offer = db.get_offer(offer_id)
-        text, entities = build_offer_text(offer, parsed['locale'], _offer_custom_emoji_id(), db.get_setting('offer_custom_emoji_alt') or os.getenv('OFFER_CUSTOM_EMOJI_ALT', '🎁'))
-        # The gift URL is already embedded as an HTML link entity in the text.
-        # Do not force url=... here: Telegram Business sendMessage can reject
-        # t.me/nft deep-links with WEBPAGE_URL_INVALID.
+        text, entities = build_offer_text(offer, parsed['locale'], remaining_seconds=6*3600)
         lp = LinkPreviewOptions(show_above_text=True, prefer_large_media=True)
-        kwargs = dict(chat_id=m.chat.id, text=text, reply_markup=offer_keyboard(offer_id, parsed['locale']),
-                      link_preview_options=lp, entities=entities)
-        if getattr(m, 'business_connection_id', None):
-            kwargs['business_connection_id'] = m.business_connection_id
+        kwargs = dict(
+            chat_id=m.chat.id,
+            text=text,
+            reply_markup=offer_keyboard(offer_id, parsed['locale']),
+            link_preview_options=lp,
+            entities=entities,
+        )
+        if business_connection_id:
+            kwargs['business_connection_id'] = business_connection_id
         sent = await safe(bot.send_message, **kwargs)
-        db.update_offer_message(offer_id, sent.chat.id, sent.message_id)
+        db.update_offer_message(offer_id, sent.chat.id, sent.message_id, business_connection_id)
         await audit('Создан DEMO-офер', seller_id,
                     f'Offer: <code>{offer_id}</code> · Buyer: <code>{buyer_id}</code> · Gift: <code>{ui.esc(parsed["gift_name"])}-{parsed["gift_number"]}</code>')
     except Exception as e:
@@ -1163,35 +1165,106 @@ async def demo_offer_action(c: CallbackQuery):
     offer = db.get_offer(offer_id)
     if not offer:
         return await c.answer('Офер не найден', show_alert=True)
-    if int(offer['buyer_id']) != int(c.from_user.id):
-        return await c.answer('Этот офер предназначен другому пользователю.', show_alert=True)
     if offer['status'] != STATUS_PENDING:
         return await c.answer('Офер уже обработан.', show_alert=True)
+
+    # Anyone who can press the button may accept/decline it.
+    expires = _parse_expiry(offer.get('expires_at'))
+    if expires and datetime.now(timezone.utc) >= expires:
+        db.set_offer_status(offer_id, STATUS_EXPIRED)
+        try:
+            if c.message:
+                await safe(bot.delete_business_messages,
+                            business_connection_id=offer.get('business_connection_id') or getattr(c.message, 'business_connection_id', None),
+                            message_ids=[c.message.message_id])
+        except Exception:
+            pass
+        return await c.answer('Срок действия офера истёк.', show_alert=True)
+
     new_status = STATUS_ACCEPTED if action == 'accept' else STATUS_DECLINED
     db.set_offer_status(offer_id, new_status)
     locale = offer['locale'] or 'ru'
+
     if new_status == STATUS_ACCEPTED:
-        text = accepted_text(offer, locale)
+        # Screenshot #2: native-style alert, then replace the same message.
+        await c.answer(accepted_alert_text(offer, locale), show_alert=True)
+        text = final_offer_text(offer, locale)
         markup = transfer_keyboard(offer, locale)
     else:
         text = declined_text(offer, locale)
         markup = None
+        await c.answer('Отклонено', show_alert=False)
+
     try:
         kwargs = dict(chat_id=c.message.chat.id, message_id=c.message.message_id, text=text, reply_markup=markup)
-        # For a button in a Business message, the connection ID is carried by
-        # the message that contains the button (not by CallbackQuery itself).
-        business_connection_id = getattr(c.message, 'business_connection_id', None) if c.message else None
-        if business_connection_id:
-            kwargs['business_connection_id'] = business_connection_id
+        bc_id = offer.get('business_connection_id') or (getattr(c.message, 'business_connection_id', None) if c.message else None)
+        if bc_id:
+            kwargs['business_connection_id'] = bc_id
         await safe(bot.edit_message_text, **kwargs)
     except Exception:
-        # If the message cannot be edited, keep the state in DB and send a visible result.
-        kwargs = dict(chat_id=c.message.chat.id, text=text, reply_markup=markup)
-        business_connection_id = getattr(c.message, 'business_connection_id', None) if c.message else None
-        if business_connection_id:
-            kwargs['business_connection_id'] = business_connection_id
-        await safe(bot.send_message, **kwargs)
-    await c.answer('Принято' if action == 'accept' else 'Отклонено')
+        # The requested flow is edit-in-place. This fallback is only for Telegram permission/API failures.
+        log.exception('Could not edit offer message %s', offer_id)
+
+
+def _parse_expiry(value):
+    if not value:
+        return None
+    try:
+        s = str(value).replace('Z', '+00:00')
+        dt = datetime.fromisoformat(s)
+        return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+    except Exception:
+        return None
+
+
+async def offer_expiry_worker():
+    """Refresh the visible countdown and delete expired offers."""
+    last_minute = {}
+    while True:
+        try:
+            now = datetime.now(timezone.utc)
+            for offer in db.get_pending_offers():
+                exp = _parse_expiry(offer.get('expires_at'))
+                if not exp:
+                    continue
+                remaining = int((exp - now).total_seconds())
+                if remaining <= 0:
+                    db.set_offer_status(offer['id'], STATUS_EXPIRED)
+                    bc_id = offer.get('business_connection_id')
+                    if bc_id and offer.get('message_id'):
+                        try:
+                            await safe(bot.delete_business_messages,
+                                        business_connection_id=bc_id,
+                                        message_ids=[int(offer['message_id'])])
+                        except Exception as e:
+                            log.warning('Could not delete expired offer %s: %s', offer['id'], e)
+                    continue
+
+                minute = remaining // 60
+                if last_minute.get(offer['id']) == minute:
+                    continue
+                last_minute[offer['id']] = minute
+                if not offer.get('message_id'):
+                    continue
+                text, entities = build_offer_text(offer, offer.get('locale') or 'ru', remaining_seconds=remaining)
+                kwargs = dict(
+                    chat_id=offer['message_chat_id'],
+                    message_id=offer['message_id'],
+                    text=text,
+                    reply_markup=offer_keyboard(offer['id'], offer.get('locale') or 'ru'),
+                    entities=entities,
+                    link_preview_options=LinkPreviewOptions(show_above_text=True, prefer_large_media=True),
+                )
+                if offer.get('business_connection_id'):
+                    kwargs['business_connection_id'] = offer['business_connection_id']
+                try:
+                    await safe(bot.edit_message_text, **kwargs)
+                except Exception as e:
+                    # Preview may already be attached; the timer edit itself is still safe to retry next minute.
+                    log.warning('Could not refresh offer %s: %s', offer['id'], e)
+        except Exception:
+            log.exception('Offer expiry worker error')
+        await asyncio.sleep(20)
 
 
 # ───────────────────────── запуск ─────────────────────────
@@ -1218,6 +1291,7 @@ async def main():
         BotCommand(command='help', description='Как пользоваться'),
     ])
     try:
+        asyncio.create_task(offer_expiry_worker())
         await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
     finally:
         await api.close()

@@ -177,6 +177,9 @@ class Database:
                         FROM parser_gifts_legacy''')
                 c.execute('DROP TABLE parser_gifts_legacy')
 
+            # Business connection used to update/delete offer messages after creation.
+            self._add_col(c, 'gift_offers', 'business_connection_id', 'TEXT')
+
             # Безопасные миграции со старых версий: докидываем всё, чего не хватает
             expected = {
                 'users': {'is_banned': 'INTEGER DEFAULT 0', 'is_premium': 'INTEGER DEFAULT 0',
@@ -223,9 +226,16 @@ class Database:
     def get_offer(self, offer_id):
         return self._one('SELECT * FROM gift_offers WHERE id=?', (offer_id,))
 
-    def update_offer_message(self, offer_id, chat_id, message_id):
+    def update_offer_message(self, offer_id, chat_id, message_id, business_connection_id=None):
         with self._db() as c:
-            c.execute('UPDATE gift_offers SET message_chat_id=?, message_id=? WHERE id=?', (chat_id, message_id, offer_id))
+            c.execute('UPDATE gift_offers SET message_chat_id=?, message_id=?, business_connection_id=? WHERE id=?',
+                      (chat_id, message_id, business_connection_id, offer_id))
+
+    def get_pending_offers(self):
+        return self._all(
+            'SELECT * FROM gift_offers WHERE status=? AND expires_at IS NOT NULL ORDER BY id',
+            ('pending',)
+        )
 
     def set_offer_status(self, offer_id, status):
         with self._db() as c:
