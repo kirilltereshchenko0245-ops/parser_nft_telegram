@@ -124,6 +124,11 @@ def transfer_keyboard(offer: dict, locale: str):
 def build_offer_text(offer: dict, locale: str, custom_emoji_id: str | None = None, custom_emoji_alt: str = '🎁'):
     name = gift_title(offer['gift_name'], offer['gift_number'])
     amount = format_amount(offer['amount'], offer['currency'], locale)
+    # Keep the NFT URL as a real HTML link entity. This lets Telegram discover
+    # the preview without forcing LinkPreviewOptions(url=...), which can return
+    # WEBPAGE_URL_INVALID for t.me/nft links in Business messages.
+    gift_url = offer.get('gift_url') or ''
+    preview_link = f'<a href=\"{esc(gift_url)}\">\u200b</a>' if gift_url else ''
     sender = offer.get('seller_username') or str(offer.get('seller_id'))
     if sender and not str(sender).startswith('@') and not str(sender).isdigit():
         sender = '@' + str(sender)
@@ -132,6 +137,7 @@ def build_offer_text(offer: dict, locale: str, custom_emoji_id: str | None = Non
     lead = '🎁'
     if locale == LOCALE_EN:
         text = (
+            (preview_link + '\n' if preview_link else '') +
             f'{lead} <b>Demo Telegram Gift Offer</b>\n'
             f'<b>{esc(name)}</b>\n\n'
             f'<b>DEMO — NOT A REAL TELEGRAM TRANSACTION</b>\n\n'
@@ -140,6 +146,7 @@ def build_offer_text(offer: dict, locale: str, custom_emoji_id: str | None = Non
         )
     else:
         text = (
+            (preview_link + '\n' if preview_link else '') +
             f'{lead} <b>Telegram Gift Offer · DEMO</b>\n'
             f'<b>{esc(name)}</b>\n\n'
             f'⚠️ <b>ДЕМО — НЕ РЕАЛЬНАЯ СДЕЛКА TELEGRAM</b>\n\n'

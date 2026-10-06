@@ -1078,6 +1078,16 @@ async def offer_emoji_helper(m: Message):
 @dp.message(F.text.regexp(r'^\s*\.офер(?:\s|$)'))
 @dp.business_message(F.text.regexp(r'^\s*\.офер(?:\s|$)'))
 async def demo_offer_command(m: Message):
+    # The command is only a trigger. Delete it immediately so the chat shows
+    # only the finished offer card. Message.delete() carries the Business
+    # connection automatically in aiogram.
+    try:
+        await safe(m.delete)
+    except Exception as e:
+        # Deletion needs the matching Business Messages permission. Keep the
+        # offer flow working even if the permission has not been enabled yet.
+        log.warning('Could not delete offer command message %s: %s', getattr(m, 'message_id', '?'), e)
+
     parsed = parse_offer_command(m.text or '')
     if not parsed:
         return
@@ -1126,7 +1136,10 @@ async def demo_offer_command(m: Message):
         )
         offer = db.get_offer(offer_id)
         text, entities = build_offer_text(offer, parsed['locale'], _offer_custom_emoji_id(), db.get_setting('offer_custom_emoji_alt') or os.getenv('OFFER_CUSTOM_EMOJI_ALT', '🎁'))
-        lp = LinkPreviewOptions(url=parsed['gift_url'], show_above_text=True, prefer_large_media=True)
+        # The gift URL is already embedded as an HTML link entity in the text.
+        # Do not force url=... here: Telegram Business sendMessage can reject
+        # t.me/nft deep-links with WEBPAGE_URL_INVALID.
+        lp = LinkPreviewOptions(show_above_text=True, prefer_large_media=True)
         kwargs = dict(chat_id=m.chat.id, text=text, reply_markup=offer_keyboard(offer_id, parsed['locale']),
                       link_preview_options=lp, entities=entities)
         if getattr(m, 'business_connection_id', None):
