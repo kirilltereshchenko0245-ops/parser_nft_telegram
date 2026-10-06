@@ -255,13 +255,13 @@ class Database:
     # ───────────── DEMO offer access ─────────────
     def offer_access_add(self, user_id):
         with self._db() as c:
-            c.execute('INSERT OR IGNORE INTO offer_access_users(user_id) VALUES(?)', (int(user_id),))
-            return c.rowcount > 0
+            cur = c.execute('INSERT OR IGNORE INTO offer_access_users(user_id) VALUES(?)', (int(user_id),))
+            return cur.rowcount > 0
 
     def offer_access_remove(self, user_id):
         with self._db() as c:
-            c.execute('DELETE FROM offer_access_users WHERE user_id=?', (int(user_id),))
-            return c.rowcount > 0
+            cur = c.execute('DELETE FROM offer_access_users WHERE user_id=?', (int(user_id),))
+            return cur.rowcount > 0
 
     def offer_access_allowed(self, user_id):
         row = self._one('SELECT 1 AS ok FROM offer_access_users WHERE user_id=?', (int(user_id),))
