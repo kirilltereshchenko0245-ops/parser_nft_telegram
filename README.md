@@ -113,3 +113,17 @@ SQLite can only remember users across deployments if its file is stored on persi
 - This reduces Telegram history API pressure and makes `FloodWait` much less likely.
 - The parser still excludes the connected parser account and previously seen users.
 - Live NFT cards keep the source chat, and the final summary waits for the scan task to finish.
+
+## DEMO Gift Offers
+
+The project includes a safe DEMO offer simulator. It creates an ordinary bot message with an NFT link preview and Accept/Decline buttons, but it does **not** call Telegram payment methods and never transfers or reserves Stars/Gram.
+
+Examples:
+
+```text
+.офер https://t.me/nft/PartySparkler-140864 150 грам
+.офер ру https://t.me/nft/PartySparkler-140864 4500 зв
+.офер англ https://t.me/nft/PartySparkler-140864 4500 stars
+```
+
+Set `OFFER_HELP_URL` to your Telegr.ph instruction page. For a Telegram custom emoji, send the bot (as the owner) a message containing `.эмодзи` followed by the desired custom emoji. The bot stores its `custom_emoji_id` and uses it in DEMO offer messages.

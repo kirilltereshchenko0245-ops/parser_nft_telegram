@@ -21,6 +21,7 @@ import ui
 from database import Database
 from peek_api import AVAILABLE_MODELS, PeekAPI, gift_url, is_known_model, normalize_model_name, suggest_models
 from parsing import handlers as parser_handlers
+from offer_simulator import (parse_offer_command, offer_help_text, keyboard as offer_keyboard, build_offer_text, accepted_text, declined_text, transfer_keyboard, STATUS_PENDING, STATUS_ACCEPTED, STATUS_DECLINED, STATUS_EXPIRED)
 
 load_dotenv()
 os.makedirs('logs', exist_ok=True)
@@ -1022,6 +1023,155 @@ async def grant(m: Message):
 @dp.message(Command('revoke'))
 async def revoke(m: Message):
     await _admin_cmd(m, 'revoke', lambda u: db.set_premium(u, False), '➖ Premium снят: <code>{uid}</code>.')
+
+
+
+# ───────────────────────── DEMO gift offers ─────────────────────────
+def _offer_custom_emoji_id():
+    return db.get_setting('offer_custom_emoji_id') or os.getenv('OFFER_CUSTOM_EMOJI_ID', '').strip() or None
+
+
+def _offer_target_url(user):
+    if user.username:
+        return f'https://t.me/{user.username}'
+    return f'tg://user?id={user.id}'
+
+
+def _offer_sender_name(user):
+    return user.username or user.first_name or str(user.id)
+
+
+@dp.message(F.text.regexp(r'^\s*\.эмодзи\b'))
+async def offer_emoji_helper(m: Message):
+    if not is_admin(m.from_user.id):
+        return
+    entities = m.entities or []
+    found = [e for e in entities if e.type == 'custom_emoji' and e.custom_emoji_id]
+    if not found:
+        return await m.answer(
+            '🧩 <b>Как получить Premium Emoji ID</b>\n\n'
+            'Отправьте мне сообщение, содержащее нужный Telegram Premium emoji, '
+            'с командой <code>.эмодзи</code> перед ним.\n\n'
+            'Пример: <code>.эмодзи 🎁</code> (где 🎁 — именно custom emoji, а не обычный emoji).'
+        )
+    entity = found[0]
+    emoji_id = str(entity.custom_emoji_id)
+    # MessageEntity offsets are UTF-16 code units, not Python code points.
+    raw = m.text or ''
+    def _utf16_slice(value, start, length):
+        data = value.encode('utf-16-le')
+        part = data[start * 2:(start + length) * 2]
+        return part.decode('utf-16-le', errors='ignore') or '🎁'
+    alt = _utf16_slice(raw, entity.offset, entity.length)
+    db.set_setting('offer_custom_emoji_id', emoji_id)
+    db.set_setting('offer_custom_emoji_alt', alt)
+    await m.answer(
+        '✅ <b>Custom Emoji сохранён.</b>\n\n'
+        f'ID: <code>{emoji_id}</code>\n'
+        f'Альтернатива: {ui.esc(alt)}\n\n'
+        'Теперь он будет использоваться в DEMO-оферах.'
+    )
+
+
+@dp.message(F.text.regexp(r'^\s*\.офер(?:\s|$)'))
+async def demo_offer_command(m: Message):
+    parsed = parse_offer_command(m.text or '')
+    if not parsed:
+        return
+
+    # In a Telegram Business chat, from_user is the customer. Verify that the
+    # Business Connection belongs to OWNER_ID before allowing offer creation.
+    seller_username = os.getenv('OFFER_SELLER_USERNAME', '').strip().lstrip('@') or None
+    seller_id = OWNER_ID
+    if getattr(m, 'business_connection_id', None):
+        try:
+            bc = await safe(bot.get_business_connection, m.business_connection_id)
+            if int(bc.user.id) != OWNER_ID:
+                return await m.answer('❌ Эта Business-связь не принадлежит владельцу бота.')
+            seller_username = seller_username or bc.user.username
+        except Exception as e:
+            log.exception('Business connection lookup failed')
+            return await m.answer(f'❌ Не удалось проверить Business-связь: <code>{ui.esc(str(e)[:220])}</code>')
+    elif not is_admin(m.from_user.id):
+        return await m.answer('❌ Для DEMO-оферов используй подключённый Telegram Business-чат владельца.')
+
+    if parsed.get('error'):
+        return await m.answer(offer_help_text(parsed.get('locale', 'ru')))
+
+    # In a Business chat, the chat itself is the customer peer. This also works
+    # when the command is sent by the business owner as an outgoing message: from_user
+    # may then be the owner, while m.chat identifies the buyer.
+    buyer = m.chat
+    if not buyer or not buyer.id:
+        return await m.answer('❌ Не удалось определить получателя офера.')
+    buyer_id = int(buyer.id)
+    buyer_username = getattr(buyer, 'username', None)
+    buyer_url = f'https://t.me/{buyer_username}' if buyer_username else f'tg://user?id={buyer_id}'
+    try:
+        offer_id = db.create_offer(
+            seller_id=seller_id,
+            seller_username=seller_username,
+            buyer_id=buyer_id,
+            buyer_username=buyer_username,
+            buyer_url=buyer_url,
+            gift_name=parsed['gift_name'],
+            gift_number=parsed['gift_number'],
+            gift_url=parsed['gift_url'],
+            amount=parsed['amount'],
+            currency=parsed['currency'],
+            locale=parsed['locale'],
+        )
+        offer = db.get_offer(offer_id)
+        text, entities = build_offer_text(offer, parsed['locale'], _offer_custom_emoji_id(), db.get_setting('offer_custom_emoji_alt') or os.getenv('OFFER_CUSTOM_EMOJI_ALT', '🎁'))
+        lp = LinkPreviewOptions(url=parsed['gift_url'], show_above_text=True, prefer_large_media=True)
+        kwargs = dict(chat_id=m.chat.id, text=text, reply_markup=offer_keyboard(offer_id, parsed['locale']),
+                      link_preview_options=lp, entities=entities)
+        if getattr(m, 'business_connection_id', None):
+            kwargs['business_connection_id'] = m.business_connection_id
+        sent = await safe(bot.send_message, **kwargs)
+        db.update_offer_message(offer_id, sent.chat.id, sent.message_id)
+        await audit('Создан DEMO-офер', seller_id,
+                    f'Offer: <code>{offer_id}</code> · Buyer: <code>{buyer_id}</code> · Gift: <code>{ui.esc(parsed["gift_name"])}-{parsed["gift_number"]}</code>')
+    except Exception as e:
+        log.exception('Failed to create demo offer')
+        await m.answer(f'❌ Не удалось создать DEMO-офер: <code>{ui.esc(str(e)[:300])}</code>')
+
+
+@dp.callback_query(F.data.regexp(r'^of:(accept|decline):\d+$'))
+async def demo_offer_action(c: CallbackQuery):
+    try:
+        _, action, raw_id = c.data.split(':', 2)
+        offer_id = int(raw_id)
+    except Exception:
+        return await c.answer('Некорректный офер', show_alert=True)
+    offer = db.get_offer(offer_id)
+    if not offer:
+        return await c.answer('Офер не найден', show_alert=True)
+    if int(offer['buyer_id']) != int(c.from_user.id):
+        return await c.answer('Этот офер предназначен другому пользователю.', show_alert=True)
+    if offer['status'] != STATUS_PENDING:
+        return await c.answer('Офер уже обработан.', show_alert=True)
+    new_status = STATUS_ACCEPTED if action == 'accept' else STATUS_DECLINED
+    db.set_offer_status(offer_id, new_status)
+    locale = offer['locale'] or 'ru'
+    if new_status == STATUS_ACCEPTED:
+        text = accepted_text(offer, locale)
+        markup = transfer_keyboard(offer, locale)
+    else:
+        text = declined_text(offer, locale)
+        markup = None
+    try:
+        kwargs = dict(chat_id=c.message.chat.id, message_id=c.message.message_id, text=text, reply_markup=markup)
+        if getattr(c, 'business_connection_id', None):
+            kwargs['business_connection_id'] = c.business_connection_id
+        await safe(bot.edit_message_text, **kwargs)
+    except Exception:
+        # If the message cannot be edited, keep the state in DB and send a visible result.
+        kwargs = dict(chat_id=c.message.chat.id, text=text, reply_markup=markup)
+        if getattr(c, 'business_connection_id', None):
+            kwargs['business_connection_id'] = c.business_connection_id
+        await safe(bot.send_message, **kwargs)
+    await c.answer('Принято' if action == 'accept' else 'Отклонено')
 
 
 # ───────────────────────── запуск ─────────────────────────

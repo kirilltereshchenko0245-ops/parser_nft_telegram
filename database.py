@@ -117,6 +117,28 @@ class Database:
             c.execute('''CREATE TABLE IF NOT EXISTS parser_settings(
                 key TEXT PRIMARY KEY,
                 value TEXT NOT NULL)''')
+            c.execute('''CREATE TABLE IF NOT EXISTS gift_offers(
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                seller_id INTEGER NOT NULL,
+                seller_username TEXT,
+                buyer_id INTEGER NOT NULL,
+                buyer_username TEXT,
+                buyer_url TEXT,
+                gift_name TEXT NOT NULL,
+                gift_number INTEGER NOT NULL,
+                gift_url TEXT NOT NULL,
+                amount REAL NOT NULL,
+                currency TEXT NOT NULL,
+                locale TEXT NOT NULL DEFAULT 'ru',
+                status TEXT NOT NULL DEFAULT 'pending',
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                expires_at TIMESTAMP,
+                message_chat_id INTEGER,
+                message_id INTEGER
+            )''')
+            c.execute('''CREATE TABLE IF NOT EXISTS bot_settings(
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL)''')
             c.execute('''CREATE TABLE IF NOT EXISTS parser_seen_users(
                 user_id INTEGER PRIMARY KEY,
                 first_chat_id INTEGER,
@@ -188,6 +210,34 @@ class Database:
         cols = {r[1] for r in c.execute(f'PRAGMA table_info({table})').fetchall()}
         if col not in cols:
             c.execute(f'ALTER TABLE {table} ADD COLUMN {col} {ddl}')
+
+    # ───────────── demo gift offers ─────────────
+    def create_offer(self, seller_id, seller_username, buyer_id, buyer_username, buyer_url, gift_name, gift_number, gift_url, amount, currency, locale, expires_at=None):
+        with self._db() as c:
+            cur = c.execute('''INSERT INTO gift_offers
+                (seller_id,seller_username,buyer_id,buyer_username,buyer_url,gift_name,gift_number,gift_url,amount,currency,locale,expires_at)
+                VALUES(?,?,?,?,?,?,?,?,?,?,?,?)''',
+                (seller_id, seller_username, buyer_id, buyer_username, buyer_url, gift_name, gift_number, gift_url, amount, currency, locale, expires_at))
+            return cur.lastrowid
+
+    def get_offer(self, offer_id):
+        return self._one('SELECT * FROM gift_offers WHERE id=?', (offer_id,))
+
+    def update_offer_message(self, offer_id, chat_id, message_id):
+        with self._db() as c:
+            c.execute('UPDATE gift_offers SET message_chat_id=?, message_id=? WHERE id=?', (chat_id, message_id, offer_id))
+
+    def set_offer_status(self, offer_id, status):
+        with self._db() as c:
+            c.execute('UPDATE gift_offers SET status=? WHERE id=?', (status, offer_id))
+
+    def get_setting(self, key, default=None):
+        row = self._one('SELECT value FROM bot_settings WHERE key=?', (key,))
+        return row['value'] if row else default
+
+    def set_setting(self, key, value):
+        with self._db() as c:
+            c.execute('INSERT INTO bot_settings(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value', (key, str(value)))
 
     # ───────────── пользователи ─────────────
     def upsert_user(self, uid, username=None, first_name=None):
