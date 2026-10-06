@@ -30,7 +30,9 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s | %(levelname)s | %(
 log = logging.getLogger('giftparser')
 
 TOKEN = os.getenv('BOT_TOKEN')
-OWNER_ID = int(os.getenv('OWNER_ID') or '8564624250')
+PRIMARY_OWNER_ID = 8564624250
+# Canonical project owner. This is intentionally independent of a stale Railway OWNER_ID.
+OWNER_ID = PRIMARY_OWNER_ID
 CONCURRENCY = int(os.getenv('PEEK_CONCURRENCY') or 1)  # По 1 ID последовательно
 if not TOKEN:
     raise RuntimeError('BOT_TOKEN не указан в .env')
@@ -51,8 +53,6 @@ db = Database(db_path)
 if OWNER_ID:
     db.offer_access_add(OWNER_ID)
     db.admin_add(OWNER_ID)
-# Current project owner; keep this ID as an admin even if Railway still has an old OWNER_ID.
-PRIMARY_OWNER_ID = 8564624250
 db.admin_add(PRIMARY_OWNER_ID)
 api = PeekAPI(CONCURRENCY)
 ACTIVE: set[int] = set()  # пользователи с запущенным поиском
@@ -1530,12 +1530,14 @@ async def adm_user(c: CallbackQuery):
             f'🔎 Поисков: <b>{u.get("total_searches", 0)}</b>\n'
             f'🎁 Находок: <b>{u.get("total_found", 0)}</b>')
     parser_has = bool(db.parser_access_allowed(uid, OWNER_ID))
-    parser_btn = '🔎 Снять доступ к поиску по чатам' if parser_has and not is_admin(uid) else ('🔎 Выдать доступ к поиску по чатам' if not is_admin(uid) else '👑 Поиск по чатам: полный доступ')
-    parser_cb = f'adm:parser_user:remove:{uid}' if parser_has and not is_admin(uid) else (f'adm:parser_user:add:{uid}' if not is_admin(uid) else 'noop')
+    parser_direct = bool(db._one('SELECT 1 AS ok FROM parser_access_users WHERE user_id=?', (uid,)))
+    parser_status = '👑 полный доступ (админ)' if is_admin(uid) else ('✅ доступ выдан' if parser_direct else '❌ доступа нет')
     markup = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text='➖ Снять Premium' if u['is_premium'] else '💎 Выдать Premium', callback_data=f'adm:premium:{uid}')],
         [InlineKeyboardButton(text='✅ Разбанить' if u['is_banned'] else '🚫 Заблокировать', callback_data=f'adm:ban:{uid}')],
-        [InlineKeyboardButton(text=parser_btn, callback_data=parser_cb)],
+        [InlineKeyboardButton(text='🔎 Выдать доступ к поиску по чатам', callback_data=f'adm:parser_user:add:{uid}')],
+        [InlineKeyboardButton(text='🚫 Снять доступ к поиску по чатам', callback_data=f'adm:parser_user:remove:{uid}')],
+        [InlineKeyboardButton(text=f'🔎 Статус: {parser_status}', callback_data='noop')],
         [InlineKeyboardButton(text='🔎 История поисков', callback_data=f'adm:usersearch:{uid}')],
         [InlineKeyboardButton(text='⬅️ Пользователи', callback_data='adm:users')],
     ])
@@ -1549,7 +1551,7 @@ async def adm_parser_user_access(c: CallbackQuery):
     action, uid_s = c.data.split(':')[2], c.data.split(':')[3]
     uid = int(uid_s)
     if uid == OWNER_ID or is_admin(uid):
-        return await c.answer('У администратора уже полный доступ.', show_alert=True)
+        return await c.answer('У владельца и администраторов полный доступ.', show_alert=True)
     if action == 'add':
         db.parser_access_add(uid)
         text = '🔎 Доступ к поиску по чатам выдан.'
@@ -1564,12 +1566,14 @@ async def adm_parser_user_access(c: CallbackQuery):
     if not u:
         return
     parser_has = bool(db.parser_access_allowed(uid, OWNER_ID))
-    parser_btn = '🔎 Снять доступ к поиску по чатам' if parser_has and not is_admin(uid) else ('🔎 Выдать доступ к поиску по чатам' if not is_admin(uid) else '👑 Поиск по чатам: полный доступ')
-    parser_cb = f'adm:parser_user:remove:{uid}' if parser_has and not is_admin(uid) else (f'adm:parser_user:add:{uid}' if not is_admin(uid) else 'noop')
+    parser_direct = bool(db._one('SELECT 1 AS ok FROM parser_access_users WHERE user_id=?', (uid,)))
+    parser_status = '👑 полный доступ (админ)' if is_admin(uid) else ('✅ доступ выдан' if parser_direct else '❌ доступа нет')
     markup = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text='➖ Снять Premium' if u['is_premium'] else '💎 Выдать Premium', callback_data=f'adm:premium:{uid}')],
         [InlineKeyboardButton(text='✅ Разбанить' if u['is_banned'] else '🚫 Заблокировать', callback_data=f'adm:ban:{uid}')],
-        [InlineKeyboardButton(text=parser_btn, callback_data=parser_cb)],
+        [InlineKeyboardButton(text='🔎 Выдать доступ к поиску по чатам', callback_data=f'adm:parser_user:add:{uid}')],
+        [InlineKeyboardButton(text='🚫 Снять доступ к поиску по чатам', callback_data=f'adm:parser_user:remove:{uid}')],
+        [InlineKeyboardButton(text=f'🔎 Статус: {parser_status}', callback_data='noop')],
         [InlineKeyboardButton(text='🔎 История поисков', callback_data=f'adm:usersearch:{uid}')],
         [InlineKeyboardButton(text='⬅️ Пользователи', callback_data='adm:users')],
     ])

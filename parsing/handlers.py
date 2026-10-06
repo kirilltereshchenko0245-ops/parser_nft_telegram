@@ -36,7 +36,7 @@ def _parser_access_allowed(db, uid):
     # Единая проверка: владелец/админы всегда имеют доступ; при закрытом
     # режиме доступ выдаётся адресно через админку. Старая привязка только
     # к владельцу parser-сессии больше не блокирует выданных пользователей.
-    owner_id = int(os.getenv('OWNER_ID') or '8564624250')
+    owner_id = 8564624250
     return db.parser_access_allowed(uid, owner_id)
 
 
@@ -81,9 +81,7 @@ async def restore_saved_parser_session(db):
             me = await probe.get_me()
             if not me:
                 raise RuntimeError('Не удалось получить профиль Telegram')
-            owner_id = int(os.getenv('OWNER_ID') or 0)
-            if owner_id <= 0:
-                raise RuntimeError('OWNER_ID не настроен')
+            owner_id = 8564624250
             db.save_parser_session(owner_id, env_session, me.get('phone'), me.get('username'), me.get('user_id'), me.get('first_name'))
             await probe.disconnect()
             session = db.get_parser_session()
