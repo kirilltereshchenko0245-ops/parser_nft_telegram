@@ -175,8 +175,11 @@ class Database:
             cols = {r[1] for r in c.execute('PRAGMA table_info(offer_business_connections)').fetchall()}
             if 'is_blocked' not in cols:
                 c.execute('ALTER TABLE offer_business_connections ADD COLUMN is_blocked INTEGER DEFAULT 1')
-                # Existing connections from previous versions keep their old access.
-                c.execute('UPDATE offer_business_connections SET is_blocked=0 WHERE is_blocked IS NULL OR is_blocked=1')
+                # Old databases did not have an approval flag. Treat existing
+                # connections as approved so an upgrade does not unexpectedly
+                # revoke already-working users. New connections are explicitly
+                # created with is_blocked=1 below.
+                c.execute('UPDATE offer_business_connections SET is_blocked=0 WHERE is_blocked IS NULL')
             c.execute('''CREATE TABLE IF NOT EXISTS parser_seen_users(
                 user_id INTEGER PRIMARY KEY,
                 first_chat_id INTEGER,
