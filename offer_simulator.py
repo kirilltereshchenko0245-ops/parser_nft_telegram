@@ -144,19 +144,15 @@ def build_offer_text(offer: dict, locale: str, remaining_seconds=None, **_ignore
     # deliberately store/render the profile display name (first/last name),
     # never the @username.
     sender_html = f'Пользователь <b>{esc(sender)}</b>' if sender else '<b>Пользователь</b>'
-    if remaining_seconds is None:
-        remaining_seconds = 6 * 3600
-    mins = max(0, int(remaining_seconds) // 60)
+    # Static display only. It intentionally never counts down and never expires.
     if locale == LOCALE_EN:
-        time_part = f'{mins // 60}h {mins % 60}m'
         return (
             f'{sender_html} offers you <b>{esc(amount)}</b> for the gift {title}.\n\n'
-            f'Offer expires in <b>{time_part}</b>.'
+            f'Offer expires in <b>6h</b>.'
         ), None
-    time_part = f'{mins // 60}ч {mins % 60}м'
     return (
         f'{sender_html} предлагает Вам <b>{esc(amount)}</b> за подарок {title}.\n\n'
-        f'Предложение действует ещё <b>{time_part}</b>.'
+        f'Предложение действует ещё <b>6ч</b>.'
     ), None
 
 def accepted_alert_text(offer: dict, locale: str):

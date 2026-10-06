@@ -54,6 +54,9 @@ ACTIVE: set[int] = set()  # пользователи с запущенным п�
 OFFER_ACTION_LOCKS: dict[int, asyncio.Lock] = {}
 OFFER_CHAT_LOCKS: dict[int, asyncio.Lock] = {}
 OFFER_CHAT_LAST_EDIT_AT: dict[int, float] = {}
+OFFER_CHAT_SEND_LOCKS: dict[int, asyncio.Lock] = {}
+BUSINESS_SELLER_NAME_CACHE: dict[str, str] = {}
+BUSINESS_OWNER_ID_CACHE: dict[str, int] = {}
 
 # Подключаем router парсера
 dp.include_router(parser_handlers.router)
@@ -224,6 +227,70 @@ async def _edit_offer_message(message: Message, text: str, markup=None, business
         result = await safe(bot.edit_message_text, **kwargs)
         OFFER_CHAT_LAST_EDIT_AT[chat_id] = loop.time()
         return result
+
+
+async def _send_offer_message(message: Message, text: str, markup=None, business_connection_id=None):
+    """Send the offer as a new message, without editMessageText.
+
+    Business chats were hitting Telegram's edit flood limit. Sending the final
+    offer avoids that edit path completely. Different chats can send in parallel;
+    only repeated sends to the same chat are serialized.
+    """
+    chat_id = int(message.chat.id)
+    lock = OFFER_CHAT_SEND_LOCKS.get(chat_id)
+    if lock is None:
+        lock = asyncio.Lock()
+        OFFER_CHAT_SEND_LOCKS[chat_id] = lock
+    async with lock:
+        kwargs = dict(
+            chat_id=message.chat.id,
+            text=text,
+            reply_markup=markup,
+            link_preview_options=LinkPreviewOptions(show_above_text=True, prefer_large_media=True),
+        )
+        bc_id = business_connection_id or getattr(message, 'business_connection_id', None)
+        if bc_id:
+            kwargs['business_connection_id'] = bc_id
+        return await safe(bot.send_message, **kwargs)
+
+
+async def _delete_offer_command_message(message: Message, business_connection_id=None):
+    """Delete the original .офер message after the offer is safely sent."""
+    bc_id = business_connection_id or getattr(message, 'business_connection_id', None)
+    if bc_id:
+        return await safe(bot.delete_business_messages, business_connection_id=bc_id, message_ids=[message.message_id])
+    return await safe(bot.delete_message, chat_id=message.chat.id, message_id=message.message_id)
+
+
+async def _business_seller_display_name(business_connection_id):
+    """Resolve and cache the connected account's profile display name.
+
+    Never use the @username for the offer text.
+    """
+    if business_connection_id in BUSINESS_SELLER_NAME_CACHE:
+        return BUSINESS_SELLER_NAME_CACHE[business_connection_id]
+    try:
+        bc = await safe(bot.get_business_connection, business_connection_id)
+        owner = getattr(bc, 'user', None) if bc else None
+        owner_id = int(getattr(owner, 'id', 0) or 0)
+        if owner_id:
+            BUSINESS_OWNER_ID_CACHE[business_connection_id] = owner_id
+        first = (getattr(owner, 'first_name', None) or '').strip()
+        last = (getattr(owner, 'last_name', None) or '').strip()
+        name = ' '.join(x for x in (first, last) if x).strip()
+        if not name and owner:
+            try:
+                chat = await safe(bot.get_chat, int(owner.id))
+                first = (getattr(chat, 'first_name', None) or '').strip()
+                last = (getattr(chat, 'last_name', None) or '').strip()
+                name = ' '.join(x for x in (first, last) if x).strip()
+            except Exception:
+                pass
+        if name:
+            BUSINESS_SELLER_NAME_CACHE[business_connection_id] = name
+        return name or None
+    except Exception:
+        return None
 
 
 # ───────────────────────── аудит / логи ─────────────────────────
@@ -1317,63 +1384,35 @@ async def demo_offer_command(m: Message):
         return
 
     sender_id = int(m.from_user.id) if m.from_user else 0
-    if not db.offer_access_allowed(sender_id):
+    business_connection_id = getattr(m, 'business_connection_id', None)
+
+    # In Business mode the allowlist may contain either the sender ID or the
+    # connected business owner's ID. This keeps admin-granted users working.
+    allowed_sender = db.offer_access_allowed(sender_id)
+    seller_id = OWNER_ID
+    seller_display_name = None
+    if business_connection_id:
+        seller_display_name = await _business_seller_display_name(business_connection_id)
+        business_owner_id = BUSINESS_OWNER_ID_CACHE.get(business_connection_id, int(OWNER_ID))
+        if business_owner_id and business_owner_id != int(OWNER_ID):
+            log.info('Ignoring Business .офер for unknown owner=%s', business_owner_id)
+            return
+        if business_owner_id:
+            seller_id = business_owner_id
+        allowed_owner = bool(business_owner_id and db.offer_access_allowed(business_owner_id))
+        if not (allowed_sender or allowed_owner):
+            log.info('Ignoring unauthorized Business .офер sender=%s owner=%s', sender_id, business_owner_id)
+            return
+    elif not allowed_sender:
         log.info('Ignoring .офер from unauthorized user %s', sender_id)
         return
 
-    business_connection_id = getattr(m, 'business_connection_id', None)
-    seller_id = OWNER_ID
-    seller_display_name = None
+    if not seller_display_name:
+        seller_display_name = os.getenv('OFFER_SELLER_NAME', '').strip() or 'Пользователь'
 
-    if business_connection_id:
-        try:
-            bc = await safe(bot.get_business_connection, business_connection_id)
-            if not bc or not getattr(bc, 'is_enabled', True):
-                return
-            business_owner = getattr(bc, 'user', None)
-            business_owner_id = int(getattr(business_owner, 'id', 0) or 0)
-            if business_owner_id != int(OWNER_ID):
-                log.info('Ignoring Business .офер for unknown owner=%s', business_owner_id)
-                return
-            # The admin-panel allowlist controls who may issue .офер.
-            # The seller displayed in the offer is ALWAYS the connected
-            # business account's profile name, never its @username.
-            seller_id = business_owner_id
-            if business_owner:
-                first = (getattr(business_owner, 'first_name', None) or '').strip()
-                last = (getattr(business_owner, 'last_name', None) or '').strip()
-                seller_display_name = ' '.join(x for x in (first, last) if x).strip() or None
-            if not seller_display_name:
-                try:
-                    owner_chat = await safe(bot.get_chat, business_owner_id)
-                    first = (getattr(owner_chat, 'first_name', None) or '').strip()
-                    last = (getattr(owner_chat, 'last_name', None) or '').strip()
-                    seller_display_name = ' '.join(x for x in (first, last) if x).strip() or None
-                except Exception:
-                    pass
-        except Exception:
-            log.exception('Business connection lookup failed')
-            return
-    else:
-        try:
-            owner_chat = await safe(bot.get_chat, OWNER_ID)
-            first = (getattr(owner_chat, 'first_name', None) or '').strip()
-            last = (getattr(owner_chat, 'last_name', None) or '').strip()
-            seller_display_name = ' '.join(x for x in (first, last) if x).strip() or None
-        except Exception:
-            pass
-
-    seller_display_name = seller_display_name or os.getenv('OFFER_SELLER_NAME', '').strip() or 'Пользователь'
-
-    # Не удаляем команду отдельным API-вызовом: в Business-чате Telegram может
-    # вернуть MESSAGE_NOT_FOUND. Вместо этого редактируем исходное сообщение
-    # прямо на месте — в чате остаётся ровно ОДНО сообщение офера.
+    # Invalid syntax: do not edit the user's message. Editing is the operation
+    # that caused the long Telegram flood waits. Just leave the original text.
     if parsed.get('error'):
-        help_text = offer_help_text(parsed.get('locale', 'ru'))
-        try:
-            await _edit_offer_message(m, help_text, business_connection_id=business_connection_id)
-        except Exception as e:
-            log.warning('Could not edit invalid offer command %s: %s', getattr(m, 'message_id', '?'), e)
         return
 
     buyer = m.chat
@@ -1382,11 +1421,11 @@ async def demo_offer_command(m: Message):
     buyer_id = int(buyer.id)
     buyer_username = getattr(buyer, 'username', None)
     buyer_url = f'https://t.me/{buyer_username}' if buyer_username else f'tg://user?id={buyer_id}'
-    expires_at = (datetime.now(timezone.utc) + timedelta(hours=6)).isoformat()
+    # Offer lifetime is intentionally unlimited in this DEMO.
+    # The text shows a static "6ч", but there is no countdown and no auto-expiry.
+    expires_at = None
 
     try:
-        # Профиль берём в момент создания офера. Поэтому смена выбранного профиля
-        # в админке применяется к следующему оферу без перезапуска бота.
         active_profile = db.offer_profile_active()
         transfer_profile_url = active_profile['url'] if active_profile else buyer_url
         offer_id = db.create_offer(
@@ -1397,21 +1436,29 @@ async def demo_offer_command(m: Message):
             transfer_profile_url=transfer_profile_url,
         )
         offer = db.get_offer(offer_id)
-        text, entities = build_offer_text(offer, parsed['locale'], remaining_seconds=6*3600)
+        text, _ = build_offer_text(offer, parsed['locale'])
         markup = offer_keyboard(offer_id, parsed['locale'])
-        # Важно: редактируем исходное сообщение .офер, а не отправляем новое.
-        # Это одновременно убирает дубликат и сильно снижает риск SendMessage flood.
-        sent = await _edit_offer_message(m, text, markup, business_connection_id=business_connection_id)
-        db.update_offer_message(offer_id, m.chat.id, m.message_id, business_connection_id)
-        log.info('Created DEMO offer %s in-place from message %s', offer_id, m.message_id)
+
+        # IMPORTANT: send first, then delete the command. We completely avoid
+        # editMessageText for offers, because this chat was being rate-limited on
+        # that method and Telegram showed the outgoing command as a spinning clock.
+        sent = await _send_offer_message(m, text, markup, business_connection_id=business_connection_id)
+        sent_chat_id = int(getattr(getattr(sent, 'chat', None), 'id', m.chat.id))
+        sent_message_id = int(getattr(sent, 'message_id', 0) or 0)
+        db.update_offer_message(offer_id, sent_chat_id, sent_message_id, business_connection_id)
+        try:
+            await _delete_offer_command_message(m, business_connection_id=business_connection_id)
+        except Exception as delete_error:
+            log.warning('Could not delete offer command %s after sending offer %s: %s', getattr(m, 'message_id', '?'), offer_id, delete_error)
+        log.info('Created DEMO offer %s by sending new message; source command=%s', offer_id, getattr(m, 'message_id', '?'))
     except TelegramRetryAfter as e:
         if 'offer_id' in locals():
             db.set_offer_status(offer_id, STATUS_EXPIRED)
-        log.warning('Offer %s was not rendered because Telegram flood control is active: retry_after=%s', locals().get('offer_id'), getattr(e, 'retry_after', '?'))
-    except Exception as e:
+        log.warning('Offer %s was not sent: Telegram flood control retry_after=%s', locals().get('offer_id'), getattr(e, 'retry_after', '?'))
+    except Exception:
         if 'offer_id' in locals():
             db.set_offer_status(offer_id, STATUS_EXPIRED)
-        log.exception('Failed to create/render demo offer')
+        log.exception('Failed to create/send demo offer')
 
 
 @dp.callback_query(F.data.regexp(r'^of:(accept|decline):\d+$'))
@@ -1430,52 +1477,52 @@ async def demo_offer_action(c: CallbackQuery):
         if offer['status'] != STATUS_PENDING:
             return await c.answer('Офер уже обработан.', show_alert=True)
 
-        expires = _parse_expiry(offer.get('expires_at'))
-        if expires and datetime.now(timezone.utc) >= expires:
-            db.set_offer_status(offer_id, STATUS_EXPIRED)
-            try:
-                if c.message:
-                    bc_id = offer.get('business_connection_id') or getattr(c.message, 'business_connection_id', None)
-                    if bc_id:
-                        await safe(bot.delete_business_messages, business_connection_id=bc_id, message_ids=[c.message.message_id])
-                    else:
-                        await safe(bot.delete_message, chat_id=c.message.chat.id, message_id=c.message.message_id)
-            except Exception:
-                pass
-            return await c.answer('Срок действия офера истёк.', show_alert=True)
-
         locale = offer['locale'] or 'ru'
         bc_id = offer.get('business_connection_id') or (getattr(c.message, 'business_connection_id', None) if c.message else None)
         if not c.message:
             return await c.answer('Сообщение офера недоступно.', show_alert=True)
 
+        old_message = c.message
         if action == 'accept':
-            # Сначала реально меняем сообщение. Только после успешного edit фиксируем
-            # статус. Поэтому первый клик больше не даст alert «успешно принято»,
-            # оставив старую кнопку из-за FloodWait.
-            try:
-                await _edit_offer_message(c.message, final_offer_text(offer, locale), transfer_keyboard(offer, locale), bc_id)
-            except TelegramRetryAfter as e:
-                log.warning('Accept offer %s blocked by flood control: retry_after=%s', offer_id, getattr(e, 'retry_after', '?'))
-                return await c.answer('Telegram временно ограничил обновление сообщения. Попробуйте позже.', show_alert=True)
-            except Exception as e:
-                log.exception('Could not edit accepted offer message %s: %s', offer_id, e)
-                return await c.answer('Не удалось обновить офер. Попробуйте ещё раз.', show_alert=True)
-            db.set_offer_status(offer_id, STATUS_ACCEPTED)
-            return await c.answer(accepted_alert_text(offer, locale), show_alert=True)
+            new_text = final_offer_text(offer, locale)
+            new_markup = transfer_keyboard(offer, locale)
+            alert = accepted_alert_text(offer, locale)
+            new_status = STATUS_ACCEPTED
+        else:
+            new_text = declined_text(offer, locale)
+            new_markup = None
+            alert = None
+            new_status = STATUS_DECLINED
 
-        # Отказ тоже делаем редактированием существующего сообщения — без второго
-        # SendMessage в тот же чат, чтобы не создавать новый flood.
+        # Answer the callback immediately so Telegram never leaves the button
+        # spinning while we perform the single state-changing API request.
         try:
-            await _edit_offer_message(c.message, declined_text(offer, locale), None, bc_id)
+            await c.answer(alert, show_alert=True) if alert else await c.answer()
+        except Exception:
+            pass
+
+        # One edit per user action. There is NO background countdown editing.
+        # This is safe compared with the old minute-by-minute EditMessageText loop.
+        try:
+            kwargs = dict(
+                chat_id=old_message.chat.id,
+                message_id=old_message.message_id,
+                text=new_text,
+                reply_markup=new_markup,
+                link_preview_options=LinkPreviewOptions(show_above_text=True, prefer_large_media=True),
+            )
+            if bc_id:
+                kwargs['business_connection_id'] = bc_id
+            await safe(bot.edit_message_text, **kwargs)
         except TelegramRetryAfter as e:
-            log.warning('Decline offer %s blocked by flood control: retry_after=%s', offer_id, getattr(e, 'retry_after', '?'))
-            return await c.answer('Telegram временно ограничил обновление сообщения. Попробуйте позже.', show_alert=True)
-        except Exception as e:
-            log.exception('Could not edit declined offer %s: %s', offer_id, e)
-            return await c.answer('Не удалось обновить офер. Попробуйте ещё раз.', show_alert=True)
-        db.set_offer_status(offer_id, STATUS_DECLINED)
-        await c.answer()
+            log.warning('Could not edit %s offer %s: flood retry_after=%s', action, offer_id, getattr(e, 'retry_after', '?'))
+            return
+        except Exception:
+            log.exception('Could not edit offer %s after %s', offer_id, action)
+            return
+
+        db.set_offer_status(offer_id, new_status)
+
 
 def _parse_expiry(value):
     if not value:
@@ -1488,31 +1535,8 @@ def _parse_expiry(value):
         return None
 
 
-async def offer_expiry_worker():
-    """Expire offers and delete them; never edit countdowns in the background."""
-    while True:
-        try:
-            now = datetime.now(timezone.utc)
-            for offer in db.get_pending_offers():
-                exp = _parse_expiry(offer.get('expires_at'))
-                if not exp or now < exp:
-                    continue
-                db.set_offer_status(offer['id'], STATUS_EXPIRED)
-                bc_id = offer.get('business_connection_id')
-                if bc_id and offer.get('message_id'):
-                    try:
-                        await safe(
-                            bot.delete_business_messages,
-                            business_connection_id=bc_id,
-                            message_ids=[int(offer['message_id'])],
-                        )
-                    except TelegramRetryAfter as e:
-                        log.warning('Could not delete expired offer %s: flood retry_after=%s', offer['id'], getattr(e, 'retry_after', '?'))
-                    except Exception as e:
-                        log.warning('Could not delete expired offer %s: %s', offer['id'], e)
-        except Exception:
-            log.exception('Offer expiry worker error')
-        await asyncio.sleep(30)
+
+# No offer expiry worker: offers are intentionally persistent in the DEMO.
 
 
 # ───────────────────────── запуск ─────────────────────────
@@ -1528,18 +1552,13 @@ async def main():
     except Exception:
         log.exception('Failed to restore saved parser session')
 
-    try:
-        await audit('Логирование подключено', None, f'Канал: <code>{LOG_CHANNEL_ID}</code>')
-        log.info('Log channel configured: %s', LOG_CHANNEL_ID)
-    except Exception as e:
-        log.error('Cannot write to log channel %s. Add bot as channel admin with permission to post messages. Error: %r', LOG_CHANNEL_ID, e)
+    log.info('Log channel configured: %s (startup audit disabled to avoid unnecessary SendMessage)', LOG_CHANNEL_ID)
     await bot.set_my_commands([
         BotCommand(command='start', description='Главное меню'),
         BotCommand(command='stop', description='Остановить текущий поиск'),
         BotCommand(command='help', description='Как пользоваться'),
     ])
     try:
-        asyncio.create_task(offer_expiry_worker())
         await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
     finally:
         await api.close()
