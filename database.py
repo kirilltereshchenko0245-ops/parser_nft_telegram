@@ -155,6 +155,11 @@ class Database:
                 url TEXT NOT NULL,
                 is_active INTEGER DEFAULT 0,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)''')
+            c.execute('''CREATE TABLE IF NOT EXISTS offer_user_profiles(
+                user_id INTEGER PRIMARY KEY,
+                name TEXT NOT NULL,
+                url TEXT NOT NULL,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)''')
             c.execute('''CREATE TABLE IF NOT EXISTS offer_business_connections(
                 connection_id TEXT PRIMARY KEY,
                 user_id INTEGER NOT NULL,
@@ -162,7 +167,16 @@ class Database:
                 first_name TEXT,
                 last_name TEXT,
                 is_enabled INTEGER DEFAULT 1,
+                is_blocked INTEGER DEFAULT 1,
                 updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)''')
+            c.execute('''CREATE TABLE IF NOT EXISTS offer_blocked_users(
+                user_id INTEGER PRIMARY KEY,
+                added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)''')
+            cols = {r[1] for r in c.execute('PRAGMA table_info(offer_business_connections)').fetchall()}
+            if 'is_blocked' not in cols:
+                c.execute('ALTER TABLE offer_business_connections ADD COLUMN is_blocked INTEGER DEFAULT 1')
+                # Existing connections from previous versions keep their old access.
+                c.execute('UPDATE offer_business_connections SET is_blocked=0 WHERE is_blocked IS NULL OR is_blocked=1')
             c.execute('''CREATE TABLE IF NOT EXISTS parser_seen_users(
                 user_id INTEGER PRIMARY KEY,
                 first_chat_id INTEGER,
@@ -355,13 +369,41 @@ class Database:
     # ───────────── Business connections ─────────────
     def save_business_connection(self, connection_id, user_id, username=None, first_name=None, last_name=None, is_enabled=True):
         with self._db() as c:
+            existing = c.execute('SELECT 1 FROM offer_business_connections WHERE connection_id=?', (str(connection_id),)).fetchone()
             c.execute('''INSERT INTO offer_business_connections
-                (connection_id,user_id,username,first_name,last_name,is_enabled,updated_at)
-                VALUES(?,?,?,?,?,?,CURRENT_TIMESTAMP)
+                (connection_id,user_id,username,first_name,last_name,is_enabled,is_blocked,updated_at)
+                VALUES(?,?,?,?,?,?,1,CURRENT_TIMESTAMP)
                 ON CONFLICT(connection_id) DO UPDATE SET
                     user_id=excluded.user_id, username=excluded.username, first_name=excluded.first_name,
                     last_name=excluded.last_name, is_enabled=excluded.is_enabled, updated_at=CURRENT_TIMESTAMP''',
                 (str(connection_id), int(user_id), username, first_name, last_name, 1 if is_enabled else 0))
+            return existing is None
+
+    def offer_user_blocked(self, user_id):
+        uid = int(user_id)
+        if self._one('SELECT 1 AS ok FROM offer_blocked_users WHERE user_id=?', (uid,)):
+            return True
+        row = self._one('SELECT is_blocked FROM offer_business_connections WHERE user_id=? ORDER BY updated_at DESC LIMIT 1', (uid,))
+        return bool(row and int(row.get('is_blocked', 0) or 0))
+
+    def block_offer_user(self, user_id):
+        with self._db() as c:
+            c.execute('INSERT OR IGNORE INTO offer_blocked_users(user_id) VALUES(?)', (int(user_id),))
+            c.execute('UPDATE offer_business_connections SET is_blocked=1, updated_at=CURRENT_TIMESTAMP WHERE user_id=?', (int(user_id),))
+
+    def unblock_offer_user(self, user_id):
+        with self._db() as c:
+            c.execute('DELETE FROM offer_blocked_users WHERE user_id=?', (int(user_id),))
+            c.execute('UPDATE offer_business_connections SET is_blocked=0, updated_at=CURRENT_TIMESTAMP WHERE user_id=?', (int(user_id),))
+
+    def offer_user_allowed(self, user_id):
+        return not self.offer_user_blocked(user_id)
+
+    def business_connection_is_blocked(self, connection_id):
+        row = self._one('SELECT is_blocked FROM offer_business_connections WHERE connection_id=?', (str(connection_id),))
+        if not row:
+            return True
+        return bool(row.get('is_blocked', 1))
 
     def disable_business_connection(self, connection_id):
         with self._db() as c:
@@ -410,6 +452,24 @@ class Database:
         with self._db() as c:
             cur = c.execute('DELETE FROM offer_profiles WHERE id=?', (int(profile_id),))
             return cur.rowcount > 0
+
+    # ───────────── персональные профили передачи ─────────────
+    def offer_user_profile_get(self, user_id):
+        return self._one('SELECT user_id,name,url,updated_at FROM offer_user_profiles WHERE user_id=?', (int(user_id),))
+
+    def offer_user_profile_set(self, user_id, name, url):
+        with self._db() as c:
+            c.execute('''INSERT INTO offer_user_profiles(user_id,name,url,updated_at) VALUES(?,?,?,CURRENT_TIMESTAMP)
+                         ON CONFLICT(user_id) DO UPDATE SET name=excluded.name,url=excluded.url,updated_at=CURRENT_TIMESTAMP''',
+                      (int(user_id), str(name).strip(), str(url).strip()))
+
+    def offer_user_profile_remove(self, user_id):
+        with self._db() as c:
+            cur=c.execute('DELETE FROM offer_user_profiles WHERE user_id=?',(int(user_id),))
+            return cur.rowcount > 0
+
+    def offer_user_profiles_list(self):
+        return self._all('SELECT user_id,name,url,updated_at FROM offer_user_profiles ORDER BY updated_at DESC')
 
     # ───────────── пользователи ─────────────
     def upsert_user(self, uid, username=None, first_name=None):

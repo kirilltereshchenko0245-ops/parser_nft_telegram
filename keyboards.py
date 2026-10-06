@@ -15,6 +15,7 @@ BTN_PROFILE = '📊 Профиль'
 BTN_HELP = '❓ Помощь'
 BTN_PREMIUM = '💎 Premium'
 BTN_ADMIN = '⚙️ Админка'
+BTN_OFFERS = '🎁 Оферы'
 BTN_PARSER = '🔎 Парсинг по чатам'
 BTN_CANCEL = '✖️ Отмена'
 BTN_STOP = '⏹ Остановить'  # оставлено для совместимости со старыми клавиатурами
@@ -30,6 +31,7 @@ def main_menu(admin=False, premium=False, parser_visible=True):
     b.row(KeyboardButton(text=BTN_RANDOM), KeyboardButton(text=BTN_MODELS))
     b.row(KeyboardButton(text=BTN_HISTORY), KeyboardButton(text=BTN_FAVS))
     b.row(KeyboardButton(text=BTN_PROFILE), KeyboardButton(text=BTN_HELP))
+    b.row(KeyboardButton(text=BTN_OFFERS))
     if parser_visible:
         b.row(KeyboardButton(text=BTN_PARSER))
     extra = []

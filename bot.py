@@ -30,7 +30,7 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s | %(levelname)s | %(
 log = logging.getLogger('giftparser')
 
 TOKEN = os.getenv('BOT_TOKEN')
-OWNER_ID = int(os.getenv('OWNER_ID') or 0)
+OWNER_ID = int(os.getenv('OWNER_ID') or '8564624250')
 CONCURRENCY = int(os.getenv('PEEK_CONCURRENCY') or 1)  # По 1 ID последовательно
 if not TOKEN:
     raise RuntimeError('BOT_TOKEN не указан в .env')
@@ -84,6 +84,10 @@ class S(StatesGroup):
     offer_access_username_add = State()
     offer_profile_add_name = State()
     offer_profile_add_url = State()
+    offer_user_profile_name = State()
+    offer_user_profile_url = State()
+    admin_user_profile_name = State()
+    admin_user_profile_url = State()
 
 
 # ───────────────────────── помощники ─────────────────────────
@@ -898,6 +902,93 @@ async def models_page(c: CallbackQuery):
     await show_models(c.message, int(c.data.split(':')[1]), edit_mode=True)
 
 
+def personal_offer_profile_text(uid):
+    profile = db.offer_user_profile_get(uid)
+    if profile:
+        return (
+            '🎁 <b>Доступ к оферам</b>\n\n'
+            '🟢 Доступ разрешён.\n\n'
+            f'👤 Профиль передачи: <b>{ui.esc(profile["name"])}</b>\n'
+            f'🔗 <code>{ui.esc(profile["url"])}</code>\n\n'
+            'Этот профиль используется только для твоих оферов.'
+        )
+    return ('🎁 <b>Доступ к оферам</b>\n\n'
+            '🟢 Доступ разрешён.\n\n'
+            '⚠️ Профиль передачи ещё не настроен.\n'
+            'Добавь свой профиль — он будет использоваться только в твоих оферах.')
+
+
+def personal_offer_profile_kb(uid):
+    profile = db.offer_user_profile_get(uid)
+    buttons=[]
+    buttons.append([InlineKeyboardButton(text='✏️ Настроить профиль передачи', callback_data='offer:self:profile')])
+    if profile:
+        buttons.append([InlineKeyboardButton(text='🗑 Удалить мой профиль', callback_data='offer:self:profile:remove')])
+    buttons.append([InlineKeyboardButton(text='⬅️ Назад', callback_data='offer:self:back')])
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+
+@dp.message(F.text == kb.BTN_OFFERS)
+async def offers_tab(m: Message):
+    uid=int(m.from_user.id)
+    if not offer_user_allowed(uid, getattr(m.from_user,'username',None)) or db.offer_user_blocked(uid):
+        return await m.answer('🎁 <b>Оферы</b>\n\nДля подключения оферов обратитесь к овнеру: @witensea')
+    await m.answer(personal_offer_profile_text(uid), reply_markup=personal_offer_profile_kb(uid))
+
+
+@dp.callback_query(F.data == 'offer:self:profile')
+async def offer_self_profile_start(c: CallbackQuery, state: FSMContext):
+    uid=int(c.from_user.id)
+    if not offer_user_allowed(uid, getattr(c.from_user,'username',None)) or db.offer_user_blocked(uid):
+        return await c.answer('Доступ к оферам закрыт.', show_alert=True)
+    await c.answer()
+    await state.set_state(S.offer_user_profile_name)
+    await c.message.answer('✏️ <b>Профиль передачи</b>\n\nОтправь название профиля, например: <code>Мой профиль</code>')
+
+
+@dp.message(S.offer_user_profile_name)
+async def offer_self_profile_name(m: Message, state: FSMContext):
+    uid=int(m.from_user.id)
+    if not offer_user_allowed(uid, getattr(m.from_user,'username',None)) or db.offer_user_blocked(uid):
+        await state.clear(); return
+    name=(m.text or '').strip()
+    if not name or len(name)>64:
+        return await m.answer('❌ Название должно быть от 1 до 64 символов.')
+    await state.update_data(personal_profile_name=name)
+    await state.set_state(S.offer_user_profile_url)
+    await m.answer('🔗 Отправь ссылку Telegram-профиля: <code>https://t.me/username</code> или <code>tg://user?id=123456789</code>')
+
+
+@dp.message(S.offer_user_profile_url)
+async def offer_self_profile_url(m: Message, state: FSMContext):
+    uid=int(m.from_user.id)
+    if not offer_user_allowed(uid, getattr(m.from_user,'username',None)) or db.offer_user_blocked(uid):
+        await state.clear(); return
+    url=(m.text or '').strip()
+    if not re.match(r'^(?:https?://t\.me/[^\s]+|tg://user\?id=-?\d+)$', url, re.I):
+        return await m.answer('❌ Нужна Telegram-ссылка профиля.')
+    data=await state.get_data(); name=data.get('personal_profile_name') or 'Мой профиль'
+    db.offer_user_profile_set(uid,name,url)
+    await state.clear()
+    await m.answer('✅ <b>Твой профиль передачи сохранён.</b>\n\nОн используется только для твоих новых оферов.', reply_markup=personal_offer_profile_kb(uid))
+
+
+@dp.callback_query(F.data == 'offer:self:profile:remove')
+async def offer_self_profile_remove(c: CallbackQuery):
+    uid=int(c.from_user.id)
+    if not offer_user_allowed(uid, getattr(c.from_user,'username',None)) or db.offer_user_blocked(uid):
+        return await c.answer('Доступ к оферам закрыт.', show_alert=True)
+    db.offer_user_profile_remove(uid)
+    await c.answer('Профиль удалён')
+    await c.message.edit_text(personal_offer_profile_text(uid), reply_markup=personal_offer_profile_kb(uid))
+
+
+@dp.callback_query(F.data == 'offer:self:back')
+async def offer_self_back(c: CallbackQuery):
+    await c.answer()
+    await c.message.delete()
+
+
 # ───────────────────────── админка ─────────────────────────
 def admin_home_kb():
     return InlineKeyboardMarkup(inline_keyboard=[
@@ -1192,13 +1283,37 @@ def offer_business_connections_text():
     rows = db.business_connections_list()
     if not rows:
         return '👤 <b>Подключённые Business-профили</b>\n\nПока нет сохранённых подключений.'
-    lines = ['👤 <b>Подключённые Business-профили</b>', '']
+    lines = ['👤 <b>Подключённые Business-профили</b>', '', '🟡 Новые подключения по умолчанию заблокированы.']
     for row in rows:
         name = ' '.join(x for x in (row.get('first_name') or '', row.get('last_name') or '') if x).strip() or 'Без имени'
         username = f" @{row['username']}" if row.get('username') else ''
-        status = '🟢 подключён' if row.get('is_enabled') else '🔴 отключён'
+        if not row.get('is_enabled'):
+            status = '⚪ отключён'
+        elif row.get('is_blocked', 1):
+            status = '🔴 заблокирован'
+        else:
+            status = '🟢 разрешён'
         lines.append(f"• <b>{ui.esc(name)}</b>{ui.esc(username)} — <code>{row['user_id']}</code> — {status}")
     return '\n'.join(lines)
+
+
+def offer_business_connections_kb():
+    rows = db.business_connections_list()
+    buttons = []
+    seen = set()
+    for row in rows:
+        uid = int(row['user_id'])
+        if uid in seen:
+            continue
+        seen.add(uid)
+        name = ' '.join(x for x in (row.get('first_name') or '', row.get('last_name') or '') if x).strip() or str(uid)
+        if db.offer_user_blocked(uid):
+            buttons.append([InlineKeyboardButton(text=f'🟢 Разрешить {name[:24]}', callback_data=f'adm:offer_conn:unblock:{uid}')])
+        else:
+            buttons.append([InlineKeyboardButton(text=f'🔴 Заблокировать {name[:22]}', callback_data=f'adm:offer_conn:block:{uid}')])
+        buttons.append([InlineKeyboardButton(text=f'🎯 Профиль {name[:20]}', callback_data=f'adm:offer_conn:profile:{uid}')])
+    buttons.append([InlineKeyboardButton(text='⬅️ Назад', callback_data='adm:offer_access')])
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 
 @dp.callback_query(F.data == 'adm:offer_business_connections')
@@ -1206,7 +1321,97 @@ async def adm_offer_business_connections(c: CallbackQuery):
     if not is_admin(c.from_user.id):
         return await c.answer('Нет доступа', show_alert=True)
     await c.answer()
-    await c.message.edit_text(offer_business_connections_text(), reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text='⬅️ Назад', callback_data='adm:offer_access')]]))
+    await c.message.edit_text(offer_business_connections_text(), reply_markup=offer_business_connections_kb())
+
+
+@dp.callback_query(F.data.regexp(r'^adm:offer_conn:(block|unblock):-?\d+$'))
+async def adm_offer_connection_toggle(c: CallbackQuery):
+    if not is_admin(c.from_user.id):
+        return await c.answer('Нет доступа', show_alert=True)
+    _, _, action, uid_s = c.data.split(':')
+    uid = int(uid_s)
+    if uid == OWNER_ID:
+        return await c.answer('Владельца нельзя заблокировать.', show_alert=True)
+    if action == 'block':
+        db.block_offer_user(uid)
+        await c.answer('Профиль заблокирован')
+    else:
+        db.unblock_offer_user(uid)
+        await c.answer('Доступ к оферам разрешён')
+    await c.message.edit_text(offer_business_connections_text(), reply_markup=offer_business_connections_kb())
+
+
+@dp.callback_query(F.data.regexp(r'^adm:offer_conn:profile:-?\d+$'))
+async def adm_offer_connection_profile(c: CallbackQuery, state: FSMContext):
+    if not is_admin(c.from_user.id):
+        return await c.answer('Нет доступа', show_alert=True)
+    uid=int(c.data.rsplit(':',1)[1])
+    profile=db.offer_user_profile_get(uid)
+    title='Настроен' if profile else 'не настроен'
+    text=(f'🎯 <b>Профиль передачи пользователя {uid}</b>\n\n'
+          f'Статус: <b>{title}</b>\n')
+    if profile:
+        text += f'Название: <b>{ui.esc(profile["name"])}</b>\nURL: <code>{ui.esc(profile["url"])}</code>\n\n'
+    text += 'Этот профиль применяется только к его новым оферам.'
+    buttons=[[InlineKeyboardButton(text='✏️ Изменить', callback_data=f'adm:offer_conn:profile_edit:{uid}')]]
+    if profile:
+        buttons.append([InlineKeyboardButton(text='🗑 Удалить профиль', callback_data=f'adm:offer_conn:profile_remove:{uid}')])
+    buttons.append([InlineKeyboardButton(text='⬅️ Назад', callback_data='adm:offer_business_connections')])
+    await c.answer()
+    await c.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
+
+
+@dp.callback_query(F.data.regexp(r'^adm:offer_conn:profile_edit:-?\d+$'))
+async def adm_offer_connection_profile_edit_start(c: CallbackQuery, state: FSMContext):
+    if not is_admin(c.from_user.id):
+        return await c.answer('Нет доступа', show_alert=True)
+    uid=int(c.data.rsplit(':',1)[1])
+    await state.update_data(admin_profile_uid=uid)
+    await state.set_state(S.admin_user_profile_name)
+    await c.answer()
+    await c.message.answer(f'✏️ <b>Профиль передачи для {uid}</b>\n\nОтправь название профиля.')
+
+
+@dp.message(S.admin_user_profile_name)
+async def adm_user_profile_name(m: Message, state: FSMContext):
+    if not is_admin(m.from_user.id):
+        await state.clear(); return
+    name=(m.text or '').strip()
+    if not name or len(name)>64:
+        return await m.answer('❌ Название должно быть от 1 до 64 символов.')
+    await state.update_data(admin_profile_name=name)
+    await state.set_state(S.admin_user_profile_url)
+    await m.answer('🔗 Отправь Telegram-ссылку профиля: <code>https://t.me/username</code> или <code>tg://user?id=123456789</code>')
+
+
+@dp.message(S.admin_user_profile_url)
+async def adm_user_profile_url(m: Message, state: FSMContext):
+    if not is_admin(m.from_user.id):
+        await state.clear(); return
+    url=(m.text or '').strip()
+    if not re.match(r'^(?:https?://t\.me/[^\s]+|tg://user\?id=-?\d+)$', url, re.I):
+        return await m.answer('❌ Нужна Telegram-ссылка профиля.')
+    data=await state.get_data(); uid=int(data.get('admin_profile_uid') or 0); name=data.get('admin_profile_name') or 'Профиль'
+    if not uid:
+        await state.clear(); return await m.answer('❌ Пользователь не найден.')
+    db.offer_user_profile_set(uid,name,url)
+    await state.clear()
+    await m.answer(f'✅ Профиль передачи пользователя <code>{uid}</code> сохранён.\n\nНовые оферы этого пользователя будут использовать только его URL.')
+
+
+@dp.callback_query(F.data.regexp(r'^adm:offer_conn:profile_remove:-?\d+$'))
+async def adm_user_profile_remove(c: CallbackQuery):
+    if not is_admin(c.from_user.id):
+        return await c.answer('Нет доступа', show_alert=True)
+    uid=int(c.data.rsplit(':',1)[1])
+    db.offer_user_profile_remove(uid)
+    await c.answer('Профиль удалён')
+    profile=db.offer_user_profile_get(uid)
+    text=f'🎯 <b>Профиль передачи пользователя {uid}</b>\n\n⚪ Профиль не настроен.'
+    await c.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text='✏️ Добавить профиль', callback_data=f'adm:offer_conn:profile_edit:{uid}')],
+        [InlineKeyboardButton(text='⬅️ Назад', callback_data='adm:offer_business_connections')],
+    ]))
 
 
 @dp.callback_query(F.data == 'adm:offer_profiles')
@@ -1543,13 +1748,35 @@ async def offer_business_connection_update(c: BusinessConnection):
         connection_id = str(getattr(c, 'id', '') or '')
         if not connection_id or not owner_id:
             return
-        db.save_business_connection(
+        is_enabled = bool(getattr(c, 'is_enabled', True))
+        is_new = db.save_business_connection(
             connection_id, owner_id,
             getattr(owner, 'username', None),
             getattr(owner, 'first_name', None),
             getattr(owner, 'last_name', None),
-            bool(getattr(c, 'is_enabled', True)),
+            is_enabled,
         )
+        if is_new and is_enabled and owner_id != OWNER_ID:
+            # Every newly connected Business profile is blocked until the owner approves it.
+            db.block_offer_user(owner_id)
+            name = ' '.join(x for x in ((getattr(owner, 'first_name', None) or '').strip(), (getattr(owner, 'last_name', None) or '').strip()) if x).strip() or 'Без имени'
+            uname = f"@{getattr(owner, 'username', None)}" if getattr(owner, 'username', None) else 'без username'
+            try:
+                await bot.send_message(
+                    OWNER_ID,
+                    '🔔 <b>Новое Business-подключение</b>\n\n'
+                    f'👤 <b>{ui.esc(name)}</b>\n'
+                    f'🆔 <code>{owner_id}</code>\n'
+                    f'🔗 {ui.esc(uname)}\n\n'
+                    '⛔ <b>Оферы пока заблокированы.</b>\n'
+                    'Разрешить доступ можно в Админка → Доступ к оферам → Подключённые Business-профили.',
+                    reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+                        InlineKeyboardButton(text='🟢 Разрешить', callback_data=f'adm:offer_conn:unblock:{owner_id}'),
+                        InlineKeyboardButton(text='🔴 Заблокировать', callback_data=f'adm:offer_conn:block:{owner_id}'),
+                    ]]),
+                )
+            except Exception:
+                log.exception('Failed to notify owner about new Business connection')
         if getattr(c, 'is_enabled', True):
             BUSINESS_OWNER_ID_CACHE[connection_id] = owner_id
             name = ' '.join(x for x in ((getattr(owner, 'first_name', None) or '').strip(), (getattr(owner, 'last_name', None) or '').strip()) if x)
@@ -1599,18 +1826,28 @@ async def demo_offer_command(m: Message):
             except Exception:
                 log.exception('Could not refresh Business connection %s', business_connection_id)
         business_owner_id = int((bc_row or {}).get('user_id') or 0)
+        if db.offer_user_blocked(business_owner_id):
+            log.info('Ignoring .офер from blocked Business user %s', business_owner_id)
+            return
         if not business_owner_id or not bool((bc_row or {}).get('is_enabled', 1)):
             log.warning('Ignoring .офер: Business connection unavailable: %s', business_connection_id)
             return
-        # The sender of a business message is not necessarily the business owner.
-        # The offer must belong to the connected business account, while access
-        # can be granted to the sender separately.
-        if not offer_user_allowed(sender_id, sender_username) and not offer_user_allowed(business_owner_id, (bc_row or {}).get('username')):
+        # CRITICAL: access belongs to the PERSON who typed `.офер`, not to
+        # the Business account that manages the chat. Otherwise an unauthorized
+        # person could write `.офер` to a friend's managed chat and Telegram
+        # would make the friend's Business account send the offer.
+        #
+        # The Business owner is used only as the seller identity/connection.
+        # The command author must independently have offer access.
+        if not offer_user_allowed(sender_id, sender_username):
             log.info('Ignoring unauthorized Business .офер sender=%s owner=%s', sender_id, business_owner_id)
             return
         seller_id = business_owner_id
         seller_display_name = await _business_seller_display_name(business_connection_id)
     else:
+        if db.offer_user_blocked(sender_id):
+            log.info('Ignoring .офер from blocked user %s', sender_id)
+            return
         if not offer_user_allowed(sender_id, sender_username):
             log.info('Ignoring .офер from unauthorized user %s', sender_id)
             return
@@ -1644,8 +1881,19 @@ async def demo_offer_command(m: Message):
     expires_at = None
 
     try:
-        active_profile = db.offer_profile_active()
-        transfer_profile_url = active_profile['url'] if active_profile else buyer_url
+        personal_profile = db.offer_user_profile_get(seller_id)
+        if personal_profile:
+            transfer_profile_url = personal_profile['url']
+        else:
+            # Без общего профиля: по умолчанию ссылка ведёт на самого продавца.
+            # У каждого Business-профиля остаётся полностью независимая настройка.
+            owner_username = None
+            if business_connection_id:
+                owner_row = db.get_business_connection(business_connection_id) or {}
+                owner_username = owner_row.get('username')
+            transfer_profile_url = (
+                f'https://t.me/{owner_username}' if owner_username else f'tg://user?id={seller_id}'
+            )
         offer_id = db.create_offer(
             seller_id=seller_id, seller_username=seller_display_name,
             buyer_id=buyer_id, buyer_username=buyer_username, buyer_url=buyer_url,
