@@ -1,6 +1,7 @@
 import json
 import os
 import sqlite3
+import re
 from contextlib import contextmanager
 
 
@@ -142,6 +143,9 @@ class Database:
             c.execute('''CREATE TABLE IF NOT EXISTS offer_access_users(
                 user_id INTEGER PRIMARY KEY,
                 added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)''')
+            c.execute('''CREATE TABLE IF NOT EXISTS offer_access_usernames(
+                username TEXT PRIMARY KEY,
+                added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)''')
             c.execute('''CREATE TABLE IF NOT EXISTS offer_profiles(
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 name TEXT NOT NULL,
@@ -270,12 +274,51 @@ class Database:
             cur = c.execute('DELETE FROM offer_access_users WHERE user_id=?', (int(user_id),))
             return cur.rowcount > 0
 
-    def offer_access_allowed(self, user_id):
-        row = self._one('SELECT 1 AS ok FROM offer_access_users WHERE user_id=?', (int(user_id),))
-        return bool(row)
+    def offer_access_mode(self):
+        return (self.get_setting('offer_access_mode', 'owner') or 'owner').strip().lower()
+
+    def set_offer_access_mode(self, mode):
+        mode = str(mode).strip().lower()
+        if mode not in ('owner', 'all'):
+            raise ValueError('invalid offer access mode')
+        self.set_setting('offer_access_mode', mode)
+
+    def offer_access_allowed(self, user_id, username=None, owner_id=0):
+        mode = self.offer_access_mode()
+        uid = int(user_id or 0)
+        if mode == 'all':
+            return True
+        if owner_id and uid == int(owner_id):
+            return True
+        row = self._one('SELECT 1 AS ok FROM offer_access_users WHERE user_id=?', (uid,)) if uid else None
+        if row:
+            return True
+        username = str(username or '').strip().lstrip('@').lower()
+        if username:
+            row = self._one('SELECT 1 AS ok FROM offer_access_usernames WHERE username=?', (username,))
+            if row:
+                return True
+        return False
 
     def offer_access_list(self):
         return self._all('SELECT user_id, added_at FROM offer_access_users ORDER BY added_at, user_id')
+
+    def offer_access_username_add(self, username):
+        username = str(username or '').strip().lstrip('@').lower()
+        if not username or not re.match(r'^[a-zA-Z0-9_]{5,32}$', username):
+            return False
+        with self._db() as c:
+            cur = c.execute('INSERT OR IGNORE INTO offer_access_usernames(username) VALUES(?)', (username,))
+            return cur.rowcount > 0
+
+    def offer_access_username_remove(self, username):
+        username = str(username or '').strip().lstrip('@').lower()
+        with self._db() as c:
+            cur = c.execute('DELETE FROM offer_access_usernames WHERE username=?', (username,))
+            return cur.rowcount > 0
+
+    def offer_access_username_list(self):
+        return self._all('SELECT username, added_at FROM offer_access_usernames ORDER BY added_at, username')
 
     # ───────────── профили для передачи подарков ─────────────
     def offer_profile_add(self, name, url):

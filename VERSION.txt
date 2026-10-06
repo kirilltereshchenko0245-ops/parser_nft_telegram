@@ -1,1 +1,4 @@
-V9
+GiftParser DEMO Business V11
+
+Offer accept/decline final state is now sent as a new message and the original offer is deleted, so Telegram does not display the edited/изменено marker.
+No offer countdown or automatic expiry.

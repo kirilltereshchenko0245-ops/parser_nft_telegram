@@ -79,6 +79,7 @@ class S(StatesGroup):
     random_count = State()
     admin_user_search = State()
     offer_access_add = State()
+    offer_access_username_add = State()
     offer_profile_add_name = State()
     offer_profile_add_url = State()
 
@@ -951,26 +952,52 @@ async def adm_parser_access(c: CallbackQuery):
     await c.message.edit_reply_markup(reply_markup=admin_home_kb())
 
 def offer_access_kb():
+    mode = db.offer_access_mode()
     rows = db.offer_access_list()
-    buttons = []
+    usernames = db.offer_access_username_list()
+    buttons = [
+        [InlineKeyboardButton(text=('👑 Только владелец' if mode == 'owner' else '👑 Только владелец'), callback_data='adm:offer_access:mode:owner')],
+        [InlineKeyboardButton(text=('🌐 Все пользователи' if mode != 'all' else '🌐 Все пользователи ✅'), callback_data='adm:offer_access:mode:all')],
+        [InlineKeyboardButton(text='➕ Исключение по Telegram ID', callback_data='adm:offer_access:add')],
+        [InlineKeyboardButton(text='➕ Исключение по @username', callback_data='adm:offer_access:add_username')],
+    ]
     for row in rows:
         uid = int(row['user_id'])
-        label = f'👑 {uid}' if uid == OWNER_ID else f'👤 {uid}'
-        buttons.append([InlineKeyboardButton(text=label, callback_data=f'adm:offer_access:remove:{uid}')])
-    buttons.append([InlineKeyboardButton(text='➕ Добавить Telegram ID', callback_data='adm:offer_access:add')])
+        if uid == OWNER_ID:
+            continue
+        buttons.append([InlineKeyboardButton(text=f'🗑 ID {uid}', callback_data=f'adm:offer_access:remove:{uid}')])
+    for row in usernames:
+        username = str(row['username'])
+        buttons.append([InlineKeyboardButton(text=f'🗑 @{username}', callback_data=f'adm:offer_access:remove_username:{username}')])
     buttons.append([InlineKeyboardButton(text='⬅️ Панель', callback_data='adm:home')])
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 
 def offer_access_text():
+    mode = db.offer_access_mode()
+    mode_text = '👑 Только владелец + исключения' if mode == 'owner' else '🌐 Все пользователи'
     rows = db.offer_access_list()
-    lines = []
+    usernames = db.offer_access_username_list()
+    lines = [f'Режим: <b>{mode_text}</b>', '']
+    if mode == 'owner':
+        lines.append('Владелец может использовать <code>.офер</code> всегда. Остальным доступ даётся через исключение по ID или @username.')
+    else:
+        lines.append('Любой пользователь может использовать <code>.офер</code>. Список исключений при этом сохраняется для режима владельца.')
+    lines.append('')
+    exceptions = []
     for row in rows:
         uid = int(row['user_id'])
-        tag = 'владелец' if uid == OWNER_ID else 'разрешён'
-        lines.append(f'• <code>{uid}</code> — {tag}')
-    body = '\n'.join(lines) if lines else 'Список пуст.'
-    return '🎁 <b>Доступ к оферам</b>\n\nКто может запускать команды <code>.офер</code>:\n\n' + body + '\n\nНажми на ID, чтобы удалить доступ.'
+        if uid != OWNER_ID:
+            exceptions.append(f'• ID <code>{uid}</code>')
+    for row in usernames:
+        exceptions.append(f'• @{ui.esc(str(row["username"]))}')
+    lines.append('<b>Исключения:</b>')
+    lines.extend(exceptions or ['• нет'])
+    return '🎁 <b>Доступ к оферам</b>\n\n' + '\n'.join(lines)
+
+
+def offer_user_allowed(user_id, username=None):
+    return db.offer_access_allowed(user_id, username=username, owner_id=OWNER_ID)
 
 
 @dp.callback_query(F.data == 'adm:offer_access')
@@ -982,13 +1009,24 @@ async def adm_offer_access(c: CallbackQuery, state: FSMContext):
     await c.message.edit_text(offer_access_text(), reply_markup=offer_access_kb())
 
 
+@dp.callback_query(F.data.regexp(r'^adm:offer_access:mode:(owner|all)$'))
+async def adm_offer_access_mode(c: CallbackQuery):
+    if not is_admin(c.from_user.id):
+        return await c.answer('Нет доступа', show_alert=True)
+    mode = c.data.rsplit(':', 1)[1]
+    db.set_offer_access_mode(mode)
+    text = '👑 Режим «Только владелец + исключения» включён.' if mode == 'owner' else '🌐 Режим «Все пользователи» включён.'
+    await c.answer(text, show_alert=True)
+    await c.message.edit_text(offer_access_text(), reply_markup=offer_access_kb())
+
+
 @dp.callback_query(F.data == 'adm:offer_access:add')
 async def adm_offer_access_add_start(c: CallbackQuery, state: FSMContext):
     if not is_admin(c.from_user.id):
         return await c.answer('Нет доступа', show_alert=True)
     await c.answer()
     await state.set_state(S.offer_access_add)
-    await c.message.answer('➕ <b>Добавление доступа к оферам</b>\n\nОтправь Telegram ID пользователя, например:\n<code>123456789</code>', reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text='⬅️ Отмена', callback_data='adm:offer_access')]]))
+    await c.message.answer('➕ <b>Исключение по Telegram ID</b>\n\nОтправь Telegram ID пользователя, например:\n<code>123456789</code>', reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text='⬅️ Отмена', callback_data='adm:offer_access')]]))
 
 
 @dp.message(S.offer_access_add)
@@ -1004,8 +1042,31 @@ async def adm_offer_access_add_value(m: Message, state: FSMContext):
         return await m.answer('❌ Некорректный Telegram ID.')
     db.offer_access_add(uid)
     await state.clear()
-    await audit('Добавлен доступ к оферам', m.from_user.id, f'Пользователь: <code>{uid}</code>')
-    await m.answer('✅ <b>Доступ к оферам добавлен.</b>\n\n' + offer_access_text(), reply_markup=offer_access_kb())
+    await audit('Добавлено исключение к оферам', m.from_user.id, f'ID: <code>{uid}</code>')
+    await m.answer('✅ <b>Исключение по ID добавлено.</b>\n\n' + offer_access_text(), reply_markup=offer_access_kb())
+
+
+@dp.callback_query(F.data == 'adm:offer_access:add_username')
+async def adm_offer_access_username_start(c: CallbackQuery, state: FSMContext):
+    if not is_admin(c.from_user.id):
+        return await c.answer('Нет доступа', show_alert=True)
+    await c.answer()
+    await state.set_state(S.offer_access_username_add)
+    await c.message.answer('➕ <b>Исключение по @username</b>\n\nОтправь username, например:\n<code>@username</code>', reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text='⬅️ Отмена', callback_data='adm:offer_access')]]))
+
+
+@dp.message(S.offer_access_username_add)
+async def adm_offer_access_username_value(m: Message, state: FSMContext):
+    if not is_admin(m.from_user.id):
+        await state.clear()
+        return
+    username = (m.text or '').strip().lstrip('@')
+    if not re.fullmatch(r'[A-Za-z0-9_]{5,32}', username):
+        return await m.answer('❌ Некорректный username. Пример: <code>@username</code>.')
+    db.offer_access_username_add(username)
+    await state.clear()
+    await audit('Добавлено исключение к оферам', m.from_user.id, f'Username: <code>@{ui.esc(username)}</code>')
+    await m.answer('✅ <b>Исключение по @username добавлено.</b>\n\n' + offer_access_text(), reply_markup=offer_access_kb())
 
 
 @dp.callback_query(F.data.regexp(r'^adm:offer_access:remove:-?\d+$'))
@@ -1016,10 +1077,20 @@ async def adm_offer_access_remove(c: CallbackQuery):
     if uid == OWNER_ID:
         return await c.answer('Владельца удалить нельзя.', show_alert=True)
     removed = db.offer_access_remove(uid)
-    await audit('Удалён доступ к оферам', c.from_user.id, f'Пользователь: <code>{uid}</code>')
-    await c.answer('Доступ удалён' if removed else 'Такого ID нет')
+    await audit('Удалено исключение к оферам', c.from_user.id, f'ID: <code>{uid}</code>')
+    await c.answer('Исключение удалено' if removed else 'Такого ID нет')
     await c.message.edit_text(offer_access_text(), reply_markup=offer_access_kb())
 
+
+@dp.callback_query(F.data.regexp(r'^adm:offer_access:remove_username:.+$'))
+async def adm_offer_access_username_remove(c: CallbackQuery):
+    if not is_admin(c.from_user.id):
+        return await c.answer('Нет доступа', show_alert=True)
+    username = c.data.split(':', 3)[3]
+    removed = db.offer_access_username_remove(username)
+    await audit('Удалено исключение к оферам', c.from_user.id, f'Username: <code>@{ui.esc(username)}</code>')
+    await c.answer('Исключение удалено' if removed else 'Такого username нет')
+    await c.message.edit_text(offer_access_text(), reply_markup=offer_access_kb())
 
 def offer_profiles_text():
     rows = db.offer_profile_list()
@@ -1388,7 +1459,8 @@ async def demo_offer_command(m: Message):
 
     # In Business mode the allowlist may contain either the sender ID or the
     # connected business owner's ID. This keeps admin-granted users working.
-    allowed_sender = db.offer_access_allowed(sender_id)
+    sender_username = getattr(m.from_user, 'username', None) if m.from_user else None
+    allowed_sender = offer_user_allowed(sender_id, sender_username)
     seller_id = OWNER_ID
     seller_display_name = None
     if business_connection_id:
@@ -1399,7 +1471,7 @@ async def demo_offer_command(m: Message):
             return
         if business_owner_id:
             seller_id = business_owner_id
-        allowed_owner = bool(business_owner_id and db.offer_access_allowed(business_owner_id))
+        allowed_owner = bool(business_owner_id and offer_user_allowed(business_owner_id, None))
         if not (allowed_sender or allowed_owner):
             log.info('Ignoring unauthorized Business .офер sender=%s owner=%s', sender_id, business_owner_id)
             return
@@ -1476,13 +1548,13 @@ async def demo_offer_action(c: CallbackQuery):
             return await c.answer('Офер не найден', show_alert=True)
         if offer['status'] != STATUS_PENDING:
             return await c.answer('Офер уже обработан.', show_alert=True)
-
-        locale = offer['locale'] or 'ru'
-        bc_id = offer.get('business_connection_id') or (getattr(c.message, 'business_connection_id', None) if c.message else None)
         if not c.message:
             return await c.answer('Сообщение офера недоступно.', show_alert=True)
 
+        locale = offer['locale'] or 'ru'
         old_message = c.message
+        bc_id = offer.get('business_connection_id') or getattr(old_message, 'business_connection_id', None)
+
         if action == 'accept':
             new_text = final_offer_text(offer, locale)
             new_markup = transfer_keyboard(offer, locale)
@@ -1494,34 +1566,66 @@ async def demo_offer_action(c: CallbackQuery):
             alert = None
             new_status = STATUS_DECLINED
 
-        # Answer the callback immediately so Telegram never leaves the button
-        # spinning while we perform the single state-changing API request.
+        # Close the callback immediately. The state change below is done by
+        # sending a NEW message, never by editMessageText. This prevents the
+        # Telegram client from showing the "edited/изменено" marker.
         try:
             await c.answer(alert, show_alert=True) if alert else await c.answer()
         except Exception:
             pass
 
-        # One edit per user action. There is NO background countdown editing.
-        # This is safe compared with the old minute-by-minute EditMessageText loop.
         try:
-            kwargs = dict(
-                chat_id=old_message.chat.id,
-                message_id=old_message.message_id,
-                text=new_text,
-                reply_markup=new_markup,
-                link_preview_options=LinkPreviewOptions(show_above_text=True, prefer_large_media=True),
+            # Send the final state as a fresh message first, so the offer is
+            # never lost if Telegram rejects the subsequent deletion.
+            sent = await _send_offer_message(
+                old_message,
+                new_text,
+                new_markup,
+                business_connection_id=bc_id,
             )
-            if bc_id:
-                kwargs['business_connection_id'] = bc_id
-            await safe(bot.edit_message_text, **kwargs)
-        except TelegramRetryAfter as e:
-            log.warning('Could not edit %s offer %s: flood retry_after=%s', action, offer_id, getattr(e, 'retry_after', '?'))
-            return
-        except Exception:
-            log.exception('Could not edit offer %s after %s', offer_id, action)
-            return
+            sent_chat_id = int(getattr(getattr(sent, 'chat', None), 'id', old_message.chat.id))
+            sent_message_id = int(getattr(sent, 'message_id', 0) or 0)
 
-        db.set_offer_status(offer_id, new_status)
+            # Only after the replacement exists, remove the old interactive
+            # offer. The resulting message is therefore completely new and
+            # has no Telegram "изменено" label.
+            try:
+                if bc_id:
+                    await safe(
+                        bot.delete_business_messages,
+                        business_connection_id=bc_id,
+                        message_ids=[old_message.message_id],
+                    )
+                else:
+                    await safe(
+                        bot.delete_message,
+                        chat_id=old_message.chat.id,
+                        message_id=old_message.message_id,
+                    )
+            except Exception as delete_error:
+                # Keeping the old message is preferable to losing the final
+                # state. Its buttons will still be guarded by DB status.
+                log.warning(
+                    'Could not delete old offer %s after replacement: %s',
+                    offer_id,
+                    delete_error,
+                )
+
+            db.update_offer_message(offer_id, sent_chat_id, sent_message_id, bc_id)
+            db.set_offer_status(offer_id, new_status)
+            log.info(
+                'Offer %s moved to %s using a new message (no edit)',
+                offer_id,
+                new_status,
+            )
+        except TelegramRetryAfter as e:
+            log.warning(
+                'Could not create replacement for offer %s: flood retry_after=%s',
+                offer_id,
+                getattr(e, 'retry_after', '?'),
+            )
+        except Exception:
+            log.exception('Could not replace offer %s after %s', offer_id, action)
 
 
 def _parse_expiry(value):
