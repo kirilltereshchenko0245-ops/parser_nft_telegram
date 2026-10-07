@@ -349,7 +349,10 @@ async def _send_offer_message(message: Message, text, markup=None, business_conn
                         chat_id=message.chat.id,
                         text=text,
                         reply_markup=markup,
-                        link_preview_options=LinkPreviewOptions(show_above_text=True, prefer_large_media=True),
+                        # The offer payload itself must never create a preview.
+                        # This is the V23 working sender; the NFT preview is
+                        # delivered separately before the interactive offer.
+                        link_preview_options=LinkPreviewOptions(is_disabled=True),
                     )
                     bc_id = business_connection_id or getattr(message, 'business_connection_id', None)
                     if bc_id:
@@ -2253,11 +2256,11 @@ async def demo_offer_command(m: Message):
         )
         offer = db.get_offer(offer_id)
         text, _ = build_offer_text(offer, parsed['locale'])
-        markup = offer_keyboard(
-            offer_id, parsed['locale'],
-            gift_url=parsed['gift_url'],
-            gift_title_text=gift_title(parsed['gift_name'], parsed['gift_number']),
-        )
+        # Keep the interactive keyboard identical to the proven V23 offer.
+        # The NFT itself is already shown in the separate preview message;
+        # putting another URL button into the offer payload was unnecessary
+        # and could reintroduce Telegram's problematic first-offer payload.
+        markup = offer_keyboard(offer_id, parsed['locale'])
 
         # Queue delivery in the background. The handler returns immediately,
         # while the per-chat + global offer limiter spreads sends across users.
@@ -2299,6 +2302,12 @@ async def _deliver_new_offer(source_message: Message, offer_id: int, text: str, 
             except Exception:
                 log.exception('Could not send NFT preview for offer %s; continuing with offer message', offer_id)
 
+        # Give Telegram a short gap between the NFT preview and the
+        # interactive offer. The old working V23 flow sends only one offer
+        # message; when we additionally show the NFT preview, spacing the two
+        # messages avoids turning them into a burst.
+        if preview_sent:
+            await asyncio.sleep(max(1.0, float(os.getenv('OFFER_PREVIEW_DELAY', '1.5'))))
         sent = await _send_offer_message(source_message, text, markup, business_connection_id=business_connection_id)
         sent_chat_id = int(getattr(getattr(sent, 'chat', None), 'id', source_message.chat.id))
         sent_message_id = int(getattr(sent, 'message_id', 0) or 0)

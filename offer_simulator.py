@@ -106,18 +106,12 @@ def offer_help_text(locale=LOCALE_RU):
 def keyboard(offer_id: int, locale: str, status: str = STATUS_PENDING, gift_url: str | None = None, gift_title_text: str | None = None):
     if status != STATUS_PENDING:
         return None
-    rows = []
-    # Telegram is currently rejecting the full first-offer text when the NFT
-    # URL is embedded as an HTML text_link entity. Keep the NFT link clickable
-    # via a URL button instead; this preserves the DEMO flow without triggering
-    # the PEER_FLOOD seen in the production-like text payload.
-    if gift_url and gift_title_text:
-        rows.append([InlineKeyboardButton(text=gift_title_text, url=gift_url)])
-    rows.append([
+    # Proven V23 keyboard: only the action buttons. The NFT preview/link is
+    # sent separately so the first offer message stays V58-safe.
+    return InlineKeyboardMarkup(inline_keyboard=[[
         InlineKeyboardButton(text='Отклонить', icon_custom_emoji_id=DECLINE_EMOJI_ID, callback_data=f'of:decline:{offer_id}'),
         InlineKeyboardButton(text='Принять', icon_custom_emoji_id=ACCEPT_EMOJI_ID, callback_data=f'of:accept:{offer_id}'),
-    ])
-    return InlineKeyboardMarkup(inline_keyboard=rows)
+    ]])
 
 
 def transfer_keyboard(offer: dict, locale: str):
