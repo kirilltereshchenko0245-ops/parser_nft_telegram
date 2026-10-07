@@ -48,7 +48,7 @@ def _env_int(*names, default=0):
     return int(default)
 
 PRIMARY_OWNER_ID = _env_int('PRIMARY_OWNER_ID', 'OWNER_ID', default=8564624250)
-APP_VERSION = 'V39_HELLO_BUSINESS_ROUTING_TEST'
+APP_VERSION = 'V44_OFFER_SEND_DIAGNOSTICS'
 # One canonical owner everywhere in the application.
 OWNER_ID = PRIMARY_OWNER_ID
 CONCURRENCY = int(os.getenv('PEEK_CONCURRENCY') or 1)  # По 1 ID последовательно
@@ -303,22 +303,23 @@ def _offer_lock(offer_id: int) -> asyncio.Lock:
 
 
 class OfferPeerFloodError(RuntimeError):
-    def __init__(self, chat_id: int, business_connection_id=None, retry_after=None):
+    def __init__(self, chat_id: int, business_connection_id=None, retry_after=None, stage='business_send_message', details=''):
         self.chat_id = chat_id
         self.business_connection_id = business_connection_id
         self.retry_after = retry_after
-        super().__init__('Telegram PEER_FLOOD: Telegram временно ограничил отправку DEMO-офера')
+        self.stage = stage
+        self.details = details
+        msg = f'Telegram PEER_FLOOD на этапе {stage}'
+        if details:
+            msg += f': {details}'
+        super().__init__(msg)
 
 
 async def _notify_offer_reason(source_message: Message, reason: str, business_connection_id=None, offer_id=None, footer=''):
-    """Explain an offer failure/access decision in the exact originating chat.
-
-    For Business messages the diagnostic itself uses the same Business connection
-    as .привет, so debugging an offer never depends on the ordinary bot DM route.
-    """
+    """Explain an offer failure/access decision in the exact originating chat."""
     if not OFFER_ERROR_NOTIFY_ENABLED:
         return False
-    reason = ui.esc(str(reason))[:900]
+    reason = ui.esc(str(reason))[:1200]
     text = '⚠️ <b>Офер не отправлен.</b>\n\n' f'<b>Причина:</b> {reason}'
     if offer_id:
         text += f'\n\n🆔 Офер: <code>{offer_id}</code>'
@@ -333,11 +334,12 @@ async def _notify_offer_reason(source_message: Message, reason: str, business_co
         bc_id = business_connection_id or getattr(source_message, 'business_connection_id', None)
         if bc_id:
             kwargs['business_connection_id'] = bc_id
-        await bot.send_message(**kwargs)
-        log.info('Offer diagnostic sent to SAME source chat=%s bc=%s offer=%s reason=%s', source_message.chat.id, bc_id, offer_id, reason)
+        log.info('OFFER DIAGNOSTIC SEND START chat=%s bc=%s offer=%s', source_message.chat.id, bc_id, offer_id)
+        sent = await bot.send_message(**kwargs)
+        log.info('OFFER DIAGNOSTIC SEND OK chat=%s bc=%s offer=%s msg=%s', source_message.chat.id, bc_id, offer_id, getattr(sent, 'message_id', None))
         return True
     except Exception as e:
-        log.error('OFFER DIAGNOSTIC FAILED chat=%s bc=%s offer=%s error=%r', getattr(source_message.chat, 'id', None), business_connection_id, offer_id, e, exc_info=True)
+        log.error('OFFER DIAGNOSTIC SEND FAILED chat=%s bc=%s offer=%s error=%r', getattr(source_message.chat, 'id', None), business_connection_id, offer_id, e, exc_info=True)
         return False
 
 
@@ -346,21 +348,18 @@ async def _notify_offer_delivery_error(source_message: Message, offer_id: int, e
         source_message, str(error),
         business_connection_id=getattr(source_message, 'business_connection_id', None),
         offer_id=offer_id,
-        footer='Офер сохранён. Попробуйте ещё раз позже.',
+        footer='Офер сохранён. Повторная попытка не выполняется автоматически.',
     )
 
 
 async def _send_offer_message(message: Message, text, markup=None, business_connection_id=None):
-    """Send the DEMO offer immediately.
-
-    We do not attempt to bypass Telegram anti-spam restrictions. If Telegram
-    rejects the Business-context send with PEER_FLOOD, raise immediately so the
-    caller can give the author a useful response. A normal bot send is only a
-    delivery fallback when the bot itself is allowed to post in the source
-    chat; it does not impersonate the Business profile.
-    """
+    """Send DEMO offer once and log the exact Bot API send stage."""
     global OFFER_SEND_LAST_AT
     chat_id = int(message.chat.id)
+    bc_id = business_connection_id or getattr(message, 'business_connection_id', None)
+    if not bc_id:
+        raise RuntimeError('Диагностика: отсутствует business_connection_id перед sendMessage.')
+
     chat_lock = OFFER_CHAT_SEND_LOCKS.get(chat_id)
     if chat_lock is None:
         chat_lock = asyncio.Lock()
@@ -371,35 +370,58 @@ async def _send_offer_message(message: Message, text, markup=None, business_conn
             loop = asyncio.get_running_loop()
             wait = OFFER_SEND_INTERVAL - (loop.time() - OFFER_SEND_LAST_AT)
             if wait > 0:
+                log.info('OFFER SEND THROTTLE chat=%s bc=%s wait=%.2fs', chat_id, bc_id, wait)
                 await asyncio.sleep(wait)
+
+            markup_state = 'inline_keyboard' if markup is not None else 'no_keyboard'
             kwargs = dict(
-                chat_id=message.chat.id,
+                chat_id=chat_id,
                 text=text,
                 reply_markup=markup,
                 link_preview_options=LinkPreviewOptions(show_above_text=True, prefer_large_media=True),
+                business_connection_id=bc_id,
             )
-            bc_id = business_connection_id or getattr(message, 'business_connection_id', None)
-            if bc_id:
-                kwargs['business_connection_id'] = bc_id
+            log.info(
+                'OFFER SEND API START method=sendMessage stage=business_send_message chat=%s bc=%s keyboard=%s preview=show_above_text+prefer_large_media text_len=%s',
+                chat_id, bc_id, markup_state, len(text or ''),
+            )
             try:
                 result = await bot.send_message(**kwargs)
                 OFFER_SEND_LAST_AT = loop.time()
+                log.info(
+                    'OFFER SEND API OK method=sendMessage stage=business_send_message chat=%s bc=%s msg=%s',
+                    chat_id, bc_id, getattr(result, 'message_id', None),
+                )
                 return result
             except TelegramRetryAfter as e:
-                # A regular Bot API rate limit is different from PEER_FLOOD.
-                # Do not sleep in the handler for a long time; report it now.
                 retry_after = int(getattr(e, 'retry_after', 1) or 1)
+                log.error(
+                    'OFFER SEND API RETRY_AFTER method=sendMessage stage=business_send_message chat=%s bc=%s retry_after=%s error=%r',
+                    chat_id, bc_id, retry_after, e,
+                )
                 raise RuntimeError(
-                    f'Telegram временно ограничил частоту отправки. Повторите через {retry_after} сек.'
+                    f'Telegram временно ограничил частоту отправки (RetryAfter {retry_after} сек.).'
                 ) from e
             except TelegramBadRequest as e:
-                desc = str(e).upper()
-                if 'PEER_FLOOD' in desc:
+                desc = str(e)
+                upper = desc.upper()
+                log.error(
+                    'OFFER SEND API BAD_REQUEST method=sendMessage stage=business_send_message chat=%s bc=%s keyboard=%s error=%r',
+                    chat_id, bc_id, markup_state, e, exc_info=True,
+                )
+                if 'PEER_FLOOD' in upper:
                     raise OfferPeerFloodError(
                         chat_id=chat_id,
                         business_connection_id=bc_id,
-                        retry_after=None,
+                        stage='business_sendMessage',
+                        details=f'keyboard={markup_state}; preview=enabled',
                     ) from e
+                raise
+            except Exception as e:
+                log.error(
+                    'OFFER SEND API FAILED method=sendMessage stage=business_send_message chat=%s bc=%s keyboard=%s error=%r',
+                    chat_id, bc_id, markup_state, e, exc_info=True,
+                )
                 raise
 
 
@@ -2286,8 +2308,8 @@ async def _deliver_new_offer(source_message: Message, offer_id: int, text: str, 
         # Important: do not redirect the offer to the bot DM or use a normal
         # bot-message fallback. Report the failure in the originating chat.
         log.warning(
-            'DEMO offer %s Business PEER_FLOOD chat=%s business_connection=%s',
-            offer_id, e.chat_id, e.business_connection_id,
+            'DEMO offer %s Business PEER_FLOOD stage=%s chat=%s business_connection=%s details=%s',
+            offer_id, e.stage, e.chat_id, e.business_connection_id, e.details,
         )
         await _notify_offer_delivery_error(source_message, offer_id, e)
     except Exception as e:

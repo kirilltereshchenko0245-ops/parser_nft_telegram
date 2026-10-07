@@ -10,3 +10,12 @@
 
 Тест:
 `.офер https://t.me/nft/PartySparkler-140864 150 Gram`
+
+
+## V44 offer diagnostics
+V44 records the exact DEMO-offer send stage in `logs/giftparser.log`. For an offer send, look for:
+- `OFFER SEND API START method=sendMessage`
+- `OFFER SEND API OK ...`
+- or `OFFER SEND API BAD_REQUEST ... PEER_FLOOD`
+
+The offer is sent only through the originating Business connection. There is no normal-bot fallback and no anti-spam bypass.

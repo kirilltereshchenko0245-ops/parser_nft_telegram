@@ -1,1 +1,4 @@
-V43_OFFER_PARSER_FIXED
+GiftParser V44 - OFFER SEND DIAGNOSTICS
+
+Purpose: exact logging of the Business Bot API sendMessage stage for DEMO offers.
+No Telegram anti-spam bypass is implemented.
