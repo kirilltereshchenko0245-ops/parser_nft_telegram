@@ -4,50 +4,107 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder, ReplyKeyboardBuilder
 import ui
 from peek_api import AVAILABLE_MODELS, gift_url, owner_url
 
-# Названия кнопок вынесены в константы: бот сравнивает по ним текст сообщений.
-BTN_SEARCH = '🔎 Новый поиск'
+# Главное меню — короткое, с inline-управлением внутри сообщений.
+BTN_SEARCH = '🔎 Парсер'
 BTN_ID = '🆔 Поиск по ID'
-BTN_RANDOM = '🎲 Случайный'
+BTN_RANDOM = '🎲 Случайный парсер'
 BTN_HISTORY = '📚 История'
 BTN_FAVS = '⭐ Избранное'
 BTN_MODELS = '🎁 Модели'
-BTN_PROFILE = '📊 Профиль'
+BTN_PROFILE = '👤 Профиль'
 BTN_HELP = '❓ Помощь'
-BTN_PREMIUM = '💎 Premium'
+BTN_PREMIUM = '💎 Премиум'
 BTN_ADMIN = '⚙️ Админка'
 BTN_OFFERS = '🎁 Оферы'
-BTN_PARSER = '🔎 Парсинг по чатам'
+BTN_PARSER = '🔎 Парсер'
 BTN_CANCEL = '✖️ Отмена'
-BTN_STOP = '⏹ Остановить'  # оставлено для совместимости со старыми клавиатурами
+BTN_STOP = '⏹ Остановить'
 
 MODELS_PER_PAGE = 12
 LIST_PER_PAGE = 8
 
-
-# ───────────── reply-клавиатуры ─────────────
 def main_menu(admin=False, premium=False, parser_visible=True):
     b = ReplyKeyboardBuilder()
-    b.row(KeyboardButton(text=BTN_SEARCH), KeyboardButton(text=BTN_ID))
-    b.row(KeyboardButton(text=BTN_RANDOM), KeyboardButton(text=BTN_MODELS))
-    b.row(KeyboardButton(text=BTN_HISTORY), KeyboardButton(text=BTN_FAVS))
-    b.row(KeyboardButton(text=BTN_PROFILE), KeyboardButton(text=BTN_HELP))
-    b.row(KeyboardButton(text=BTN_OFFERS))
-    if parser_visible:
-        b.row(KeyboardButton(text=BTN_PARSER))
-    extra = []
-    if not premium:
-        extra.append(KeyboardButton(text=BTN_PREMIUM))
+    b.row(KeyboardButton(text='🔎 Парсер'), KeyboardButton(text='💎 Премиум'))
+    b.row(KeyboardButton(text='🎁 Оферы'), KeyboardButton(text='👤 Профиль'))
     if admin:
-        extra.append(KeyboardButton(text=BTN_ADMIN))
-    if extra:
-        b.row(*extra)
+        b.row(KeyboardButton(text=BTN_ADMIN))
     return b.as_markup(resize_keyboard=True, input_field_placeholder='Выберите действие…')
 
+def inline_main_menu(admin=False, premium=False, offers=False):
+    b = InlineKeyboardBuilder()
+    b.row(InlineKeyboardButton(text='🔎 Парсер', callback_data='menu:parser'))
+    b.row(InlineKeyboardButton(text='💎 Премиум', callback_data='menu:premium'),
+          InlineKeyboardButton(text='🎁 Оферы', callback_data='menu:offers'))
+    b.row(InlineKeyboardButton(text='👤 Профиль', callback_data='menu:profile'),
+          InlineKeyboardButton(text='❓ Помощь', callback_data='menu:help'))
+    if admin:
+        b.row(InlineKeyboardButton(text='⚙️ Админка', callback_data='menu:admin'))
+    return b.as_markup()
+
+def parser_menu_kb():
+    b = InlineKeyboardBuilder()
+    b.row(InlineKeyboardButton(text='🔎 Обычный парсер', callback_data='parser_ui:regular'))
+    b.row(InlineKeyboardButton(text='🎲 Случайный парсер', callback_data='parser_ui:random'))
+    b.row(InlineKeyboardButton(text='🆔 Поиск по ID', callback_data='parser_ui:id'))
+    b.row(InlineKeyboardButton(text='📡 Парсер чатов', callback_data='parser_ui:chats'))
+    b.row(InlineKeyboardButton(text='‹ Главное меню', callback_data='menu:home'))
+    return b.as_markup()
+
+def profile_menu_kb():
+    b = InlineKeyboardBuilder()
+    b.row(InlineKeyboardButton(text='ПОСЛЕДНИЙ ПАРСИНГ', callback_data='profile:last'))
+    b.row(InlineKeyboardButton(text='⭐ Избранное', callback_data='profile:favorites'), InlineKeyboardButton(text='💳 Покупки', callback_data='profile:payments'))
+    b.row(InlineKeyboardButton(text='📚 История', callback_data='profile:history'))
+    b.row(InlineKeyboardButton(text='💎 Премиум', callback_data='menu:premium'),
+          InlineKeyboardButton(text='🆘 Техподдержка', url='https://t.me/witensea'))
+    b.row(InlineKeyboardButton(text='‹ Главное меню', callback_data='menu:home'))
+    return b.as_markup()
+
+def premium_menu_kb():
+    b = InlineKeyboardBuilder()
+    b.row(InlineKeyboardButton(text='⚡ 7 TON · 2 дня', callback_data='buy:premium_2d'))
+    b.row(InlineKeyboardButton(text='📡 10 TON · чаты · 24 часа', callback_data='buy:chat_24h'))
+    b.row(InlineKeyboardButton(text='🎁 25 TON · оферы · 5 дней', callback_data='buy:offers_5d'))
+    b.row(InlineKeyboardButton(text='‹ Главное меню', callback_data='menu:home'))
+    return b.as_markup()
+
+def offers_locked_kb():
+    b = InlineKeyboardBuilder()
+    b.row(InlineKeyboardButton(text='💎 Купить доступ в Премиум', callback_data='menu:premium'))
+    b.row(InlineKeyboardButton(text='📖 Инструкция по установке', callback_data='offers:install'))
+    b.row(InlineKeyboardButton(text='‹ Главное меню', callback_data='menu:home'))
+    return b.as_markup()
+
+def offers_active_kb():
+    b = InlineKeyboardBuilder()
+    b.row(InlineKeyboardButton(text='⚙️ Настроить профиль передачи', callback_data='offer:self:profile'))
+    b.row(InlineKeyboardButton(text='📖 Инструкция по установке', callback_data='offers:install'))
+    b.row(InlineKeyboardButton(text='‹ Главное меню', callback_data='menu:home'))
+    return b.as_markup()
+
+def catalog_kb(items, page, pages, query=''):
+    b = InlineKeyboardBuilder()
+    for i in range(0, len(items), 2):
+        row = []
+        for title, model in items[i:i+2]:
+            row.append(InlineKeyboardButton(text=title, callback_data=f'catalog:pick:{model}'))
+        b.row(*row)
+    nav=[]
+    if page > 1:
+        nav.append(InlineKeyboardButton(text='‹', callback_data=f'catalog:page:{page-1}:{query}'))
+    nav.append(InlineKeyboardButton(text=f'{page}/{pages}', callback_data='noop'))
+    if page < pages:
+        nav.append(InlineKeyboardButton(text='›', callback_data=f'catalog:page:{page+1}:{query}'))
+    b.row(*nav)
+    b.row(InlineKeyboardButton(text='🔎 Поиск по названию', callback_data='catalog:query'))
+    b.row(InlineKeyboardButton(text='‹ Парсер', callback_data='menu:parser'))
+    return b.as_markup()
 
 def cancel():
-    b = ReplyKeyboardBuilder()
-    b.add(KeyboardButton(text=BTN_CANCEL))
-    return b.as_markup(resize_keyboard=True, input_field_placeholder='Введите значение…')
+    b = InlineKeyboardBuilder()
+    b.row(InlineKeyboardButton(text='‹ Отмена', callback_data='fsm:cancel'))
+    return b.as_markup()
 
 
 # ───────────── карточка подарка ─────────────

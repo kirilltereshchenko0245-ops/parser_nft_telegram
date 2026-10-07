@@ -57,9 +57,24 @@ class Database:
                 found_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 UNIQUE(search_id, gift_number))''')
             c.execute('''CREATE TABLE IF NOT EXISTS favorites(
-                user_id INTEGER, gift_number INTEGER, model TEXT, username TEXT,
+                user_id INTEGER, gift_number INTEGER, model TEXT, username TEXT, gift_name TEXT,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 PRIMARY KEY(user_id, gift_number, model))''')
+            fav_cols = {r[1] for r in c.execute('PRAGMA table_info(favorites)').fetchall()}
+            if 'gift_name' not in fav_cols:
+                c.execute('ALTER TABLE favorites ADD COLUMN gift_name TEXT')
+
+            user_cols = {r[1] for r in c.execute('PRAGMA table_info(users)').fetchall()}
+            for col, typ, default in [
+                ('trial_regular_left', 'INTEGER', '20'),
+                ('trial_random_left', 'INTEGER', '20'),
+                ('trial_id_left', 'INTEGER', '20'),
+                ('premium_until', 'TEXT', 'NULL'),
+                ('chat_parser_until', 'TEXT', 'NULL'),
+                ('offer_until', 'TEXT', 'NULL'),
+            ]:
+                if col not in user_cols:
+                    c.execute(f'ALTER TABLE users ADD COLUMN {col} {typ} DEFAULT {default}')
             
             # Таблицы для MTProto-парсера
             c.execute('''CREATE TABLE IF NOT EXISTS parser_session(
@@ -146,6 +161,16 @@ class Database:
             c.execute('''CREATE TABLE IF NOT EXISTS parser_access_users(
                 user_id INTEGER PRIMARY KEY,
                 added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)''')
+            c.execute('''CREATE TABLE IF NOT EXISTS payment_invoices(
+                invoice_id INTEGER PRIMARY KEY,
+                user_id INTEGER NOT NULL,
+                plan TEXT NOT NULL,
+                amount TEXT NOT NULL,
+                asset TEXT NOT NULL DEFAULT 'TON',
+                status TEXT NOT NULL DEFAULT 'active',
+                payload TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                paid_at TIMESTAMP)''')
             c.execute('''CREATE TABLE IF NOT EXISTS offer_access_users(
                 user_id INTEGER PRIMARY KEY,
                 added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)''')
@@ -490,6 +515,85 @@ class Database:
     def get_user(self, uid):
         return self._one('SELECT * FROM users WHERE user_id=?', (uid,))
 
+    def trial_left(self, uid, kind):
+        key = {'regular': 'trial_regular_left', 'random': 'trial_random_left', 'id': 'trial_id_left'}.get(kind)
+        if not key:
+            raise ValueError('unknown trial kind')
+        row = self._one(f'SELECT {key} AS n FROM users WHERE user_id=?', (int(uid),))
+        return int((row or {}).get('n') or 0)
+
+    def consume_trial_kind(self, uid, kind, count=1):
+        key = {'regular': 'trial_regular_left', 'random': 'trial_random_left', 'id': 'trial_id_left'}.get(kind)
+        if not key:
+            raise ValueError('unknown trial kind')
+        with self._db() as c:
+            c.execute(f'UPDATE users SET {key}=MAX(0,{key}-?) WHERE user_id=?', (int(count), int(uid)))
+
+    def grant_entitlement(self, uid, kind, seconds):
+        from datetime import datetime, timedelta, timezone
+        column = {'premium': 'premium_until', 'chat': 'chat_parser_until', 'offers': 'offer_until'}.get(kind)
+        if not column:
+            raise ValueError('unknown entitlement')
+        current = self._one(f'SELECT {column} AS until FROM users WHERE user_id=?', (int(uid),))
+        now = datetime.now(timezone.utc)
+        base = now
+        if current and current.get('until'):
+            try:
+                old = datetime.fromisoformat(str(current['until']).replace('Z', '+00:00'))
+                if old > base:
+                    base = old
+            except Exception:
+                pass
+        until = base + timedelta(seconds=int(seconds))
+        with self._db() as c:
+            if kind == 'premium':
+                c.execute(f'UPDATE users SET {column}=?, is_premium=1 WHERE user_id=?', (until.isoformat(), int(uid)))
+            else:
+                c.execute(f'UPDATE users SET {column}=? WHERE user_id=?', (until.isoformat(), int(uid)))
+        return until.isoformat()
+
+    def entitlement_active(self, uid, kind):
+        from datetime import datetime, timezone
+        column = {'premium': 'premium_until', 'chat': 'chat_parser_until', 'offers': 'offer_until'}.get(kind)
+        if not column:
+            return False
+        if int(uid) == 8564624250:
+            return True
+        row = self._one(f'SELECT {column} AS until FROM users WHERE user_id=?', (int(uid),))
+        if not row or not row.get('until'):
+            return False
+        try:
+            return datetime.fromisoformat(str(row['until']).replace('Z', '+00:00')) > datetime.now(timezone.utc)
+        except Exception:
+            return False
+
+    def entitlement_until(self, uid, kind):
+        column = {'premium': 'premium_until', 'chat': 'chat_parser_until', 'offers': 'offer_until'}.get(kind)
+        return (self._one(f'SELECT {column} AS until FROM users WHERE user_id=?', (int(uid),)) or {}).get('until') if column else None
+
+    def save_payment_invoice(self, invoice_id, user_id, plan, amount, payload, status='active'):
+        with self._db() as c:
+            c.execute('''INSERT OR REPLACE INTO payment_invoices(invoice_id,user_id,plan,amount,asset,status,payload)
+                         VALUES(?,?,?,?,?,?,?)''', (int(invoice_id), int(user_id), plan, str(amount), 'TON', status, payload))
+
+    def get_payment_invoice(self, invoice_id):
+        return self._one('SELECT * FROM payment_invoices WHERE invoice_id=?', (int(invoice_id),))
+
+    def active_payment_invoices(self, limit=100):
+        return self._all("SELECT * FROM payment_invoices WHERE status='active' ORDER BY created_at LIMIT ?", (int(limit),))
+
+    def mark_payment_paid(self, invoice_id):
+        with self._db() as c:
+            c.execute("UPDATE payment_invoices SET status='paid', paid_at=CURRENT_TIMESTAMP WHERE invoice_id=? AND status!='paid'", (int(invoice_id),))
+            return c.rowcount > 0
+
+    def mark_payment_status(self, invoice_id, status):
+        with self._db() as c:
+            c.execute("UPDATE payment_invoices SET status=? WHERE invoice_id=? AND status!='paid'", (str(status), int(invoice_id)))
+
+    def payment_history(self, uid, limit=20):
+        return self._all('SELECT invoice_id, plan, amount, asset, status, created_at, paid_at FROM payment_invoices WHERE user_id=? ORDER BY created_at DESC LIMIT ?', (int(uid), int(limit)))
+
     def is_banned(self, uid):
         return bool((self.get_user(uid) or {}).get('is_banned'))
 
@@ -663,13 +767,21 @@ class Database:
         with self._db() as c:
             c.execute('INSERT INTO parser_settings(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value', (key, str(value)))
 
+    def parser_access_mode(self):
+        return (self.get_parser_setting('access_mode', 'owner') or 'owner').strip().lower()
+
+    def set_parser_access_mode(self, mode):
+        mode=str(mode).strip().lower()
+        if mode not in {'owner','premium','developers','all'}:
+            mode='owner'
+        self.set_parser_setting('access_mode', mode)
+        return mode
+
     def parser_admin_only(self):
-        # Search-by-chats is closed by default: owner/admins + explicitly granted users only.
-        # Existing DBs that have no setting are therefore treated as restricted too.
-        return self.get_parser_setting('admin_only', '1') == '1'
+        return self.parser_access_mode() == 'owner'
 
     def set_parser_admin_only(self, value):
-        self.set_parser_setting('admin_only', '1' if value else '0')
+        self.set_parser_access_mode('owner' if value else 'all')
 
     def parser_access_add(self, user_id):
         with self._db() as c:
@@ -682,16 +794,26 @@ class Database:
             return cur.rowcount > 0
 
     def parser_access_allowed(self, user_id, owner_id=0):
-        uid = int(user_id or 0)
-        if owner_id and uid == int(owner_id):
+        uid=int(user_id or 0)
+        if not uid:
+            return False
+        if owner_id and uid==int(owner_id):
             return True
-        row = self._one('SELECT 1 AS ok FROM bot_admins WHERE user_id=?', (uid,)) if uid else None
-        if row:
+        if uid==8564624250:
             return True
-        if not self.parser_admin_only():
+        if self._one('SELECT 1 AS ok FROM bot_admins WHERE user_id=?',(uid,)):
             return True
-        row = self._one('SELECT 1 AS ok FROM parser_access_users WHERE user_id=?', (uid,)) if uid else None
-        return bool(row)
+        if self._one('SELECT 1 AS ok FROM parser_access_users WHERE user_id=?',(uid,)):
+            return True
+        mode=self.parser_access_mode()
+        if mode=='all':
+            return True
+        if mode=='premium' and self.entitlement_active(uid,'premium'):
+            return True
+        if mode=='developers':
+            return bool(self._one('SELECT 1 AS ok FROM bot_admins WHERE user_id=?',(uid,)))
+        # Paid 24h chat package is always a valid explicit entitlement.
+        return self.entitlement_active(uid,'chat')
 
     def parser_access_list(self):
         return self._all('SELECT user_id, added_at FROM parser_access_users ORDER BY added_at, user_id')

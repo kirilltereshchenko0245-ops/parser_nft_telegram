@@ -33,14 +33,11 @@ def _session_owned(session, uid):
     return bool(session and int(session.get('owner_id') or 0) == int(uid))
 
 CANONICAL_OWNER_ID = 8564624250
-PARSER_ACCESS_VERSION = 'V23'
+PARSER_ACCESS_VERSION = 'V25'
 
 def _parser_access_allowed(db, uid):
-    # Абсолютный bypass для владельца проекта. Никакая настройка БД,
-    # parser session owner или старый Railway OWNER_ID не может его закрыть.
-    if int(uid or 0) == CANONICAL_OWNER_ID:
-        return True
-    return db.parser_access_allowed(uid, CANONICAL_OWNER_ID)
+    # Единственный источник доступа: владелец/админ, выданный доступ или активный платный 24h-доступ.
+    return db.parser_access_allowed(int(uid or 0), CANONICAL_OWNER_ID)
 
 
 
@@ -117,7 +114,7 @@ async def parser_menu_handler(message: Message, state: FSMContext, db):
             '🔒 <b>Нет доступа к поиску по чатам.</b>\n\n'
             f'Ваш Telegram ID: <code>{uid}</code>\n'
             f'ID владельца в этой сборке: <code>{CANONICAL_OWNER_ID}</code>\n\n'
-            'Если эти ID совпадают, доступ должен быть разрешён. Версия: <code>V22</code>.'
+            'Если эти ID совпадают, доступ должен быть разрешён. Версия: <code>V24</code>.'
         )
     await state.clear()
     session = db.get_parser_session()
@@ -149,7 +146,7 @@ async def parser_connect_handler(call: CallbackQuery, state: FSMContext, db):
     StringSession through the PARSER_SESSION_STRING environment variable.
     """
     session = db.get_parser_session()
-    if session and session.get('session_string') and _session_owned(session, call.from_user.id):
+    if session and session.get('session_string') and _parser_access_allowed(db, call.from_user.id):
         try:
             await ensure_client(db)
             await call.message.edit_text(
@@ -354,6 +351,14 @@ async def parser_limit_handler(call: CallbackQuery, state: FSMContext, db):
         )
         return
     await start_scan_with_limit(call, call.from_user.id, state, db, int(value), call)
+
+
+@router.callback_query(F.data == 'parser:fsm_cancel')
+async def parser_fsm_cancel(call: CallbackQuery, state: FSMContext, db):
+    await state.clear()
+    await call.answer('Отменено')
+    session=db.get_parser_session()
+    await call.message.edit_text(format_parser_menu(session), reply_markup=parser_kb.parser_main_menu(bool(session and session.get('is_active'))))
 
 
 @router.message(ParserStates.waiting_limit)

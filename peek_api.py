@@ -16,16 +16,9 @@ except ImportError:  # прокси необязателен
 PEEK_URL = 'https://server.peek.tg/api/nft/gifts/search'
 log = logging.getLogger(__name__)
 
-AVAILABLE_MODELS = [
-    'PreciousPeach', 'PlushPepe', 'HeroicHelmet', 'MightyArm', 'IonGem', 'DurovsCap', 'NailBracelet',
-    'PerfumeBottle', 'MagicPotion', 'MiniOscar', 'AstralShard', 'ArtisanBrick', 'GemSignet', 'GenieLamp',
-    'BondedRing', 'SharpTongue', 'ElectricSkull', 'BlingBinky', 'WestsideSign', 'KissedFrog', 'LootBag',
-    'SignetRing', 'ToyBear', 'IceCream', 'DeskCalendar', 'LightSword', 'SnowGlobe', 'ScaredCat',
-    'JoyfulBundle', 'EasterEgg', 'JellyBunny', 'RestlessJar', 'PrettyPosy', 'SwagBag', 'StellarRocket',
-    'PetSnake', 'GingerCookie', 'FreshSocks', 'BerryBox', 'InputKey', 'VictoryMedal', 'HypnoLollipop',
-    'SnoopCigar', 'EvilEye', 'SpringBasket', 'ValentineBox', 'LushBouquet', 'RecordPlayer', 'InstantRamen',
-    'HexPot', 'SnakeBox', 'IonicDryer', 'HomemadeCake', 'SpicedWine', 'SantaHat', 'EternalRose',
-]
+from gift_catalog import GIFT_MODELS
+
+AVAILABLE_MODELS = GIFT_MODELS
 
 
 # ───────────── названия моделей ─────────────
@@ -138,7 +131,7 @@ class PeekAPI:
             connector = ProxyConnector.from_url(self.proxy_url, rdns=True)
         self.session = aiohttp.ClientSession(
             connector=connector, timeout=self.timeout,
-            headers={'User-Agent': 'GiftParser/5.2', 'Accept': 'application/json, text/plain, */*',
+            headers={'User-Agent': 'GiftParser/24.0', 'Accept': 'application/json, text/plain, */*',
                      'Origin': 'https://peek.tg', 'Referer': 'https://peek.tg/'})
 
     async def get_gift(self, model, number, retries=4):
