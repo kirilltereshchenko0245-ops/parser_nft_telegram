@@ -1964,15 +1964,14 @@ async def demo_offer_command(m: Message):
         if not business_owner_id or not bool((bc_row or {}).get('is_enabled', 1)):
             log.warning('Ignoring .офер: Business connection unavailable: %s', business_connection_id)
             return
-        # A command inside a Business-managed chat is valid only when the
-        # person who typed it is the owner of THIS Business connection.
-        # This prevents an unauthorized friend from triggering another user's
-        # Business account by simply writing `.офер` to their chat.
-        if business_owner_id != sender_id:
-            log.info('Ignoring cross-user Business .офер sender=%s business_owner=%s', sender_id, business_owner_id)
-            return
-        if not offer_ready_for_user(sender_id, sender_username, business_connection_id):
-            log.info('Ignoring unavailable Business .офер sender=%s connection=%s', sender_id, business_connection_id)
+        # DEMO offers are a bot UI flow, not a real Telegram transaction.
+        # In a Business message, from_user is the customer who wrote in the
+        # managed chat, NOT the Business account owner. Requiring
+        # sender_id == business_owner_id therefore made every Business .офер
+        # silently fail. Authorization is instead tied to the approved active
+        # Business connection itself.
+        if db.offer_user_blocked(business_owner_id) and not is_admin(business_owner_id):
+            log.info('Ignoring blocked Business .офер connection=%s owner=%s', business_connection_id, business_owner_id)
             return
         seller_id = business_owner_id
         seller_display_name = await _business_seller_display_name(business_connection_id)
