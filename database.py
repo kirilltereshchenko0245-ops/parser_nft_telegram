@@ -171,6 +171,16 @@ class Database:
                 payload TEXT,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 paid_at TIMESTAMP)''')
+            c.execute('''CREATE TABLE IF NOT EXISTS xrocket_invoices(
+                client_invoice_id TEXT PRIMARY KEY,
+                provider_invoice_id TEXT NOT NULL,
+                user_id INTEGER NOT NULL,
+                plan TEXT NOT NULL,
+                amount TEXT NOT NULL,
+                asset TEXT NOT NULL DEFAULT 'TON',
+                status TEXT NOT NULL DEFAULT 'active',
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                paid_at TIMESTAMP)''')
             c.execute('''CREATE TABLE IF NOT EXISTS offer_access_users(
                 user_id INTEGER PRIMARY KEY,
                 added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)''')
@@ -593,6 +603,26 @@ class Database:
 
     def payment_history(self, uid, limit=20):
         return self._all('SELECT invoice_id, plan, amount, asset, status, created_at, paid_at FROM payment_invoices WHERE user_id=? ORDER BY created_at DESC LIMIT ?', (int(uid), int(limit)))
+
+    def save_xrocket_invoice(self, client_invoice_id, provider_invoice_id, user_id, plan, amount, asset='TON', status='active'):
+        with self._db() as c:
+            c.execute('''INSERT OR REPLACE INTO xrocket_invoices(client_invoice_id,provider_invoice_id,user_id,plan,amount,asset,status) VALUES(?,?,?,?,?,?,?)''',
+                      (str(client_invoice_id),str(provider_invoice_id),int(user_id),str(plan),str(amount),str(asset),str(status)))
+    def active_xrocket_invoices(self, limit=100):
+        return self._all("SELECT * FROM xrocket_invoices WHERE status='active' ORDER BY created_at LIMIT ?", (int(limit),))
+    def mark_xrocket_paid(self, client_invoice_id):
+        with self._db() as c:
+            c.execute("UPDATE xrocket_invoices SET status='paid', paid_at=CURRENT_TIMESTAMP WHERE client_invoice_id=? AND status!='paid'", (str(client_invoice_id),))
+            return c.rowcount > 0
+    def mark_xrocket_status(self, client_invoice_id, status):
+        with self._db() as c:
+            c.execute("UPDATE xrocket_invoices SET status=? WHERE client_invoice_id=? AND status!='paid'", (str(status),str(client_invoice_id)))
+
+    def user_count(self):
+        row=self._one('SELECT COUNT(*) AS n FROM users')
+        return int((row or {}).get('n') or 0)
+    def all_user_ids(self):
+        return [int(r['user_id']) for r in self._all('SELECT user_id FROM users ORDER BY user_id')]
 
     def is_banned(self, uid):
         return bool((self.get_user(uid) or {}).get('is_banned'))

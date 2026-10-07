@@ -23,7 +23,7 @@ import ui
 from database import Database
 from peek_api import AVAILABLE_MODELS, PeekAPI, gift_url, is_known_model, normalize_model_name, suggest_models
 from gift_catalog import GIFT_CATALOG, GIFT_MODELS, GIFT_BY_API, GIFT_PAGE_SIZE
-from payments import CryptoPay
+from payments import CryptoPay, XRocketPay
 from parsing import handlers as parser_handlers
 from offer_simulator import (parse_offer_command, offer_help_text, keyboard as offer_keyboard, build_offer_text, accepted_alert_text, final_offer_text, declined_text, transfer_keyboard, STATUS_PENDING, STATUS_ACCEPTED, STATUS_DECLINED)
 
@@ -34,7 +34,7 @@ log = logging.getLogger('giftparser')
 
 TOKEN = os.getenv('BOT_TOKEN')
 PRIMARY_OWNER_ID = 8564624250
-APP_VERSION = 'V25_ADMIN_OFFERS_STABILITY'
+APP_VERSION = 'V26_BROADCAST_XROCKET_STABILITY'
 # Canonical project owner. This is intentionally independent of a stale Railway OWNER_ID.
 OWNER_ID = PRIMARY_OWNER_ID
 CONCURRENCY = int(os.getenv('PEEK_CONCURRENCY') or 1)  # По 1 ID последовательно
@@ -62,6 +62,7 @@ db.parser_access_add(PRIMARY_OWNER_ID)
 log.info('PARSER ACCESS BOOT version=%s owner=%s db=%s', APP_VERSION, PRIMARY_OWNER_ID, os.path.abspath(db_path))
 api = PeekAPI(CONCURRENCY)
 crypto_pay = CryptoPay(os.getenv('CRYPTO_PAY_API_TOKEN'))
+xrocket_pay = XRocketPay(os.getenv('XROCKET_PAY_API_TOKEN'))
 ACTIVE: set[int] = set()  # пользователи с запущенным поиском
 OFFER_ACTION_LOCKS: dict[int, asyncio.Lock] = {}
 OFFER_CHAT_SEND_LOCKS: dict[int, asyncio.Lock] = {}
@@ -101,6 +102,7 @@ class S(StatesGroup):
     catalog_query = State()
     admin_user_profile_name = State()
     admin_user_profile_url = State()
+    admin_broadcast = State()
 
 
 # ───────────────────────── помощники ─────────────────────────
@@ -378,8 +380,9 @@ async def start(m: Message, state: FSMContext):
     await audit('Запуск /start', m.from_user.id)
     await state.clear()
     u = db.get_user(m.from_user.id) or {}
-    await m.answer(' ', reply_markup=ReplyKeyboardRemove())
-    await m.answer(ui.v24_welcome(), reply_markup=kb.inline_main_menu(is_admin(m.from_user.id), is_unlimited(m.from_user.id)))
+    # Telegram rejects empty text messages; remove legacy reply keyboard without sending a blank message.
+    welcome = await m.answer(ui.v24_welcome(), reply_markup=ReplyKeyboardRemove())
+    await welcome.edit_reply_markup(reply_markup=kb.inline_main_menu(is_admin(m.from_user.id), is_unlimited(m.from_user.id)))
 
 
 @dp.message(F.text == kb.BTN_CANCEL)
@@ -1040,40 +1043,62 @@ async def v24_chats(c: CallbackQuery,state:FSMContext):
     await c.message.edit_text(parser_handlers.format_parser_menu(session),reply_markup=parser_kb.parser_main_menu(bool(session and session.get('is_active'))))
 
 @dp.callback_query(F.data.startswith('buy:'))
-async def v24_buy(c: CallbackQuery):
-    uid=c.from_user.id; plan=c.data.split(':',1)[1]
-    plans={'premium_2d':('7','premium',172800,'Премиум на 2 дня'),'chat_24h':('10','chat',86400,'Парсер чатов на 24 часа'),'offers_5d':('25','offers',432000,'Оферы на 5 дней')}
-    if plan not in plans: return await c.answer('Неизвестный тариф',show_alert=True)
-    if not crypto_pay.configured: return await c.answer('Платежи пока не настроены: добавь CRYPTO_PAY_API_TOKEN в Railway Variables.',show_alert=True)
-    amount,kind,seconds,title=plans[plan]
-    payload=f'giftparser:{uid}:{plan}:{int(time.time())}'
-    try:
-        inv=await crypto_pay.create_invoice(amount,f'GiftParser — {title}',payload)
-        db.save_payment_invoice(inv['invoice_id'],uid,plan,amount,payload)
-        url=inv.get('bot_invoice_url') or inv.get('mini_app_invoice_url') or inv.get('web_app_invoice_url')
-        if not url: raise RuntimeError('CryptoBot не вернул ссылку на оплату')
-        await c.answer('Счёт создан')
-        await c.message.answer(f'💳 <b>ОПЛАТА</b>\n\n{ui.esc(title)}\nСумма: <b>{amount} TON</b>\n\nПосле оплаты доступ включится автоматически.',reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text='💳 Оплатить в CryptoBot',url=url)],[InlineKeyboardButton(text='💎 К тарифам',callback_data='menu:premium')]]))
-    except Exception as e:
-        log.exception('CryptoPay invoice failed uid=%s plan=%s',uid,plan)
-        await c.answer(f'Ошибка оплаты: {str(e)[:180]}',show_alert=True)
-
-@dp.callback_query(F.data == 'profile:last')
-async def v24_profile_last(c: CallbackQuery):
-    uid=c.from_user.id; row=db.last_resumable_search(uid)
+async def buy_plan(c: CallbackQuery):
+    uid = int(c.from_user.id)
+    plan = c.data.split(':', 1)[1]
+    plans = {
+        'premium_2d': ('7', 'premium', 172800, 'Премиум · 2 дня'),
+        'chat_24h': ('10', 'chat', 86400, 'Парсер чатов · 24 часа'),
+        'offers_5d': ('25', 'offers', 432000, 'Оферы · 5 дней'),
+    }
+    if plan not in plans:
+        return await c.answer('Тариф не найден', show_alert=True)
+    amount, kind, seconds, title = plans[plan]
     await c.answer()
-    if not row:
-        return await c.message.edit_text('🔎 <b>ПОСЛЕДНИЙ ПАРСИНГ</b>\n\nПока нет незавершённых поисков.', reply_markup=kb.profile_menu_kb())
-    text=(f'🔎 <b>ПОСЛЕДНИЙ ПАРСИНГ</b>\n\n'
-          f'🎁 {ui.esc(ui.pretty(row["model"]))}\n'
-          f'🆔 <code>{row["start_id"]}–{row["end_id"]}</code>\n'
-          f'📌 Статус: <b>{ui.esc(row["status"])}</b>\n'
-          f'🔢 Последний ID: <code>{row["last_checked_id"]}</code>')
-    await c.message.edit_text(text, reply_markup=kb.history_detail_kb(row))
+    payload = f'{uid}:{plan}:{int(time.time())}'
+    markup = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text='💳 CryptoBot', callback_data=f'pay:crypto:{plan}')],
+        [InlineKeyboardButton(text='🚀 xRocket', callback_data=f'pay:xrocket:{plan}')],
+        [InlineKeyboardButton(text='‹ Премиум', callback_data='menu:premium')],
+    ])
+    await c.message.edit_text(f'💳 <b>{ui.esc(title)}</b>\n\nСтоимость: <b>{amount} TON</b>\n\nВыбери способ оплаты:', reply_markup=markup)
 
-@dp.callback_query(F.data == 'profile:history')
-async def v24_profile_history(c: CallbackQuery):
-    await c.answer(); await history(c.message)
+async def _create_crypto_invoice(c: CallbackQuery, plan: str):
+    plans = {'premium_2d':('7','premium',172800,'Премиум · 2 дня'),'chat_24h':('10','chat',86400,'Парсер чатов · 24 часа'),'offers_5d':('25','offers',432000,'Оферы · 5 дней')}
+    amount, kind, seconds, title = plans[plan]; uid=int(c.from_user.id)
+    if not crypto_pay.configured:
+        return await c.answer('CryptoBot не настроен.', show_alert=True)
+    payload=f'{uid}:{plan}:{int(time.time())}'
+    try:
+        inv=await crypto_pay.create_invoice(amount, f'GiftParser — {title}', payload)
+        db.save_payment_invoice(inv['invoice_id'], uid, plan, amount, payload)
+        url=inv.get('bot_invoice_url') or inv.get('mini_app_invoice_url') or inv.get('web_app_invoice_url')
+        if not url: raise RuntimeError('CryptoBot не вернул ссылку оплаты')
+        await c.message.edit_text(f'💳 <b>CryptoBot</b>\n\nТариф: <b>{ui.esc(title)}</b>\nСумма: <b>{amount} TON</b>\n\nПосле оплаты доступ активируется автоматически.', reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text='💳 Оплатить CryptoBot', url=url)],[InlineKeyboardButton(text='‹ Назад', callback_data=f'buy:{plan}')]]))
+    except Exception as e:
+        log.exception('CryptoBot invoice failed uid=%s plan=%s',uid,plan); await c.answer('Не удалось создать счёт.',show_alert=True)
+
+@dp.callback_query(F.data.startswith('pay:crypto:'))
+async def pay_crypto(c: CallbackQuery):
+    return await _create_crypto_invoice(c, c.data.split(':',2)[2])
+
+@dp.callback_query(F.data.startswith('pay:xrocket:'))
+async def pay_xrocket(c: CallbackQuery):
+    plan=c.data.split(':',2)[2]
+    plans={'premium_2d':('7','premium',172800,'Премиум · 2 дня'),'chat_24h':('10','chat',86400,'Парсер чатов · 24 часа'),'offers_5d':('25','offers',432000,'Оферы · 5 дней')}
+    if plan not in plans: return await c.answer('Тариф не найден',show_alert=True)
+    amount, kind, seconds, title=plans[plan]; uid=int(c.from_user.id)
+    if not xrocket_pay.configured: return await c.answer('xRocket не настроен. Добавь XROCKET_PAY_API_TOKEN.',show_alert=True)
+    client_id=f'gp_{uid}_{plan}_{int(time.time()*1000)}'
+    try:
+        inv=await xrocket_pay.create_invoice(amount, title, client_id, uid, c.from_user.username)
+        db.save_xrocket_invoice(client_id, str(inv.get('id') or client_id), uid, plan, amount, 'TON', 'active')
+        url=((inv.get('links') or {}).get('telegramBotLink') or (inv.get('links') or {}).get('webLink'))
+        if not url: raise RuntimeError('xRocket не вернул ссылку оплаты')
+        await c.answer()
+        await c.message.edit_text(f'🚀 <b>xRocket</b>\n\nТариф: <b>{ui.esc(title)}</b>\nСумма: <b>{amount} TON</b>\n\nПосле оплаты доступ активируется автоматически.', reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text='🚀 Оплатить через xRocket', url=url)],[InlineKeyboardButton(text='‹ Назад', callback_data=f'buy:{plan}')]]))
+    except Exception as e:
+        log.exception('xRocket invoice failed uid=%s plan=%s',uid,plan); await c.answer('Не удалось создать xRocket-счёт.',show_alert=True)
 
 @dp.callback_query(F.data == 'profile:payments')
 async def v24_profile_payments(c: CallbackQuery):
@@ -1206,6 +1231,78 @@ async def offer_self_back(c: CallbackQuery):
         pass
 
 
+# ───────────────────────── Рассылка ─────────────────────────
+@dp.callback_query(F.data == 'adm:broadcast')
+async def adm_broadcast_start(c: CallbackQuery, state: FSMContext):
+    if not is_admin(c.from_user.id):
+        return await c.answer('Нет доступа', show_alert=True)
+    await c.answer()
+    await state.set_state(S.admin_broadcast)
+    await c.message.edit_text(
+        '📣 <b>РАССЫЛКА</b>\n\n'
+        'Отправь следующим сообщением то, что нужно разослать: <b>текст, фото, GIF, видео, документ, аудио, голосовое или стикер</b>.\n\n'
+        'Поддерживается одно сообщение за рассылку. После получения я покажу подтверждение.',
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text='‹ Назад', callback_data='adm:home')]])
+    )
+
+@dp.callback_query(F.data == 'adm:broadcast_cancel')
+async def adm_broadcast_cancel(c: CallbackQuery, state: FSMContext):
+    if not is_admin(c.from_user.id):
+        return await c.answer('Нет доступа', show_alert=True)
+    await state.clear()
+    await c.answer('Отменено')
+    await c.message.edit_text('⚙️ <b>АДМИН-ПАНЕЛЬ</b>', reply_markup=admin_home_kb())
+
+@dp.message(S.admin_broadcast)
+async def adm_broadcast_preview(m: Message, state: FSMContext):
+    if not is_admin(m.from_user.id):
+        await state.clear(); return
+    await state.update_data(broadcast_chat_id=m.chat.id, broadcast_message_id=m.message_id)
+    count = db.user_count() if hasattr(db, 'user_count') else len(db.recent_users(1000000))
+    await m.answer(
+        f'📣 <b>ПРЕДПРОСМОТР РАССЫЛКИ</b>\n\nПолучателей: <b>{count}</b>\n\nЕсли сообщение выше корректное — нажми «Начать рассылку».',
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text='🚀 Начать рассылку', callback_data='adm:broadcast_send')],
+            [InlineKeyboardButton(text='✖️ Отмена', callback_data='adm:broadcast_cancel')],
+        ])
+    )
+
+@dp.callback_query(F.data == 'adm:broadcast_send')
+async def adm_broadcast_send(c: CallbackQuery, state: FSMContext):
+    if not is_admin(c.from_user.id):
+        return await c.answer('Нет доступа', show_alert=True)
+    data = await state.get_data()
+    source_chat = data.get('broadcast_chat_id'); source_message = data.get('broadcast_message_id')
+    if not source_chat or not source_message:
+        await state.clear(); return await c.answer('Сообщение рассылки не найдено.', show_alert=True)
+    await c.answer('Рассылка запущена')
+    await c.message.edit_text('📣 <b>РАССЫЛКА ЗАПУЩЕНА</b>\n\nБот отправляет сообщения безопасной очередью.')
+    await state.clear()
+    asyncio.create_task(run_broadcast(int(source_chat), int(source_message), int(c.from_user.id)))
+
+async def run_broadcast(source_chat: int, source_message: int, admin_id: int):
+    rows = db.all_user_ids() if hasattr(db, 'all_user_ids') else [int(x['user_id']) for x in db.recent_users(1000000)]
+    sent = failed = 0
+    for uid in rows:
+        try:
+            await bot.copy_message(chat_id=int(uid), from_chat_id=source_chat, message_id=source_message)
+            sent += 1
+        except TelegramRetryAfter as e:
+            await asyncio.sleep(min(int(getattr(e, 'retry_after', 1) or 1), 30) + 0.2)
+            try:
+                await bot.copy_message(chat_id=int(uid), from_chat_id=source_chat, message_id=source_message)
+                sent += 1
+            except Exception:
+                failed += 1
+        except Exception:
+            failed += 1
+        await asyncio.sleep(float(os.getenv('BROADCAST_DELAY', '0.08')))
+    try:
+        await bot.send_message(admin_id, f'✅ <b>РАССЫЛКА ЗАВЕРШЕНА</b>\n\nОтправлено: <b>{sent}</b>\nОшибок: <b>{failed}</b>')
+    except Exception:
+        pass
+    log.info('Broadcast finished admin=%s sent=%s failed=%s', admin_id, sent, failed)
+
 # ───────────────────────── новая админка V25 ─────────────────────────
 def admin_home_kb():
     return InlineKeyboardMarkup(inline_keyboard=[
@@ -1214,6 +1311,7 @@ def admin_home_kb():
         [InlineKeyboardButton(text='🔎 Доступ к парсеру', callback_data='adm:parser_access')],
         [InlineKeyboardButton(text='🎁 Доступ к оферам', callback_data='adm:offer_access')],
         [InlineKeyboardButton(text='💳 Тарифы', callback_data='adm:tariffs')],
+        [InlineKeyboardButton(text='📣 Рассылка', callback_data='adm:broadcast')],
         [InlineKeyboardButton(text='📜 Логи', callback_data='adm:logs')],
         [InlineKeyboardButton(text='🔄 Обновить', callback_data='adm:home')],
     ])
@@ -1825,30 +1923,52 @@ async def demo_offer_action(c: CallbackQuery):
 async def payment_poll_loop():
     while True:
         try:
-            if not crypto_pay.configured:
-                await asyncio.sleep(60)
-                continue
-            for row in db.active_payment_invoices(100):
-                try:
-                    inv = await crypto_pay.get_invoice(row['invoice_id'])
-                    if not inv:
-                        continue
-                    if inv.get('status') == 'expired':
-                        db.mark_payment_status(row['invoice_id'], 'expired')
-                        continue
-                    if inv.get('status') != 'paid':
-                        continue
-                    if not db.mark_payment_paid(row['invoice_id']):
-                        continue
-                    plan=row['plan']; uid=int(row['user_id'])
-                    seconds={'premium_2d':172800,'chat_24h':86400,'offers_5d':432000}.get(plan)
-                    kind={'premium_2d':'premium','chat_24h':'chat','offers_5d':'offers'}.get(plan)
-                    if seconds and kind:
-                        until=db.grant_entitlement(uid,kind,seconds)
-                        await bot.send_message(uid,f'✅ <b>ОПЛАТА ПОДТВЕРЖДЕНА</b>\n\nДоступ активирован.\n⏳ До: <code>{ui.esc(until[:19].replace("T"," "))}</code>')
-                        log.info('Paid plan activated uid=%s plan=%s until=%s',uid,plan,until)
-                except Exception:
-                    log.exception('Payment check failed invoice=%s',row.get('invoice_id'))
+            if crypto_pay.configured:
+                for row in db.active_payment_invoices(100):
+                    try:
+                        inv = await crypto_pay.get_invoice(row['invoice_id'])
+                        if not inv:
+                            continue
+                        if inv.get('status') == 'expired':
+                            db.mark_payment_status(row['invoice_id'], 'expired')
+                            continue
+                        if inv.get('status') != 'paid':
+                            continue
+                        if not db.mark_payment_paid(row['invoice_id']):
+                            continue
+                        plan=row['plan']; uid=int(row['user_id'])
+                        seconds={'premium_2d':172800,'chat_24h':86400,'offers_5d':432000}.get(plan)
+                        kind={'premium_2d':'premium','chat_24h':'chat','offers_5d':'offers'}.get(plan)
+                        if seconds and kind:
+                            until=db.grant_entitlement(uid,kind,seconds)
+                            try:
+                                await bot.send_message(uid,f'✅ <b>ОПЛАТА ПОДТВЕРЖДЕНА</b>\n\nДоступ активирован.\n⏳ До: <code>{ui.esc(until[:19].replace("T"," "))}</code>')
+                            except Exception: pass
+                            log.info('Paid CryptoBot plan activated uid=%s plan=%s until=%s',uid,plan,until)
+                    except Exception:
+                        log.exception('CryptoBot payment check failed invoice=%s',row.get('invoice_id'))
+            if xrocket_pay.configured:
+                for row in db.active_xrocket_invoices(100):
+                    try:
+                        inv = await xrocket_pay.get_invoice(row['provider_invoice_id'])
+                        payment = inv.get('payment') if isinstance(inv, dict) else None
+                        status = str((payment or {}).get('status') or inv.get('status') or '').lower()
+                        if status == 'paid':
+                            if not db.mark_xrocket_paid(row['client_invoice_id']):
+                                continue
+                            plan=row['plan']; uid=int(row['user_id'])
+                            seconds={'premium_2d':172800,'chat_24h':86400,'offers_5d':432000}.get(plan)
+                            kind={'premium_2d':'premium','chat_24h':'chat','offers_5d':'offers'}.get(plan)
+                            if seconds and kind:
+                                until=db.grant_entitlement(uid,kind,seconds)
+                                try:
+                                    await bot.send_message(uid,f'✅ <b>ОПЛАТА XRocket ПОДТВЕРЖДЕНА</b>\n\nДоступ активирован.\n⏳ До: <code>{ui.esc(until[:19].replace("T"," "))}</code>')
+                                except Exception: pass
+                                log.info('Paid xRocket plan activated uid=%s plan=%s until=%s',uid,plan,until)
+                        elif status in {'expired','failed','cancelled'}:
+                            db.mark_xrocket_status(row['client_invoice_id'],status)
+                    except Exception:
+                        log.exception('xRocket payment check failed client_invoice=%s',row.get('client_invoice_id'))
         except Exception:
             log.exception('Payment polling loop failed')
         await asyncio.sleep(15)
@@ -1857,7 +1977,6 @@ async def payment_poll_loop():
 async def main():
     await bot.delete_webhook(drop_pending_updates=True)
     payment_task = asyncio.create_task(payment_poll_loop())
-    # Восстанавливаем сохранённую MTProto StringSession без повторного запроса кода.
     try:
         restored = await parser_handlers.restore_saved_parser_session(db)
         log.info('Saved parser session restore: %s', restored)
@@ -1866,7 +1985,6 @@ async def main():
             log.info('Interrupted parser scan resume: %s', resumed)
     except Exception:
         log.exception('Failed to restore saved parser session')
-
     log.info('STARTED %s | PRIMARY_OWNER_ID=%s | OWNER_ID=%s | DB=%s', APP_VERSION, PRIMARY_OWNER_ID, OWNER_ID, db_path)
     log.info('Log channel configured: %s (startup audit disabled to avoid unnecessary SendMessage)', LOG_CHANNEL_ID)
     await bot.set_my_commands([
@@ -1884,8 +2002,8 @@ async def main():
             pass
         await api.close()
         await crypto_pay.close()
+        await xrocket_pay.close()
         await bot.session.close()
-
 
 if __name__ == '__main__':
     asyncio.run(main())
