@@ -48,7 +48,7 @@ def _env_int(*names, default=0):
     return int(default)
 
 PRIMARY_OWNER_ID = _env_int('PRIMARY_OWNER_ID', 'OWNER_ID', default=8564624250)
-APP_VERSION = 'V59_OFFER_FIXED'
+APP_VERSION = 'V59_OFFER_FIXED_V3'
 BOOTSTRAP_OFFER_ACCESS_IDS = {8570516857}
 # One canonical owner everywhere in the application.
 OWNER_ID = PRIMARY_OWNER_ID
@@ -2113,15 +2113,20 @@ async def demo_offer_command(m: Message):
         if not business_owner_id or not bool((bc_row or {}).get('is_enabled', 1)):
             log.warning('Ignoring .офер: Business connection unavailable: %s', business_connection_id)
             return
-        # A command inside a Business-managed chat is valid only when the
-        # person who typed it is the owner of THIS Business connection.
-        # This prevents an unauthorized friend from triggering another user's
-        # Business account by simply writing `.офер` to their chat.
-        if business_owner_id != sender_id:
-            log.info('Ignoring cross-user Business .офер sender=%s business_owner=%s', sender_id, business_owner_id)
-            return
-        if not offer_ready_for_user(sender_id, sender_username, business_connection_id=business_connection_id):
-            log.info('Ignoring unavailable Business .офер sender=%s connection=%s', sender_id, business_connection_id)
+        # IMPORTANT: for an incoming Telegram Business message, from_user is
+        # normally the CUSTOMER who wrote in the Business chat, not the owner
+        # of the connected Business account. Therefore sender_id must NOT be
+        # compared with business_owner_id here. The exact Business connection
+        # is the authorization boundary for the offer sender.
+        if not offer_ready_for_user(
+            business_owner_id,
+            (bc_row or {}).get('username'),
+            business_connection_id=business_connection_id,
+        ):
+            log.info(
+                'Ignoring unavailable Business .офер sender=%s owner=%s connection=%s',
+                sender_id, business_owner_id, business_connection_id,
+            )
             return
         seller_id = business_owner_id
         seller_display_name = await _business_seller_display_name(business_connection_id)
