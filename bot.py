@@ -48,8 +48,8 @@ def _env_int(*names, default=0):
     return int(default)
 
 PRIMARY_OWNER_ID = _env_int('PRIMARY_OWNER_ID', 'OWNER_ID', default=8564624250)
-APP_VERSION = 'V59_OFFER_FIXED_V6'
-BOOTSTRAP_OFFER_ACCESS_IDS = {8570516857}
+APP_VERSION = 'V59_OFFER_FIXED_V7'
+BOOTSTRAP_OFFER_ACCESS_IDS = set()
 # One canonical owner everywhere in the application.
 OWNER_ID = PRIMARY_OWNER_ID
 CONCURRENCY = int(os.getenv('PEEK_CONCURRENCY') or 1)  # По 1 ID последовательно
@@ -76,11 +76,17 @@ if OWNER_ID:
     db.offer_access_add(OWNER_ID)
     db.admin_add(OWNER_ID)
     db.parser_access_add(OWNER_ID)
-for _offer_uid in BOOTSTRAP_OFFER_ACCESS_IDS:
-    # Explicitly pre-granted DEMO-offer access. The Business connection itself
-    # is still created only when Telegram sends the BusinessConnection update.
-    db.offer_access_add(_offer_uid)
-    db.unblock_offer_user(_offer_uid)
+# V7 one-time clean offer reset. Set OFFER_DB_RESET_V7=1 for the first deploy;
+# after the reset the flag is recorded in bot_settings so restarts do not wipe data again.
+if os.getenv('OFFER_DB_RESET_V7', '0').strip().lower() in {'1','true','yes'} and db.get_setting('offer_db_reset_v7_done') != '1':
+    try:
+        reset_result = db.reset_offer_state_v7(keep_user_ids={OWNER_ID})
+        db.offer_access_add(OWNER_ID)
+        db.unblock_offer_user(OWNER_ID)
+        db.set_setting('offer_db_reset_v7_done', '1')
+        log.warning('V7 OFFER DB RESET COMPLETE: %s', reset_result)
+    except Exception:
+        log.exception('V7 OFFER DB RESET FAILED')
 log.info('OWNER BOOT version=%s owner=%s db=%s', APP_VERSION, OWNER_ID, os.path.abspath(db_path))
 api = PeekAPI(CONCURRENCY)
 crypto_pay = CryptoPay(os.getenv('CRYPTO_PAY_API_TOKEN'))
@@ -339,15 +345,11 @@ async def _send_offer_message(message: Message, text, markup=None, business_conn
                     )
                     if wait > 0:
                         await asyncio.sleep(wait)
-                    # The production first-offer payload must stay inside the
-                    # combinations proven safe by V58: plain full text + URL
-                    # button, with link preview disabled.  Do not put the NFT
-                    # URL into message text and do not request a preview.
                     kwargs = dict(
                         chat_id=message.chat.id,
                         text=text,
                         reply_markup=markup,
-                        link_preview_options=LinkPreviewOptions(is_disabled=True),
+                        link_preview_options=LinkPreviewOptions(show_above_text=True, prefer_large_media=True),
                     )
                     bc_id = business_connection_id or getattr(message, 'business_connection_id', None)
                     if bc_id:
@@ -1834,8 +1836,6 @@ async def adm_log_channel_value(m: Message, state: FSMContext):
 def admin_business_connections_kb():
     rows = db.business_connections_list()
     buttons = []
-    # Show one row per Business owner. Older duplicate connection records are
-    # intentionally hidden here; the per-user reset button removes them.
     seen = set()
     for row in rows[:100]:
         uid = int(row['user_id'])
@@ -1843,13 +1843,11 @@ def admin_business_connections_kb():
             continue
         seen.add(uid)
         name = (' @' + row['username']) if row.get('username') else (row.get('first_name') or str(uid))
-        blocked = db.offer_user_blocked(uid)
-        action = '🟢 Разрешить' if blocked else '🔴 Заблокировать'
-        action_cb = 'unblock' if blocked else 'block'
-        buttons.append([InlineKeyboardButton(
-            text=f'{action} · {str(name).strip()[:20]}',
-            callback_data=f'adm:offer_conn:{action_cb}:{uid}'
-        )])
+        has_access = db.offer_access_allowed(uid, row.get('username'), OWNER_ID)
+        if has_access:
+            buttons.append([InlineKeyboardButton(text=f'🔴 Забрать доступ · {str(name).strip()[:20]}', callback_data=f'adm:offer_conn:revoke:{uid}')])
+        else:
+            buttons.append([InlineKeyboardButton(text=f'🟢 Выдать доступ · {str(name).strip()[:20]}', callback_data=f'adm:offer_conn:grant:{uid}')])
     buttons.append([InlineKeyboardButton(text='‹ Назад', callback_data='adm:offer_access')])
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
@@ -1920,13 +1918,24 @@ async def adm_offer_business_connections(c: CallbackQuery):
     if not is_admin(c.from_user.id): return await c.answer('Нет доступа',show_alert=True)
     await c.answer(); await c.message.edit_text('🔗 <b>BUSINESS-ПРОФИЛИ</b>\n\nНовые подключения по умолчанию закрыты. Нажми кнопку рядом с пользователем, чтобы разрешить или запретить оферы.',reply_markup=admin_business_connections_kb())
 
-@dp.callback_query(F.data.regexp(r'^adm:offer_conn:(block|unblock):-?\d+$'))
+@dp.callback_query(F.data.regexp(r'^adm:offer_conn:(grant|revoke):-?\d+$'))
 async def adm_offer_connection_toggle(c: CallbackQuery):
-    if not is_admin(c.from_user.id): return await c.answer('Нет доступа',show_alert=True)
-    action=c.data.split(':')[2]; uid=int(c.data.split(':')[3])
-    if action=='block': db.block_offer_user(uid); msg='Оферы заблокированы.'
-    else: db.unblock_offer_user(uid); msg='Оферы разрешены.'
-    await c.answer(msg,show_alert=True); await c.message.edit_text('🔗 <b>BUSINESS-ПРОФИЛИ</b>\n\nНовые подключения по умолчанию закрыты.',reply_markup=admin_business_connections_kb())
+    if not is_admin(c.from_user.id): return await c.answer('Нет доступа', show_alert=True)
+    action = c.data.split(':')[2]
+    uid = int(c.data.split(':')[3])
+    if action == 'grant':
+        db.offer_access_add(uid)
+        db.unblock_offer_user(uid)
+        msg = 'Доступ к оферам выдан.'
+        title = '🟢 Доступ к оферам выдан'
+    else:
+        db.offer_access_remove(uid)
+        db.block_offer_user(uid)
+        msg = 'Доступ к оферам забран.'
+        title = '🔴 Доступ к оферам забран'
+    await audit(title, c.from_user.id, f'Пользователь: <code>{uid}</code>')
+    await c.answer(msg, show_alert=True)
+    await c.message.edit_text('🔗 <b>BUSINESS-ПРОФИЛИ</b>\n\n🟢 — доступ выдан\n🔴 — доступ забран.', reply_markup=admin_business_connections_kb())
 
 
 # ───────────────────────── Business routing test ─────────────────────────
@@ -2027,6 +2036,26 @@ async def offer_emoji_helper(m: Message):
     )
 
 
+def new_business_connection_kb(uid):
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text='🟢 Выдать доступ к оферам', callback_data=f'adm:new_offer_conn:grant:{int(uid)}')],
+        [InlineKeyboardButton(text='🔗 Открыть Business-профили', callback_data='adm:offer_business_connections')],
+    ])
+
+@dp.callback_query(F.data.regexp(r'^adm:new_offer_conn:grant:-?\d+$'))
+async def adm_new_offer_connection_grant(c: CallbackQuery):
+    if not is_admin(c.from_user.id):
+        return await c.answer('Нет доступа', show_alert=True)
+    uid=int(c.data.split(':')[3])
+    db.offer_access_add(uid)
+    db.unblock_offer_user(uid)
+    await audit('Выдан доступ к оферам из уведомления Business', c.from_user.id, f'Пользователь: <code>{uid}</code>')
+    await c.answer('Доступ к оферам выдан.', show_alert=True)
+    try:
+        await c.message.edit_text((c.message.text or '') + '\n\n✅ <b>Доступ выдан.</b>', reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text='🔗 Business-профили', callback_data='adm:offer_business_connections')]]))
+    except Exception:
+        pass
+
 @dp.business_connection()
 async def offer_business_connection_update(c: BusinessConnection):
     try:
@@ -2044,12 +2073,8 @@ async def offer_business_connection_update(c: BusinessConnection):
             is_enabled,
         )
         if is_new and is_enabled and owner_id != OWNER_ID:
-            # New Business connections are usable immediately. Explicit admin
-            # blocks still work through offer_blocked_users. This avoids the
-            # old V58/V59 state where every new connection was blocked and
-            # `.офер` silently did nothing while `.привет` worked.
-            db.unblock_offer_user(owner_id)
-            db.offer_access_add(owner_id)
+            # New connections are NOT granted offer access automatically. The
+            # owner must explicitly press the real grant button.
             name = ' '.join(x for x in ((getattr(owner, 'first_name', None) or '').strip(), (getattr(owner, 'last_name', None) or '').strip()) if x).strip() or 'Без имени'
             uname = f"@{getattr(owner, 'username', None)}" if getattr(owner, 'username', None) else 'без username'
             try:
@@ -2059,7 +2084,8 @@ async def offer_business_connection_update(c: BusinessConnection):
                     f'👤 <b>{ui.esc(name)}</b>\n'
                     f'🆔 <code>{owner_id}</code>\n'
                     f'🔗 {ui.esc(uname)}\n\n'
-                    '✅ <b>Оферы доступны автоматически.</b>',
+                    '⛔ <b>Доступ к оферам пока не выдан.</b>',
+                    reply_markup=new_business_connection_kb(owner_id),
                 )
             except Exception:
                 log.exception('Failed to notify owner about new Business connection')
@@ -2151,7 +2177,7 @@ async def demo_offer_command(m: Message):
             try:
                 await bot.send_message(
                     chat_id=m.chat.id,
-                    text='⛔ <b>Оферы заблокированы для этого Business-профиля.</b>',
+                    text='⛔ <b>Доступ к оферам не выдан.</b>\n\nОбратитесь к владельцу бота для получения доступа.',
                     business_connection_id=business_connection_id,
                 )
             except Exception:
@@ -2160,19 +2186,20 @@ async def demo_offer_command(m: Message):
         seller_id = business_owner_id
         seller_display_name = await _business_seller_display_name(business_connection_id)
     else:
-        if not offer_ready_for_user(sender_id, sender_username):
-            log.info('Ignoring normal .офер from user without active Business access: %s', sender_id)
-            return await m.answer('⛔ <b>Для офера сначала подключи Telegram Business.</b>')
-        # For a normal bot PM, use the sender's own saved Business connection.
-        # This avoids ever falling back to OWNER_ID for another authorized user.
+        # Normal private chat: first locate the user's current saved Business
+        # connection, then check offer permission. The old V5 order checked
+        # permission before resolving the connection and therefore returned
+        # "connect Business" even for already-connected users.
         saved_bc = db.get_business_connection_for_user(sender_id)
-        if saved_bc:
-            business_connection_id = saved_bc['connection_id']
-            seller_id = sender_id
-            seller_display_name = await _business_seller_display_name(business_connection_id)
-        else:
-            log.warning('Authorized user %s has no active Business connection; .офер is not sent as OWNER', sender_id)
-            return
+        if not saved_bc:
+            log.info('Normal .офер without saved Business connection: %s', sender_id)
+            return await m.answer('⛔ <b>Для офера сначала подключи Telegram Business.</b>')
+        business_connection_id = saved_bc['connection_id']
+        if not offer_ready_for_user(sender_id, sender_username, business_connection_id=business_connection_id):
+            log.info('Normal .офер denied: user=%s has Business but no offer access', sender_id)
+            return await m.answer('⛔ <b>Доступ к оферам не выдан.</b>\n\nОбратитесь к владельцу бота для получения доступа.')
+        seller_id = sender_id
+        seller_display_name = await _business_seller_display_name(business_connection_id)
 
     if not seller_display_name:
         seller_display_name = os.getenv('OFFER_SELLER_NAME', '').strip() or 'Пользователь'

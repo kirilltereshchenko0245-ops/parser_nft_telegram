@@ -107,8 +107,10 @@ def keyboard(offer_id: int, locale: str, status: str = STATUS_PENDING, gift_url:
     if status != STATUS_PENDING:
         return None
     rows = []
-    # V58 proved that the NFT must not be embedded in the first-offer text. Keep
-    # it only as a separate URL button; this is the safest production payload.
+    # Telegram is currently rejecting the full first-offer text when the NFT
+    # URL is embedded as an HTML text_link entity. Keep the NFT link clickable
+    # via a URL button instead; this preserves the DEMO flow without triggering
+    # the PEER_FLOOD seen in the production-like text payload.
     if gift_url and gift_title_text:
         rows.append([InlineKeyboardButton(text=gift_title_text, url=gift_url)])
     rows.append([
@@ -141,25 +143,23 @@ def _linked_title(offer: dict):
 
 
 def build_offer_text(offer: dict, locale: str, remaining_seconds=None, **_ignored):
-    """Build the safe first-offer payload.
-
-    V58 showed that the production-style payload can trigger Telegram
-    PEER_FLOOD when the NFT URL is embedded in the message text. The first
-    offer therefore contains only plain text. The NFT remains clickable in
-    the separate URL button created by ``keyboard()``. No HTML anchor, no
-    inline URL and no preview are used.
-    """
-    title = esc(gift_title(offer['gift_name'], offer['gift_number']))
-    amount = esc(format_amount(offer['amount'], offer['currency'], locale))
-    sender = esc((offer.get('seller_username') or '').strip()) or 'Пользователь'
+    """Text for the first offer. The NFT title is linked by the URL button."""
+    title = gift_title(offer['gift_name'], offer['gift_number'])
+    amount = format_amount(offer['amount'], offer['currency'], locale)
+    sender = (offer.get('seller_username') or '').strip()
+    # seller_username historically stored @username. For the offer UI we now
+    # deliberately store/render the profile display name (first/last name),
+    # never the @username.
+    sender_html = f'Пользователь <b>{esc(sender)}</b>' if sender else '<b>Пользователь</b>'
+    # Static display only. It intentionally never counts down and never expires.
     if locale == LOCALE_EN:
         return (
-            f'{sender} offers you {amount} for the gift {title}.\n\n'
-            f'Offer expires in 6h.'
+            f'{sender_html} offers you <b>{esc(amount)}</b> for the gift {title}.\n\n'
+            f'Offer expires in <b>6h</b>.'
         ), None
     return (
-        f'{sender} предлагает Вам {amount} за подарок {title}.\n\n'
-        f'Предложение действует ещё 6ч.'
+        f'{sender_html} предлагает Вам <b>{esc(amount)}</b> за подарок {title}.\n\n'
+        f'Предложение действует ещё <b>6ч</b>.'
     ), None
 
 def accepted_alert_text(offer: dict, locale: str):

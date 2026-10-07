@@ -486,6 +486,38 @@ class Database:
             c.execute('DELETE FROM offer_blocked_users WHERE user_id=?', (uid,))
             return cur.rowcount
 
+    def reset_offer_state_v7(self, keep_user_ids=()):
+        """One-time clean reset of local offer state and Business sessions.
+
+        Keeps unrelated bot/parser/admin data. Existing offer history is cleared
+        because it belongs to the resettable offer subsystem. Telegram-side
+        Business connections are not revoked; fresh updates recreate them.
+        """
+        keep = {int(x) for x in (keep_user_ids or ()) if int(x or 0)}
+        with self._db() as c:
+            removed = {}
+            # Offer history / pending state
+            cur = c.execute('DELETE FROM gift_offers')
+            removed['gift_offers'] = cur.rowcount
+            # Access and connection state
+            if keep:
+                ph=','.join('?' for _ in keep)
+                for table,col,key in [
+                    ('offer_access_users','user_id','access_users'),
+                    ('offer_blocked_users','user_id','blocked_users'),
+                    ('offer_business_connections','user_id','business_connections'),
+                    ('offer_user_profiles','user_id','user_profiles'),
+                ]:
+                    cur=c.execute(f'DELETE FROM {table} WHERE {col} NOT IN ({ph})', tuple(keep))
+                    removed[key]=cur.rowcount
+            else:
+                for table,key in [('offer_access_users','access_users'),('offer_blocked_users','blocked_users'),('offer_business_connections','business_connections'),('offer_user_profiles','user_profiles')]:
+                    cur=c.execute(f'DELETE FROM {table}')
+                    removed[key]=cur.rowcount
+            cur=c.execute('DELETE FROM offer_access_usernames')
+            removed['access_usernames']=cur.rowcount
+            return removed
+
     def reset_all_offer_users(self, keep_user_ids=()):
         """Hard reset all local DEMO-offer users/connections.
 
