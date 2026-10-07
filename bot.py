@@ -126,6 +126,57 @@ async def inject_db(handler, event, data):
     return await handler(event, data)
 
 
+# Business diagnostics/repair middleware.  Telegram delivers messages received
+# through a connected Business account as a separate `business_message` update.
+# We deliberately observe EVERY Business message before the command filters so
+# a missing/incorrect command filter can never make the route look dead.
+@dp.business_message.middleware()
+async def business_route_probe(handler, event, data):
+    try:
+        bc_id = getattr(event, 'business_connection_id', None)
+        chat = getattr(event, 'chat', None)
+        sender = getattr(event, 'from_user', None)
+        chat_id = getattr(chat, 'id', None)
+        sender_id = getattr(sender, 'id', None)
+        text_value = getattr(event, 'text', None) or getattr(event, 'caption', None) or ''
+        log.info(
+            'BUSINESS UPDATE RECEIVED chat=%s sender=%s connection=%s text=%r',
+            chat_id, sender_id, bc_id, text_value[:300],
+        )
+
+        # If Telegram has delivered a Business update but this connection is
+        # not cached locally (for example after a DB reset/redeploy), recover
+        # it immediately. Telegram explicitly supports this via
+        # getBusinessConnection for freshly logged-in bots.
+        if bc_id and not db.get_business_connection(bc_id):
+            try:
+                fresh = await bot.get_business_connection(bc_id)
+                owner = getattr(fresh, 'user', None)
+                owner_id = int(getattr(owner, 'id', 0) or 0)
+                if owner_id:
+                    db.save_business_connection(
+                        str(getattr(fresh, 'id', bc_id) or bc_id),
+                        owner_id,
+                        getattr(owner, 'username', None),
+                        getattr(owner, 'first_name', None),
+                        getattr(owner, 'last_name', None),
+                        bool(getattr(fresh, 'is_enabled', True)),
+                    )
+                    db.offer_access_add(owner_id)
+                    db.unblock_offer_user(owner_id)
+                    BUSINESS_OWNER_ID_CACHE[str(getattr(fresh, 'id', bc_id) or bc_id)] = owner_id
+                    log.warning(
+                        'BUSINESS CONNECTION RECOVERED owner=%s connection=%s enabled=%s',
+                        owner_id, bc_id, getattr(fresh, 'is_enabled', True),
+                    )
+            except Exception:
+                log.exception('BUSINESS CONNECTION RECOVERY FAILED connection=%s', bc_id)
+    except Exception:
+        log.exception('BUSINESS ROUTE PROBE FAILED')
+
+    return await handler(event, data)
+
+
 class S(StatesGroup):
     model = State()
     range = State()
@@ -2029,6 +2080,23 @@ async def hello_command_business(m: Message):
         return
 
 
+@dp.business_message(F.text.regexp(r'^\s*\.бизнестест\s*$'))
+async def business_route_test(m: Message):
+    """Explicit end-to-end test for the Business message route."""
+    bc_id = getattr(m, 'business_connection_id', None)
+    chat_id = getattr(getattr(m, 'chat', None), 'id', None)
+    if not bc_id or not chat_id:
+        return
+    try:
+        await bot.send_message(
+            chat_id=chat_id,
+            text='✅ Business-сообщение дошло до бота. Маршрут работает.',
+            business_connection_id=bc_id,
+        )
+    except Exception:
+        log.exception('BUSINESS TEST SEND FAILED chat=%s connection=%s', chat_id, bc_id)
+
+
 # ───────────────────────── DEMO gift offers ─────────────────────────
 def _offer_custom_emoji_id():
     return db.get_setting('offer_custom_emoji_id') or os.getenv('OFFER_CUSTOM_EMOJI_ID', '').strip() or None
@@ -2502,7 +2570,16 @@ async def main():
         BotCommand(command='help', description='Как пользоваться'),
     ])
     try:
-        await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
+        # Keep Business updates explicit.  This prevents a deployment/library
+        # mismatch from silently omitting business_message/business_connection.
+        await dp.start_polling(
+            bot,
+            allowed_updates=[
+                'message', 'callback_query', 'business_message',
+                'business_connection', 'edited_business_message',
+                'deleted_business_messages',
+            ],
+        )
     finally:
         payment_task.cancel()
         try:
