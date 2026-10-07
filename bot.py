@@ -48,7 +48,7 @@ def _env_int(*names, default=0):
     return int(default)
 
 PRIMARY_OWNER_ID = _env_int('PRIMARY_OWNER_ID', 'OWNER_ID', default=8564624250)
-APP_VERSION = 'V32_OFFER_FLOOD_QUEUE'
+APP_VERSION = 'V34_OFFER_IMMEDIATE_BUSINESS_FALLBACK'
 # One canonical owner everywhere in the application.
 OWNER_ID = PRIMARY_OWNER_ID
 CONCURRENCY = int(os.getenv('PEEK_CONCURRENCY') or 1)  # По 1 ID последовательно
@@ -357,13 +357,15 @@ async def _notify_offer_delivery_error(source_message: Message, offer_id: int, e
 
 
 async def _send_offer_message(message: Message, text, markup=None, business_connection_id=None):
-    """Rate-limited offer sender.
+    """Send the DEMO offer immediately.
 
-    Each chat is serialized independently, while a small global gate spreads
-    sends from all Business accounts. Long Telegram RetryAfter values never
-    hold the global gate, so one flooded chat does not stall other users.
+    We do not attempt to bypass Telegram anti-spam restrictions. If Telegram
+    rejects the Business-context send with PEER_FLOOD, raise immediately so the
+    caller can give the author a useful response. A normal bot send is only a
+    delivery fallback when the bot itself is allowed to post in the source
+    chat; it does not impersonate the Business profile.
     """
-    global OFFER_SEND_LAST_AT, OFFER_SEND_BLOCKED_UNTIL
+    global OFFER_SEND_LAST_AT
     chat_id = int(message.chat.id)
     chat_lock = OFFER_CHAT_SEND_LOCKS.get(chat_id)
     if chat_lock is None:
@@ -371,51 +373,58 @@ async def _send_offer_message(message: Message, text, markup=None, business_conn
         OFFER_CHAT_SEND_LOCKS[chat_id] = chat_lock
 
     async with chat_lock:
-        for attempt in range(6):
+        async with OFFER_SEND_GATE:
+            loop = asyncio.get_running_loop()
+            wait = OFFER_SEND_INTERVAL - (loop.time() - OFFER_SEND_LAST_AT)
+            if wait > 0:
+                await asyncio.sleep(wait)
+            kwargs = dict(
+                chat_id=message.chat.id,
+                text=text,
+                reply_markup=markup,
+                link_preview_options=LinkPreviewOptions(show_above_text=True, prefer_large_media=True),
+            )
+            bc_id = business_connection_id or getattr(message, 'business_connection_id', None)
+            if bc_id:
+                kwargs['business_connection_id'] = bc_id
             try:
-                async with OFFER_SEND_GATE:
-                    loop = asyncio.get_running_loop()
-                    wait = max(
-                        OFFER_SEND_INTERVAL - (loop.time() - OFFER_SEND_LAST_AT),
-                        OFFER_SEND_BLOCKED_UNTIL - loop.time(),
-                    )
-                    if wait > 0:
-                        await asyncio.sleep(wait)
-                    kwargs = dict(
-                        chat_id=message.chat.id,
-                        text=text,
-                        reply_markup=markup,
-                        link_preview_options=LinkPreviewOptions(show_above_text=True, prefer_large_media=True),
-                    )
-                    bc_id = business_connection_id or getattr(message, 'business_connection_id', None)
-                    if bc_id:
-                        kwargs['business_connection_id'] = bc_id
-                    result = await bot.send_message(**kwargs)
-                    OFFER_SEND_LAST_AT = loop.time()
-                    return result
+                result = await bot.send_message(**kwargs)
+                OFFER_SEND_LAST_AT = loop.time()
+                return result
             except TelegramRetryAfter as e:
-                retry_after = max(1, int(getattr(e, 'retry_after', 1) or 1))
-                OFFER_SEND_BLOCKED_UNTIL = asyncio.get_running_loop().time() + retry_after + 0.25
-                log.warning('Offer send flood control: retry_after=%ss chat=%s attempt=%s', retry_after, chat_id, attempt + 1)
-                await asyncio.sleep(min(retry_after + random.uniform(0.15, 0.45), 15))
+                # A regular Bot API rate limit is different from PEER_FLOOD.
+                # Do not sleep in the handler for a long time; report it now.
+                retry_after = int(getattr(e, 'retry_after', 1) or 1)
+                raise RuntimeError(
+                    f'Telegram временно ограничил частоту отправки. Повторите через {retry_after} сек.'
+                ) from e
             except TelegramBadRequest as e:
                 desc = str(e).upper()
                 if 'PEER_FLOOD' in desc:
-                    # Do NOT sit inside this task for minutes and retry the same
-                    # restricted Business send. The caller needs the error now.
-                    # The offer remains pending in SQLite and can be retried by a
-                    # separate scheduler later, without hiding the diagnostic.
-                    log.warning(
-                        'OFFER PEER_FLOOD: immediate failure chat=%s business_connection=%s attempt=%s',
-                        chat_id, business_connection_id or getattr(message, 'business_connection_id', None), attempt + 1
-                    )
                     raise OfferPeerFloodError(
                         chat_id=chat_id,
-                        business_connection_id=business_connection_id or getattr(message, 'business_connection_id', None),
+                        business_connection_id=bc_id,
                         retry_after=None,
                     ) from e
                 raise
-        raise RuntimeError('Offer delivery retries exhausted after Telegram flood control')
+
+
+async def _send_plain_chat_fallback(source_message: Message, text, markup=None):
+    """Try a normal bot message in the source chat, without Business identity.
+
+    This is a delivery fallback, not a flood bypass. Telegram may reject it if
+    the bot has no permission to post in that chat.
+    """
+    try:
+        return await bot.send_message(
+            chat_id=source_message.chat.id,
+            text=text,
+            reply_markup=markup,
+            link_preview_options=LinkPreviewOptions(show_above_text=True, prefer_large_media=True),
+        )
+    except Exception as e:
+        log.warning('OFFER PLAIN CHAT FALLBACK FAILED chat=%s error=%r', source_message.chat.id, e)
+        return None
 
 
 async def _delete_offer_command_message(message: Message, business_connection_id=None):
@@ -2105,12 +2114,8 @@ async def demo_offer_command(m: Message):
         text, _ = build_offer_text(offer, parsed['locale'])
         markup = offer_keyboard(offer_id, parsed['locale'])
 
-        # Queue delivery in the background. The handler returns immediately,
-        # while the per-chat + global offer limiter spreads sends across users.
-        task = asyncio.create_task(_deliver_new_offer(m, offer_id, text, markup, business_connection_id))
-        OFFER_DELIVERY_TASKS.add(task)
-        task.add_done_callback(OFFER_DELIVERY_TASKS.discard)
-        log.info('Queued DEMO offer %s; source command=%s queue=%s', offer_id, getattr(m, 'message_id', '?'), len(OFFER_DELIVERY_TASKS))
+        # Deliver synchronously so the author gets an immediate result.
+        await _deliver_new_offer(m, offer_id, text, markup, business_connection_id)
     except Exception:
         if 'offer_id' in locals():
             db.set_offer_status(offer_id, STATUS_DECLINED)
@@ -2129,17 +2134,50 @@ async def _deliver_new_offer(source_message: Message, offer_id: int, text: str, 
             log.warning('Could not delete offer command %s after sending offer %s: %s', getattr(source_message, 'message_id', '?'), offer_id, delete_error)
         log.info('Delivered DEMO offer %s; source command=%s', offer_id, getattr(source_message, 'message_id', '?'))
     except OfferPeerFloodError as e:
-        # Surface the exact problem immediately. Do not mark the DEMO offer
-        # declined: the record is still valid and can be retried later.
+        # The Business identity is what Telegram has restricted. For a DEMO
+        # offer we do not need to impersonate that Business profile: the offer
+        # is only a bot-side UI simulation. First try the exact same offer as a
+        # normal bot message in the source chat. This is a delivery fallback,
+        # not an attempt to circumvent Telegram's anti-spam restriction.
         log.warning(
-            'DEMO offer %s pending due to PEER_FLOOD chat=%s business_connection=%s',
+            'DEMO offer %s Business delivery blocked by PEER_FLOOD chat=%s business_connection=%s',
             offer_id, e.chat_id, e.business_connection_id,
         )
-        await _notify_offer_delivery_error(source_message, offer_id, e)
+        fallback = await _send_plain_chat_fallback(source_message, text, markup)
+        if fallback:
+            sent_chat_id = int(getattr(getattr(fallback, 'chat', None), 'id', source_message.chat.id))
+            sent_message_id = int(getattr(fallback, 'message_id', 0) or 0)
+            db.update_offer_message(offer_id, sent_chat_id, sent_message_id, None)
+            try:
+                # Best effort only: the Business delete can itself be restricted.
+                await _delete_offer_command_message(source_message, business_connection_id=business_connection_id)
+            except Exception as delete_error:
+                log.info('Fallback offer %s sent, but source command was not deleted: %s', offer_id, delete_error)
+            log.info(
+                'Delivered DEMO offer %s via plain-bot fallback after Business PEER_FLOOD chat=%s',
+                offer_id, source_message.chat.id,
+            )
+            return
+
+        # If the ordinary bot route is also unavailable, do not fabricate a
+        # successful offer. Keep the DB record and immediately explain the
+        # transport failure to the author.
+        error_text = (
+            '⚠️ <b>Не удалось отправить DEMO-офер.</b>\n\n'
+            'Telegram временно ограничил отправку для этого Business-профиля.\n\n'
+            f'🆔 Офер: <code>{offer_id}</code>\n'
+            'Офер сохранён и не был удалён.'
+        )
+        error_fallback = await _send_plain_chat_fallback(source_message, error_text)
+        if error_fallback:
+            log.info('OFFER ERROR SENT IN SOURCE CHAT offer=%s chat=%s', offer_id, source_message.chat.id)
+        else:
+            await _notify_offer_delivery_error(source_message, offer_id, e)
     except Exception as e:
-        log.error('Failed to deliver queued offer %s: %s', offer_id, e, exc_info=True)
+        log.error('Failed to deliver offer %s: %s', offer_id, e, exc_info=True)
         try:
-            db.set_offer_status(offer_id, STATUS_DECLINED)
+            # Keep the offer record so it can be retried/inspected instead of
+            # destroying the DEMO state because of a transport error.
             await _notify_offer_delivery_error(source_message, offer_id, e)
         except Exception:
             log.exception('Failed to report offer delivery error offer=%s', offer_id)
