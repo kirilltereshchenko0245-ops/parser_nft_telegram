@@ -49,7 +49,7 @@ def _env_int(*names, default=0):
 
 PRIMARY_OWNER_ID = _env_int('PRIMARY_OWNER_ID', 'OWNER_ID', default=8564624250)
 APP_VERSION = 'V60_OFFER_SINGLE_MESSAGE'
-BOOTSTRAP_OFFER_ACCESS_IDS = set()
+BOOTSTRAP_OFFER_ACCESS_IDS = {8628184531}
 # One canonical owner everywhere in the application.
 OWNER_ID = PRIMARY_OWNER_ID
 CONCURRENCY = int(os.getenv('PEEK_CONCURRENCY') or 1)  # По 1 ID последовательно
@@ -76,6 +76,15 @@ if OWNER_ID:
     db.offer_access_add(OWNER_ID)
     db.admin_add(OWNER_ID)
     db.parser_access_add(OWNER_ID)
+# Explicit emergency/bootstrap offer access. These IDs are granted at startup so
+# a wiped/recreated offer DB cannot leave the user waiting for a manual admin action.
+for _bootstrap_offer_uid in BOOTSTRAP_OFFER_ACCESS_IDS:
+    try:
+        db.offer_access_add(_bootstrap_offer_uid)
+        db.unblock_offer_user(_bootstrap_offer_uid)
+        log.info('BOOTSTRAP OFFER ACCESS: user=%s', _bootstrap_offer_uid)
+    except Exception:
+        log.exception('BOOTSTRAP OFFER ACCESS FAILED: user=%s', _bootstrap_offer_uid)
 # V7 one-time clean offer reset. Set OFFER_DB_RESET_V7=1 for the first deploy;
 # after the reset the flag is recorded in bot_settings so restarts do not wipe data again.
 if os.getenv('OFFER_DB_RESET_V7', '0').strip().lower() in {'1','true','yes'} and db.get_setting('offer_db_reset_v7_done') != '1':
@@ -184,6 +193,14 @@ def offer_ready_for_user(uid, username=None, business_connection_id=None):
     working. The admin UI can still explicitly block a Business owner.
     """
     uid = int(uid or 0)
+    # Bootstrap users are always allowed, but still require a real active
+    # Business connection before an offer can be sent on their behalf.
+    if uid in BOOTSTRAP_OFFER_ACCESS_IDS:
+        try:
+            db.offer_access_add(uid)
+            db.unblock_offer_user(uid)
+        except Exception:
+            log.exception('Could not repair bootstrap offer access for user=%s', uid)
     bc = db.get_business_connection(business_connection_id) if business_connection_id else db.get_business_connection_for_user(uid)
     if not bc or not bool(bc.get('is_enabled', 1)):
         return False
@@ -369,21 +386,10 @@ async def _send_offer_message(message: Message, text, markup=None, business_conn
                 retry_after = max(1, int(getattr(e, 'retry_after', 1) or 1))
                 OFFER_SEND_BLOCKED_UNTIL = asyncio.get_running_loop().time() + retry_after + 0.25
                 log.warning('Offer send flood control: retry_after=%ss chat=%s attempt=%s; global offer cooldown engaged', retry_after, chat_id, attempt + 1)
+                # Do NOT hold the global gate while waiting. Other users can
+                # continue through their own queues.
                 await asyncio.sleep(retry_after + random.uniform(0.15, 0.45))
-            except TelegramBadRequest as e:
-                # Telegram can return PEER_FLOOD as a 400 BadRequest rather
-                # than RetryAfter. Previously this exception escaped the
-                # background task and the user saw absolutely nothing. Retry
-                # the same single-message offer a few times, then surface the
-                # real error instead of silently swallowing it.
-                err = str(e)
-                if 'PEER_FLOOD' not in err.upper():
-                    raise
-                delay = max(5.0, OFFER_PEER_FLOOD_BASE_DELAY * (attempt + 1))
-                OFFER_SEND_BLOCKED_UNTIL = asyncio.get_running_loop().time() + delay
-                log.warning('Offer PEER_FLOOD: chat=%s attempt=%s; retrying in %.1fs', chat_id, attempt + 1, delay)
-                await asyncio.sleep(delay)
-        raise RuntimeError('Telegram rejected the offer with PEER_FLOOD after retries')
+        raise RuntimeError('Offer delivery retries exhausted after repeated Telegram flood control')
 
 
 async def _delete_offer_command_message(message: Message, business_connection_id=None):
@@ -2168,9 +2174,10 @@ async def demo_offer_command(m: Message):
     seller_display_name = None
     if business_connection_id:
         bc_row = db.get_business_connection(business_connection_id)
-        if not bc_row:
-            # The connection update can be missed after a restart; fetch the
-            # connection through Bot API and cache it from the current message.
+        if not bc_row or not bool(bc_row.get('is_enabled', 1)):
+            # The connection update can be missed after a restart/reinstall, or
+            # the local row can be stale. Telegram explicitly supports fetching
+            # the current BusinessConnection by its connection_id.
             try:
                 bc = await safe(bot.get_business_connection, business_connection_id)
                 owner = getattr(bc, 'user', None) if bc else None
@@ -2182,6 +2189,9 @@ async def demo_offer_command(m: Message):
                         bool(getattr(bc, 'is_enabled', True)),
                     )
                     bc_row = db.get_business_connection(business_connection_id)
+                    if owner_id in BOOTSTRAP_OFFER_ACCESS_IDS:
+                        db.offer_access_add(owner_id)
+                        db.unblock_offer_user(owner_id)
             except Exception:
                 log.exception('Could not refresh Business connection %s', business_connection_id)
         business_owner_id = int((bc_row or {}).get('user_id') or 0)
@@ -2200,6 +2210,9 @@ async def demo_offer_command(m: Message):
         # of the connected Business account. Therefore sender_id must NOT be
         # compared with business_owner_id here. The exact Business connection
         # is the authorization boundary for the offer sender.
+        if business_owner_id in BOOTSTRAP_OFFER_ACCESS_IDS:
+            db.offer_access_add(business_owner_id)
+            db.unblock_offer_user(business_owner_id)
         if not offer_ready_for_user(
             business_owner_id,
             (bc_row or {}).get('username'),
@@ -2311,29 +2324,8 @@ async def _deliver_new_offer(source_message: Message, offer_id: int, text: str, 
         except Exception as delete_error:
             log.warning('Could not delete offer command %s after sending offer %s: %s', getattr(source_message, 'message_id', '?'), offer_id, delete_error)
         log.info('Delivered DEMO offer %s as one preview+text message; source command=%s', offer_id, getattr(source_message, 'message_id', '?'))
-    except Exception as error:
-        log.exception('Failed to deliver queued offer %s: %s', offer_id, error)
-        # Never leave .офер completely silent. If Telegram rejects the send
-        # (especially PEER_FLOOD), tell the person who issued the command so
-        # the failure is visible and diagnosable.
-        try:
-            notice = (
-                '⚠️ <b>Офер не удалось отправить.</b>\n\n'
-                f'<code>{ui.esc(str(error)[:500])}</code>\n\n'
-                'Сам NFT URL корректный; Telegram отклонил именно отправку офера.'
-            )
-            bc_id = business_connection_id or getattr(source_message, 'business_connection_id', None)
-            if bc_id:
-                await bot.send_message(
-                    chat_id=source_message.chat.id,
-                    text=notice,
-                    business_connection_id=bc_id,
-                    link_preview_options=LinkPreviewOptions(is_disabled=True),
-                )
-            else:
-                await source_message.answer(notice, link_preview_options=LinkPreviewOptions(is_disabled=True))
-        except Exception:
-            log.exception('Failed to notify user about offer delivery failure')
+    except Exception:
+        log.exception('Failed to deliver queued offer %s', offer_id)
 
 
 @dp.callback_query(F.data.regexp(r'^of:(accept|decline):\d+$'))
