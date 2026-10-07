@@ -2120,8 +2120,8 @@ async def demo_offer_command(m: Message):
         if business_owner_id != sender_id:
             log.info('Ignoring cross-user Business .офер sender=%s business_owner=%s', sender_id, business_owner_id)
             return
-        if not offer_ready_for_user(sender_id, sender_username):
-            log.info('Ignoring unavailable Business .офер sender=%s', sender_id)
+        if not offer_ready_for_user(sender_id, sender_username, business_connection_id=business_connection_id):
+            log.info('Ignoring unavailable Business .офер sender=%s connection=%s', sender_id, business_connection_id)
             return
         seller_id = business_owner_id
         seller_display_name = await _business_seller_display_name(business_connection_id)

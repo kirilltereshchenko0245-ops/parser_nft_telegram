@@ -10,7 +10,10 @@ from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
 from ui import esc, num, pretty
 
-GIFT_RE = re.compile(r"(?:https?://)?t\.me/nft/([^/?#\s]+?)-(\d+)(?:[/?#\s]|$)", re.I)
+GIFT_RE = re.compile(
+    r"(?:https?://)?(?:(?:www\.)?t\.me|(?:www\.)?telegram\.me)/nft/(?P<slug>[^/?#\s]+)-(?P<number>\d+)(?=$|[/?#\s])",
+    re.I,
+)
 AMOUNT_RE = re.compile(r"(?P<amount>\d+(?:[.,]\d+)?)\s*(?P<currency>грам(?:м|s)?|gram(?:s)?|зв(?:езд|ёзд)?|stars?|⭐)", re.I)
 LOCALE_RU = 'ru'
 LOCALE_EN = 'en'
@@ -47,10 +50,17 @@ def parse_offer_command(text: str):
     gift = GIFT_RE.search(tail)
     if not gift:
         return {'locale': locale, 'error': 'gift_url'}
-    gift_name = unquote(gift.group(1))
-    gift_number = int(gift.group(2))
+    gift_name = unquote(gift.group('slug'))
+    gift_number = int(gift.group('number'))
+    # Normalize the NFT URL so query strings/fragments/trailing slashes do not
+    # become part of the URL button. Telegram accepts both t.me and telegram.me
+    # links, with or without https/www; keep the canonical https://t.me form.
+    gift_url = f'https://t.me/nft/{gift_name}-{gift_number}'
+    # Amount may be placed before OR after the NFT URL. This makes copy/paste
+    # from common offer formats much less fragile.
+    before = tail[:gift.start()].strip()
     after = tail[gift.end():].strip()
-    amount = AMOUNT_RE.search(after)
+    amount = AMOUNT_RE.search(after) or AMOUNT_RE.search(before)
     if not amount:
         return {'locale': locale, 'gift_name': gift_name, 'gift_number': gift_number, 'error': 'amount'}
     value = float(amount.group('amount').replace(',', '.'))
@@ -62,7 +72,7 @@ def parse_offer_command(text: str):
         'gift_number': gift_number,
         'amount': value,
         'currency': _currency(amount.group('currency')),
-        'gift_url': gift.group(0).rstrip('.,)')
+        'gift_url': gift_url
     }
 
 
