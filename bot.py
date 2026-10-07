@@ -48,7 +48,7 @@ def _env_int(*names, default=0):
     return int(default)
 
 PRIMARY_OWNER_ID = _env_int('PRIMARY_OWNER_ID', 'OWNER_ID', default=8564624250)
-APP_VERSION = 'V34_OFFER_IMMEDIATE_BUSINESS_FALLBACK'
+APP_VERSION = 'V39_HELLO_BUSINESS_ROUTING_TEST'
 # One canonical owner everywhere in the application.
 OWNER_ID = PRIMARY_OWNER_ID
 CONCURRENCY = int(os.getenv('PEEK_CONCURRENCY') or 1)  # По 1 ID последовательно
@@ -1881,6 +1881,56 @@ async def adm_offer_connection_toggle(c: CallbackQuery):
     if action=='block': db.block_offer_user(uid); msg='Оферы заблокированы.'
     else: db.unblock_offer_user(uid); msg='Оферы разрешены.'
     await c.answer(msg,show_alert=True); await c.message.edit_text('🔗 <b>BUSINESS-ПРОФИЛИ</b>\n\nНовые подключения по умолчанию закрыты.',reply_markup=admin_business_connections_kb())
+
+
+# ───────────────────────── Business routing test ─────────────────────────
+@dp.message(F.text.regexp(r'^\s*\.привет\s*$'))
+async def hello_command_private(m: Message):
+    """Simple routing test: .привет -> Привет in the same normal bot chat."""
+    try:
+        sent = await bot.send_message(chat_id=m.chat.id, text='Привет')
+        try:
+            await bot.delete_message(chat_id=m.chat.id, message_id=m.message_id)
+        except Exception as e:
+            log.warning('HELLO command delete failed chat=%s error=%r', m.chat.id, e)
+        log.info('HELLO delivered chat=%s via=bot', m.chat.id)
+        return sent
+    except Exception as e:
+        log.error('HELLO delivery failed chat=%s error=%r', m.chat.id, e, exc_info=True)
+        try:
+            await m.answer(f'⚠️ Не удалось отправить <b>Привет</b>.\n\nПричина: {ui.esc(str(e))}')
+        except Exception:
+            pass
+
+
+@dp.business_message(F.text.regexp(r'^\s*\.привет\s*$'))
+async def hello_command_business(m: Message):
+    """Business routing test: .привет -> Привет in the exact originating chat."""
+    bc_id = getattr(m, 'business_connection_id', None)
+    chat_id = getattr(getattr(m, 'chat', None), 'id', None)
+    if not bc_id or not chat_id:
+        log.warning('HELLO BUSINESS missing target chat=%s business_connection=%s', chat_id, bc_id)
+        return
+    try:
+        sent = await bot.send_message(
+            chat_id=chat_id,
+            text='Привет',
+            business_connection_id=bc_id,
+        )
+        try:
+            await bot.delete_business_messages(
+                business_connection_id=bc_id,
+                message_ids=[m.message_id],
+            )
+        except Exception as e:
+            log.warning('HELLO business command delete failed chat=%s bc=%s error=%r', chat_id, bc_id, e)
+        log.info('HELLO delivered chat=%s via=business connection=%s', chat_id, bc_id)
+        return sent
+    except Exception as e:
+        log.error('HELLO BUSINESS delivery failed chat=%s bc=%s error=%r', chat_id, bc_id, e, exc_info=True)
+        # Important: do not send a fallback to the bot DM. This test is specifically
+        # intended to prove whether the originating Business route can deliver.
+        return
 
 
 # ───────────────────────── DEMO gift offers ─────────────────────────
