@@ -12,6 +12,8 @@ from telethon.errors import FloodWaitError
 from parsing.telegram_client import ParserClient
 from parsing.scanner import ChatScanner
 from parsing import keyboards as parser_kb
+from price_estimator import estimate_stars
+from live_gift_price import live_price
 
 log = logging.getLogger('giftparser.parser')
 router = Router()
@@ -189,7 +191,7 @@ async def parser_connect_handler(call: CallbackQuery, state: FSMContext, db):
 # Parser authentication is performed once outside the bot and injected as
 # PARSER_SESSION_STRING.
 
-async def resume_interrupted_scan(db):
+async def resume_interrupted_scan(db, telegram_bot=None):
     """Resume a scan left in 'running' state after a container/process restart."""
     global scanner, scan_task
     state = db.get_parser_scan_state()
@@ -207,7 +209,9 @@ async def resume_interrupted_scan(db):
             for gift in gifts[:5]:
                 try:
                     card = format_gift_card(user, gift)
-                    await bot.send_message(owner_id, card, reply_markup=parser_kb.parser_gift_kb({**gift, 'username': user.get('username'), 'user_id': user.get('user_id')}))
+                    if telegram_bot is None:
+                        raise RuntimeError('Bot instance unavailable for resumed result')
+                    await telegram_bot.send_message(owner_id, card)
                 except Exception:
                     log.exception('Failed to send resumed result')
         scanner = ChatScanner(client, db, result_callback=on_result)
@@ -397,8 +401,11 @@ async def start_scan_with_limit(message, uid, state, db, limit, call, explicit_m
 
     async def on_result(user, gifts):
         for gift in gifts[:5]:
+            live, source, details = await live_price(parser_client, gift)
+            if live:
+                gift['market'] = {'price': live, 'source': source, 'details': details}
             card = format_gift_card(user, gift)
-            await origin_message.answer(card, reply_markup=parser_kb.parser_gift_kb({**gift, 'username': user.get('username'), 'user_id': user.get('user_id')}))
+            await origin_message.answer(card)
 
     db.save_parser_scan_state(uid, mode, limit, 'running')
     scanner = ChatScanner(client, db, result_callback=on_result)
@@ -423,6 +430,8 @@ def format_gift_card(user, gift):
     else:
         status = '—'
     link = f'https://t.me/nft/{gift["gift_slug"]}' if gift.get('gift_slug') else 'ссылка недоступна для обычного подарка'
+    price, source = estimate_stars(gift)
+    price_label = '⭐ Актуальная оценка Telegram' if source == 'market' else '⭐ Цена: нет данных'
     return ('🎁 <b>НАЙДЕН ПОДАРОК</b>\n\n'
             f'👤 Владелец: <b>{username}</b>\n'
             f'🆔 Telegram ID: <code>{user.get("user_id")}</code>\n'
@@ -430,7 +439,9 @@ def format_gift_card(user, gift):
             f'🎁 Подарок: <b>{gift.get("gift_name") or "Telegram Gift"}</b>\n'
             f'🔢 ID типа: <code>{gift.get("gift_id") or "—"}</code>\n'
             f'🔢 Номер: <code>{gift.get("gift_num") or "—"}</code>\n'
-            f'📌 Статус: <b>{status}</b>\n\n'
+            f'📌 Статус: <b>{status}</b>\n'
+            f'{price_label}: <b>~{price:,} Stars</b>\n\n' if price else
+            f'{price_label}\n\n'
             f'🔗 {link}')
 
 

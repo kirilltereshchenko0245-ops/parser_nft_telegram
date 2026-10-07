@@ -23,7 +23,9 @@ import ui
 from database import Database
 from peek_api import AVAILABLE_MODELS, PeekAPI, gift_url, is_known_model, normalize_model_name, suggest_models
 from gift_catalog import GIFT_CATALOG, GIFT_MODELS, GIFT_BY_API, GIFT_PAGE_SIZE
-from payments import CryptoPay
+from price_estimator import estimate_stars
+from live_gift_price import live_price
+from payments import CryptoPay, XRocketPay
 from parsing import handlers as parser_handlers
 from offer_simulator import (parse_offer_command, offer_help_text, keyboard as offer_keyboard, build_offer_text, accepted_alert_text, final_offer_text, declined_text, transfer_keyboard, STATUS_PENDING, STATUS_ACCEPTED, STATUS_DECLINED)
 
@@ -33,9 +35,21 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s | %(levelname)s | %(
 log = logging.getLogger('giftparser')
 
 TOKEN = os.getenv('BOT_TOKEN')
-PRIMARY_OWNER_ID = 8564624250
-APP_VERSION = 'V25_ADMIN_OFFERS_STABILITY'
-# Canonical project owner. This is intentionally independent of a stale Railway OWNER_ID.
+# Canonical owner comes from Railway/Environment variables.
+# PRIMARY_OWNER_ID has priority when explicitly set; OWNER_ID remains a compatible fallback.
+def _env_int(*names, default=0):
+    for name in names:
+        raw = os.getenv(name)
+        if raw is not None and str(raw).strip():
+            try:
+                return int(str(raw).strip())
+            except ValueError:
+                pass
+    return int(default)
+
+PRIMARY_OWNER_ID = _env_int('PRIMARY_OWNER_ID', 'OWNER_ID', default=8564624250)
+APP_VERSION = 'V34_OFFER_IMMEDIATE_BUSINESS_FALLBACK'
+# One canonical owner everywhere in the application.
 OWNER_ID = PRIMARY_OWNER_ID
 CONCURRENCY = int(os.getenv('PEEK_CONCURRENCY') or 1)  # По 1 ID последовательно
 if not TOKEN:
@@ -45,7 +59,7 @@ MAX_RANGE = 10_000        # максимум ID за один поиск
 MAX_LIVE_CARDS = 30       # сколько карточек присылать «вживую» во время поиска
 EDIT_INTERVAL = 1.5       # не чаще раза в N секунд обновляем статус (защита от flood)
 GIFT_REQUEST_DELAY = float(os.getenv('GIFT_REQUEST_DELAY', '5'))
-LOG_CHANNEL_ID = int(os.getenv('LOG_CHANNEL_ID', '-1003864916255'))
+LOG_CHANNEL_ID = int(os.getenv('LOG_CHANNEL_ID', '0') or 0)
 LOG_CHANNEL_DISABLED = False
 API_REQUEST_LOCK = asyncio.Lock()
 NEXT_API_REQUEST_AT = 0.0
@@ -54,21 +68,27 @@ bot = Bot(TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 dp = Dispatcher(storage=MemoryStorage())
 db_path = os.getenv('DATABASE_PATH') or (os.path.join(os.getenv('RAILWAY_VOLUME_MOUNT_PATH'), 'bot_database.db') if os.getenv('RAILWAY_VOLUME_MOUNT_PATH') else 'bot_database.db')
 db = Database(db_path)
+if not db.get_setting('log_channel_id') and LOG_CHANNEL_ID:
+    db.set_setting('log_channel_id', str(LOG_CHANNEL_ID))
 if OWNER_ID:
+    # Bootstrap/migrate the current owner into every owner-level permission table.
     db.offer_access_add(OWNER_ID)
     db.admin_add(OWNER_ID)
-db.admin_add(PRIMARY_OWNER_ID)
-db.parser_access_add(PRIMARY_OWNER_ID)
-log.info('PARSER ACCESS BOOT version=%s owner=%s db=%s', APP_VERSION, PRIMARY_OWNER_ID, os.path.abspath(db_path))
+    db.parser_access_add(OWNER_ID)
+log.info('OWNER BOOT version=%s owner=%s db=%s', APP_VERSION, OWNER_ID, os.path.abspath(db_path))
 api = PeekAPI(CONCURRENCY)
 crypto_pay = CryptoPay(os.getenv('CRYPTO_PAY_API_TOKEN'))
+xrocket_pay = XRocketPay(os.getenv('XROCKET_PAY_API_TOKEN'))
 ACTIVE: set[int] = set()  # пользователи с запущенным поиском
 OFFER_ACTION_LOCKS: dict[int, asyncio.Lock] = {}
 OFFER_CHAT_SEND_LOCKS: dict[int, asyncio.Lock] = {}
 OFFER_SEND_GATE = asyncio.Lock()
 OFFER_SEND_LAST_AT = 0.0
 OFFER_SEND_BLOCKED_UNTIL = 0.0
-OFFER_SEND_INTERVAL = float(os.getenv('OFFER_SEND_INTERVAL', '1.25'))
+OFFER_SEND_INTERVAL = float(os.getenv('OFFER_SEND_INTERVAL', '4.0'))
+OFFER_PEER_FLOOD_RETRIES = int(os.getenv('OFFER_PEER_FLOOD_RETRIES', '6'))
+OFFER_PEER_FLOOD_BASE_DELAY = float(os.getenv('OFFER_PEER_FLOOD_BASE_DELAY', '30'))
+OFFER_ERROR_NOTIFY_ENABLED = os.getenv('OFFER_ERROR_NOTIFY_ENABLED', '1').strip().lower() not in {'0','false','no'}
 OFFER_DELIVERY_TASKS: set[asyncio.Task] = set()
 BUSINESS_SELLER_NAME_CACHE: dict[str, str] = {}
 BUSINESS_OWNER_ID_CACHE: dict[str, int] = {}
@@ -101,6 +121,10 @@ class S(StatesGroup):
     catalog_query = State()
     admin_user_profile_name = State()
     admin_user_profile_url = State()
+    admin_broadcast = State()
+    admin_log_channel = State()
+    admin_broadcast_audience = State()
+    admin_tariff = State()
 
 
 # ───────────────────────── помощники ─────────────────────────
@@ -137,6 +161,43 @@ def chat_parser_allowed(uid):
 
 def offers_paid(uid):
     return is_admin(uid) or db.entitlement_active(uid, 'offers')
+
+
+def offer_ready_for_user(uid, username=None, business_connection_id=None):
+    """DEMO-offer access with a reliable Business connection check.
+
+    Owner/admins do not need a paid offers entitlement, but they still need an
+    enabled Business connection when actually sending a Business offer. Other
+    users need their offers entitlement plus an approved, unblocked connection.
+    """
+    uid = int(uid or 0)
+    bc = db.get_business_connection(business_connection_id) if business_connection_id else db.get_business_connection_for_user(uid)
+    if not bc or not bool(bc.get('is_enabled', 1)) or bool(bc.get('is_blocked', 0)):
+        return False
+    if db.offer_user_blocked(uid) and not is_admin(uid):
+        return False
+    if is_admin(uid):
+        return True
+    return offers_paid(uid)
+
+
+def tariff_config():
+    defaults = {
+        'premium_2d': ('7', 'premium', 172800, 'Премиум · 2 дня'),
+        'chat_24h': ('10', 'chat', 86400, 'Парсер чатов · 24 часа'),
+        'offers_5d': ('25', 'offers', 432000, 'Оферы · 5 дней'),
+    }
+    out = {}
+    for key, (amount, kind, seconds, title) in defaults.items():
+        raw = db.get_setting('tariff_' + key)
+        try:
+            amount = str(float(raw)) if raw is not None else amount
+            if amount.endswith('.0'): amount = amount[:-2]
+            if float(amount) <= 0: raise ValueError
+        except Exception:
+            pass
+        out[key] = (amount, kind, seconds, title)
+    return out
 
 
 async def safe(fn, *args, **kwargs):
@@ -222,7 +283,11 @@ async def send_card(target: Message, uid: int, g: dict, large=False):
     else:
         lp = LinkPreviewOptions(is_disabled=True)
     fav = db.is_favorite(uid, g.get('giftNumber'), name)
-    return await safe(target.answer, ui.gift_card(g), reply_markup=kb.gift_kb(g, fav), link_preview_options=lp)
+    stars, source = estimate_stars(g)
+    gg = dict(g)
+    gg['estimated_stars'] = stars
+    gg['price_source'] = source
+    return await safe(target.answer, ui.gift_card(gg), link_preview_options=lp)
 
 
 def no_preview():
@@ -237,14 +302,70 @@ def _offer_lock(offer_id: int) -> asyncio.Lock:
     return lock
 
 
-async def _send_offer_message(message: Message, text, markup=None, business_connection_id=None):
-    """Rate-limited offer sender.
+class OfferPeerFloodError(RuntimeError):
+    def __init__(self, chat_id: int, business_connection_id=None, retry_after=None):
+        self.chat_id = chat_id
+        self.business_connection_id = business_connection_id
+        self.retry_after = retry_after
+        super().__init__('Telegram PEER_FLOOD: Telegram временно ограничил отправку DEMO-офера')
 
-    Each chat is serialized independently, while a small global gate spreads
-    sends from all Business accounts. Long Telegram RetryAfter values never
-    hold the global gate, so one flooded chat does not stall other users.
+
+async def _notify_offer_delivery_error(source_message: Message, offer_id: int, error: Exception):
+    """Best-effort immediate diagnostic for the author of .офер.
+
+    A Business connection may itself be the thing Telegram is restricting, so
+    the notification first tries the author's private chat as a normal bot
+    message. If that is unavailable (e.g. the user never started the bot), we
+    try the source chat without the Business connection. Every failure is
+    logged explicitly instead of disappearing in a background task.
     """
-    global OFFER_SEND_LAST_AT, OFFER_SEND_BLOCKED_UNTIL
+    if not OFFER_ERROR_NOTIFY_ENABLED:
+        return
+    sender_id = int(getattr(getattr(source_message, 'from_user', None), 'id', 0) or 0)
+    reason = ui.esc(str(error))[:700]
+    text = (
+        '⚠️ <b>Не удалось отправить DEMO-офер.</b>\n\n'
+        f'Причина: <code>{reason}</code>\n\n'
+        f'🆔 Офер: <code>{offer_id}</code>\n'
+        'Telegram временно ограничил отправку для этого Business-профиля. '
+        'Офер сохранён и не был удалён.'
+    )
+
+    if sender_id:
+        try:
+            await bot.send_message(sender_id, text, link_preview_options=LinkPreviewOptions(is_disabled=True))
+            log.info('Offer error notification sent to author=%s offer=%s', sender_id, offer_id)
+            return
+        except Exception as e:
+            log.warning('Could not notify offer author in private chat author=%s offer=%s: %s', sender_id, offer_id, e)
+
+    # Fallback: try the source chat as the bot, explicitly without the Business
+    # connection. This can work when the chat is directly accessible to the bot.
+    try:
+        await bot.send_message(
+            chat_id=source_message.chat.id,
+            text=text,
+            link_preview_options=LinkPreviewOptions(is_disabled=True),
+        )
+        log.info('Offer error notification sent to source chat=%s offer=%s', source_message.chat.id, offer_id)
+    except Exception as e:
+        log.error(
+            'OFFER ERROR NOTIFICATION FAILED offer=%s author=%s source_chat=%s error=%r',
+            offer_id, sender_id, getattr(source_message.chat, 'id', None), e,
+            exc_info=True,
+        )
+
+
+async def _send_offer_message(message: Message, text, markup=None, business_connection_id=None):
+    """Send the DEMO offer immediately.
+
+    We do not attempt to bypass Telegram anti-spam restrictions. If Telegram
+    rejects the Business-context send with PEER_FLOOD, raise immediately so the
+    caller can give the author a useful response. A normal bot send is only a
+    delivery fallback when the bot itself is allowed to post in the source
+    chat; it does not impersonate the Business profile.
+    """
+    global OFFER_SEND_LAST_AT
     chat_id = int(message.chat.id)
     chat_lock = OFFER_CHAT_SEND_LOCKS.get(chat_id)
     if chat_lock is None:
@@ -252,40 +373,58 @@ async def _send_offer_message(message: Message, text, markup=None, business_conn
         OFFER_CHAT_SEND_LOCKS[chat_id] = chat_lock
 
     async with chat_lock:
-        for attempt in range(6):
+        async with OFFER_SEND_GATE:
+            loop = asyncio.get_running_loop()
+            wait = OFFER_SEND_INTERVAL - (loop.time() - OFFER_SEND_LAST_AT)
+            if wait > 0:
+                await asyncio.sleep(wait)
+            kwargs = dict(
+                chat_id=message.chat.id,
+                text=text,
+                reply_markup=markup,
+                link_preview_options=LinkPreviewOptions(show_above_text=True, prefer_large_media=True),
+            )
+            bc_id = business_connection_id or getattr(message, 'business_connection_id', None)
+            if bc_id:
+                kwargs['business_connection_id'] = bc_id
             try:
-                async with OFFER_SEND_GATE:
-                    loop = asyncio.get_running_loop()
-                    wait = max(
-                        OFFER_SEND_INTERVAL - (loop.time() - OFFER_SEND_LAST_AT),
-                        OFFER_SEND_BLOCKED_UNTIL - loop.time(),
-                    )
-                    if wait > 0:
-                        await asyncio.sleep(wait)
-                    kwargs = dict(
-                        chat_id=message.chat.id,
-                        text=text,
-                        reply_markup=markup,
-                        link_preview_options=LinkPreviewOptions(show_above_text=True, prefer_large_media=True),
-                    )
-                    bc_id = business_connection_id or getattr(message, 'business_connection_id', None)
-                    if bc_id:
-                        kwargs['business_connection_id'] = bc_id
-                    result = await bot.send_message(**kwargs)
-                    OFFER_SEND_LAST_AT = loop.time()
-                    return result
+                result = await bot.send_message(**kwargs)
+                OFFER_SEND_LAST_AT = loop.time()
+                return result
             except TelegramRetryAfter as e:
-                retry_after = max(1, int(getattr(e, 'retry_after', 1) or 1))
-                OFFER_SEND_BLOCKED_UNTIL = asyncio.get_running_loop().time() + retry_after + 0.25
-                log.warning('Offer send flood control: retry_after=%ss chat=%s attempt=%s', retry_after, chat_id, attempt + 1)
-                await asyncio.sleep(min(retry_after + random.uniform(0.15, 0.45), 15))
+                # A regular Bot API rate limit is different from PEER_FLOOD.
+                # Do not sleep in the handler for a long time; report it now.
+                retry_after = int(getattr(e, 'retry_after', 1) or 1)
+                raise RuntimeError(
+                    f'Telegram временно ограничил частоту отправки. Повторите через {retry_after} сек.'
+                ) from e
             except TelegramBadRequest as e:
-                desc=str(e).upper()
+                desc = str(e).upper()
                 if 'PEER_FLOOD' in desc:
-                    log.error('OFFER PEER_FLOOD: chat=%s business_connection=%s offer_send_aborted', chat_id, business_connection_id or getattr(message,'business_connection_id',None))
-                    raise RuntimeError('Telegram PEER_FLOOD: отправка офера временно ограничена Telegram') from e
+                    raise OfferPeerFloodError(
+                        chat_id=chat_id,
+                        business_connection_id=bc_id,
+                        retry_after=None,
+                    ) from e
                 raise
-        raise RuntimeError('Offer delivery retries exhausted after Telegram flood control')
+
+
+async def _send_plain_chat_fallback(source_message: Message, text, markup=None):
+    """Try a normal bot message in the source chat, without Business identity.
+
+    This is a delivery fallback, not a flood bypass. Telegram may reject it if
+    the bot has no permission to post in that chat.
+    """
+    try:
+        return await bot.send_message(
+            chat_id=source_message.chat.id,
+            text=text,
+            reply_markup=markup,
+            link_preview_options=LinkPreviewOptions(show_above_text=True, prefer_large_media=True),
+        )
+    except Exception as e:
+        log.warning('OFFER PLAIN CHAT FALLBACK FAILED chat=%s error=%r', source_message.chat.id, e)
+        return None
 
 
 async def _delete_offer_command_message(message: Message, business_connection_id=None):
@@ -330,23 +469,28 @@ async def _business_seller_display_name(business_connection_id):
 # ───────────────────────── аудит / логи ─────────────────────────
 async def audit(action: str, uid: int | None = None, details: str = ''):
     global LOG_CHANNEL_DISABLED
-    if LOG_CHANNEL_DISABLED or not LOG_CHANNEL_ID:
+    channel_raw = db.get_setting('log_channel_id') or LOG_CHANNEL_ID
+    try:
+        channel_id = int(channel_raw)
+    except (TypeError, ValueError):
+        return
+    if LOG_CHANNEL_DISABLED or not channel_id:
         return
     actor = f'<code>{uid}</code>' if uid is not None else '<code>system</code>'
     text = f'🧾 <b>{ui.esc(action)}</b>\n👤 {actor}'
     if details:
         text += f'\n{details}'
     try:
-        await safe(bot.send_message, LOG_CHANNEL_ID, text, disable_web_page_preview=True)
+        await safe(bot.send_message, channel_id, text, disable_web_page_preview=True)
     except TelegramBadRequest as e:
         low=str(e).lower()
         if 'chat not found' in low or 'peer_flood' in low:
             LOG_CHANNEL_DISABLED = True
             log.warning('Audit log channel disabled after Telegram rejection: %s', e)
         else:
-            log.error('LOG CHANNEL FAILED channel=%s action=%s error=%r', LOG_CHANNEL_ID, action, e)
+            log.error('LOG CHANNEL FAILED channel=%s action=%s error=%r', channel_id, action, e)
     except Exception as e:
-        log.error('LOG CHANNEL FAILED channel=%s action=%s error=%r', LOG_CHANNEL_ID, action, e)
+        log.error('LOG CHANNEL FAILED channel=%s action=%s error=%r', channel_id, action, e)
 
 
 # ───────────────────────── доступ ─────────────────────────
@@ -356,14 +500,19 @@ async def access_message(handler, event: Message, data):
         uid = event.from_user.id
         db.upsert_user(uid, event.from_user.username, event.from_user.first_name)
         if db.is_banned(uid):
-            await audit('Заблокированный пользователь попытался выполнить действие', uid, f'Текст: <code>{ui.esc(event.text or "")}</code>')
+            await audit('Заблокированный пользователь попытался выполнить действие', uid, f'Text: <code>{ui.esc(event.text or "")}</code>')
             await event.answer('🚫 <b>Доступ ограничен.</b>')
+            return
+        if db.get_setting('maintenance_mode','0') == '1' and not is_admin(uid) and not (event.text or '').startswith('/start'):
+            await event.answer('🚧 <b>Технические работы</b>\n\nБот временно недоступен. Попробуй позже.')
             return
     return await handler(event, data)
 
-
 @dp.callback_query.middleware()
 async def access_callback(handler, event: CallbackQuery, data):
+    if db.get_setting('maintenance_mode','0') == '1' and not is_admin(event.from_user.id) and not (event.data or '').startswith('menu:home'):
+        await event.answer('🚧 Технические работы. Попробуй позже.', show_alert=True)
+        return
     if db.is_banned(event.from_user.id):
         await audit('Заблокированный пользователь нажал кнопку', event.from_user.id, f'Callback: <code>{ui.esc(event.data or "")}</code>')
         await event.answer('🚫 Доступ ограничен', show_alert=True)
@@ -377,9 +526,8 @@ async def access_callback(handler, event: CallbackQuery, data):
 async def start(m: Message, state: FSMContext):
     await audit('Запуск /start', m.from_user.id)
     await state.clear()
-    u = db.get_user(m.from_user.id) or {}
-    await m.answer(' ', reply_markup=ReplyKeyboardRemove())
-    await m.answer(ui.v24_welcome(), reply_markup=kb.inline_main_menu(is_admin(m.from_user.id), is_unlimited(m.from_user.id)))
+    # Inline keyboard is attached in the same send call. No legacy reply keyboard or second edit step.
+    await m.answer(ui.v24_welcome(), reply_markup=kb.main_menu(is_admin(m.from_user.id), is_unlimited(m.from_user.id)))
 
 
 @dp.message(F.text == kb.BTN_CANCEL)
@@ -975,7 +1123,7 @@ async def v24_catalog_query_value(m: Message, state: FSMContext):
     q=(m.text or '').strip().lower()[:24]
     await state.clear(); await show_catalog(m,1,q)
 
-async def show_catalog(target, page=1, query=''):
+async def show_catalog(target, page=1, query='', edit=False):
     items=[]
     for title, model in zip(GIFT_CATALOG, GIFT_MODELS):
         if not query or query in title.lower() or query in model.lower():
@@ -984,12 +1132,15 @@ async def show_catalog(target, page=1, query=''):
     visible=items[(page-1)*GIFT_PAGE_SIZE:page*GIFT_PAGE_SIZE]
     text='🎁 <b>ОБЫЧНЫЙ ПАРСЕР</b>\n\nВыбери NFT-подарок. Листай страницы или ищи по названию.'
     if query: text += f'\n\n🔎 Запрос: <b>{ui.esc(query)}</b>'
-    await target.answer(text, reply_markup=kb.catalog_kb(visible,page,pages,query))
+    if edit:
+        await target.edit_text(text, reply_markup=kb.catalog_kb(visible,page,pages,query))
+    else:
+        await target.answer(text, reply_markup=kb.catalog_kb(visible,page,pages,query))
 
 @dp.callback_query(F.data.startswith('catalog:page:'))
 async def v24_catalog_page(c: CallbackQuery):
     _,_,page,query=(c.data.split(':',3)+[''])[:4]
-    await c.answer(); await show_catalog(c.message,int(page),query)
+    await c.answer(); await show_catalog(c.message,int(page),query,edit=True)
 
 @dp.callback_query(F.data.startswith('catalog:pick:'))
 async def v24_catalog_pick(c: CallbackQuery, state: FSMContext):
@@ -999,29 +1150,83 @@ async def v24_catalog_pick(c: CallbackQuery, state: FSMContext):
 
 @dp.callback_query(F.data == 'parser_ui:random')
 async def v24_random_menu(c: CallbackQuery):
-    await c.answer(); await c.message.edit_text('🎲 <b>СЛУЧАЙНЫЙ ПАРСЕР</b>\n\nСлучайно выбираю подарок и номер. Сколько проверок сделать?', reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text='1',callback_data='random_v24:1'),InlineKeyboardButton(text='5',callback_data='random_v24:5'),InlineKeyboardButton(text='10',callback_data='random_v24:10'),InlineKeyboardButton(text='20',callback_data='random_v24:20')],
-        [InlineKeyboardButton(text='‹ Парсер',callback_data='menu:parser')]
+    await c.answer()
+    await c.message.edit_text('🎲 <b>СЛУЧАЙНЫЙ ПАРСЕР</b>\n\nВыбери модель. Можно листать каталог, затем выбрать количество проверок.', reply_markup=random_models_kb(1))
+
+
+def random_models_kb(page=1):
+    items=list(zip(GIFT_CATALOG, GIFT_MODELS))
+    per=8; pages=max(1,(len(items)+per-1)//per); page=max(1,min(int(page),pages))
+    visible=items[(page-1)*per:page*per]
+    rows=[]
+    for i in range(0,len(visible),2):
+        rows.append([InlineKeyboardButton(text=a,callback_data=f'random_model:{b}') for a,b in visible[i:i+2]])
+    nav=[]
+    if page>1: nav.append(InlineKeyboardButton(text='‹',callback_data=f'random_models_page:{page-1}'))
+    nav.append(InlineKeyboardButton(text=f'{page}/{pages}',callback_data='noop'))
+    if page<pages: nav.append(InlineKeyboardButton(text='›',callback_data=f'random_models_page:{page+1}'))
+    rows.append(nav)
+    rows.append([InlineKeyboardButton(text='🎲 Любая модель',callback_data='random_model:any')])
+    rows.append([InlineKeyboardButton(text='‹ Парсер',callback_data='menu:parser')])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+@dp.callback_query(F.data.startswith('random_models_page:'))
+async def random_models_page(c: CallbackQuery):
+    await c.answer(); await c.message.edit_reply_markup(reply_markup=random_models_kb(int(c.data.split(':')[1])))
+
+@dp.callback_query(F.data.startswith('random_model:'))
+async def random_model_pick(c: CallbackQuery):
+    model=c.data.split(':',1)[1]
+    await c.answer()
+    label='любые модели' if model=='any' else ui.pretty(model)
+    await c.message.edit_text(f'🎲 <b>СЛУЧАЙНЫЙ ПАРСЕР</b>\n\nМодель: <b>{ui.esc(label)}</b>\n\nСколько проверок сделать?', reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text='1',callback_data=f'random_v24:1:{model}'),InlineKeyboardButton(text='5',callback_data=f'random_v24:5:{model}'),InlineKeyboardButton(text='10',callback_data=f'random_v24:10:{model}'),InlineKeyboardButton(text='20',callback_data=f'random_v24:20:{model}')],
+        [InlineKeyboardButton(text='‹ Модели',callback_data='parser_ui:random')]
     ]))
 
 @dp.callback_query(F.data.startswith('random_v24:'))
 async def v24_random_run(c: CallbackQuery):
-    uid=c.from_user.id; count=int(c.data.split(':')[1])
+    parts=c.data.split(':'); uid=c.from_user.id; count=int(parts[1]); selected_model=parts[2] if len(parts)>2 else 'any'
     if not trial_allowed(uid,'random',count): return await c.answer(f'Осталось: {db.trial_left(uid,"random")}',show_alert=True)
     if uid in ACTIVE: return await c.answer('У тебя уже идёт проверка.',show_alert=True)
     await c.answer('Запускаю…'); ACTIVE.add(uid); db.clear_stop(uid)
-    status=await c.message.answer(f'🎲 Проверяю <b>{count}</b> случайных подарков…',reply_markup=kb.running_kb())
-    found=0; errors=0
+    status=await c.message.edit_text(f'🎲 Проверяю <b>{count}</b> случайных подарков…',reply_markup=kb.running_kb())
+    found=0; errors=0; prices=[]; owners=set(); results=[]
     try:
+        try:
+            await parser_handlers.ensure_client(db)
+        except Exception:
+            pass
         for i in range(count):
             if db.should_stop(uid): break
-            model=random.choice(GIFT_MODELS); number=random.randint(1,100000)
+            model=random.choice(GIFT_MODELS) if selected_model == 'any' else selected_model; number=random.randint(1,100000)
             try: gift=await peek_get_gift(model,number)
-            except Exception as e: gift=None; errors+=1; log.warning('V24 random failed model=%s number=%s: %s',model,number,e)
+            except Exception as e: gift=None; errors+=1; log.warning('Random failed model=%s number=%s: %s',model,number,e)
             db.consume_trial_kind(uid,'random',1)
-            if gift:
-                found+=1; await send_card(c.message,uid,gift)
-        await edit(status,f'🎲 <b>СЛУЧАЙНЫЙ ПАРСЕР ЗАВЕРШЁН</b>\n\nПроверено: <b>{count}</b>\nНайдено: <b>{found}</b>\nОшибок сети: <b>{errors}</b>',reply_markup=kb.inline_main_menu(is_admin(uid),is_unlimited(uid)))
+            if not gift: continue
+            found+=1
+            gift['gift_slug'] = gift.get('gift_slug') or f'{gift.get("model") or model}-{gift.get("giftNumber") or number}'
+            live, source, details = await live_price(parser_handlers.parser_client, gift)
+            if live:
+                gift['market'] = {'price': live, 'source': source, 'details': details}
+                prices.append(live)
+            owner = gift.get('username') or gift.get('userId') or gift.get('owner')
+            if owner: owners.add(str(owner))
+            results.append(gift)
+            await send_card(c.message,uid,gift)
+        total=sum(prices) if prices else 0
+        avg=round(total/len(prices)) if prices else 0
+        owner_text=', '.join(f'@{x}' if not x.isdigit() else x for x in list(owners)[:15]) or 'не определены'
+        summary=(f'🎲 <b>СЛУЧАЙНЫЙ ПАРСЕР ЗАВЕРШЁН</b>\n\n'
+                 f'🔎 Проверено: <b>{count}</b>\n'
+                 f'🎁 Найдено подарков: <b>{found}</b>\n'
+                 f'👤 Владельцев: <b>{len(owners)}</b>\n'
+                 f'👥 Владельцы: <b>{ui.esc(owner_text)}</b>\n'
+                 f'⭐ Оценено по Telegram: <b>{len(prices)}/{found}</b>\n'
+                 f'💰 Суммарная оценка: <b>~{total:,} Stars</b>\n'
+                 f'📊 Средняя цена: <b>~{avg:,} Stars</b>' if prices else
+                 f'🎲 <b>СЛУЧАЙНЫЙ ПАРСЕР ЗАВЕРШЁН</b>\n\nПроверено: <b>{count}</b>\nНайдено подарков: <b>{found}</b>\nВладельцев: <b>{len(owners)}</b>\n⚠️ Актуальную цену Telegram не удалось получить для найденных подарков.')
+        await edit(status,summary,reply_markup=kb.inline_main_menu(is_admin(uid),is_unlimited(uid)))
     finally:
         ACTIVE.discard(uid); db.clear_stop(uid)
 
@@ -1040,40 +1245,58 @@ async def v24_chats(c: CallbackQuery,state:FSMContext):
     await c.message.edit_text(parser_handlers.format_parser_menu(session),reply_markup=parser_kb.parser_main_menu(bool(session and session.get('is_active'))))
 
 @dp.callback_query(F.data.startswith('buy:'))
-async def v24_buy(c: CallbackQuery):
-    uid=c.from_user.id; plan=c.data.split(':',1)[1]
-    plans={'premium_2d':('7','premium',172800,'Премиум на 2 дня'),'chat_24h':('10','chat',86400,'Парсер чатов на 24 часа'),'offers_5d':('25','offers',432000,'Оферы на 5 дней')}
-    if plan not in plans: return await c.answer('Неизвестный тариф',show_alert=True)
-    if not crypto_pay.configured: return await c.answer('Платежи пока не настроены: добавь CRYPTO_PAY_API_TOKEN в Railway Variables.',show_alert=True)
-    amount,kind,seconds,title=plans[plan]
-    payload=f'giftparser:{uid}:{plan}:{int(time.time())}'
-    try:
-        inv=await crypto_pay.create_invoice(amount,f'GiftParser — {title}',payload)
-        db.save_payment_invoice(inv['invoice_id'],uid,plan,amount,payload)
-        url=inv.get('bot_invoice_url') or inv.get('mini_app_invoice_url') or inv.get('web_app_invoice_url')
-        if not url: raise RuntimeError('CryptoBot не вернул ссылку на оплату')
-        await c.answer('Счёт создан')
-        await c.message.answer(f'💳 <b>ОПЛАТА</b>\n\n{ui.esc(title)}\nСумма: <b>{amount} TON</b>\n\nПосле оплаты доступ включится автоматически.',reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text='💳 Оплатить в CryptoBot',url=url)],[InlineKeyboardButton(text='💎 К тарифам',callback_data='menu:premium')]]))
-    except Exception as e:
-        log.exception('CryptoPay invoice failed uid=%s plan=%s',uid,plan)
-        await c.answer(f'Ошибка оплаты: {str(e)[:180]}',show_alert=True)
-
-@dp.callback_query(F.data == 'profile:last')
-async def v24_profile_last(c: CallbackQuery):
-    uid=c.from_user.id; row=db.last_resumable_search(uid)
+async def buy_plan(c: CallbackQuery):
+    uid = int(c.from_user.id)
+    plan = c.data.split(':', 1)[1]
+    plans = tariff_config()
+    if plan not in plans:
+        return await c.answer('Тариф не найден', show_alert=True)
+    amount, kind, seconds, title = plans[plan]
     await c.answer()
-    if not row:
-        return await c.message.edit_text('🔎 <b>ПОСЛЕДНИЙ ПАРСИНГ</b>\n\nПока нет незавершённых поисков.', reply_markup=kb.profile_menu_kb())
-    text=(f'🔎 <b>ПОСЛЕДНИЙ ПАРСИНГ</b>\n\n'
-          f'🎁 {ui.esc(ui.pretty(row["model"]))}\n'
-          f'🆔 <code>{row["start_id"]}–{row["end_id"]}</code>\n'
-          f'📌 Статус: <b>{ui.esc(row["status"])}</b>\n'
-          f'🔢 Последний ID: <code>{row["last_checked_id"]}</code>')
-    await c.message.edit_text(text, reply_markup=kb.history_detail_kb(row))
+    payload = f'{uid}:{plan}:{int(time.time())}'
+    markup = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text='💳 CryptoBot', callback_data=f'pay:crypto:{plan}')],
+        [InlineKeyboardButton(text='🚀 xRocket', callback_data=f'pay:xrocket:{plan}')],
+        [InlineKeyboardButton(text='‹ Премиум', callback_data='menu:premium')],
+    ])
+    await c.message.edit_text(f'💳 <b>{ui.esc(title)}</b>\n\nСтоимость: <b>{amount} TON</b>\n\nВыбери способ оплаты:', reply_markup=markup)
 
-@dp.callback_query(F.data == 'profile:history')
-async def v24_profile_history(c: CallbackQuery):
-    await c.answer(); await history(c.message)
+async def _create_crypto_invoice(c: CallbackQuery, plan: str):
+    plans = tariff_config()
+    amount, kind, seconds, title = plans[plan]; uid=int(c.from_user.id)
+    if not crypto_pay.configured:
+        return await c.answer('CryptoBot не настроен.', show_alert=True)
+    payload=f'{uid}:{plan}:{int(time.time())}'
+    try:
+        inv=await crypto_pay.create_invoice(amount, f'GiftParser — {title}', payload)
+        db.save_payment_invoice(inv['invoice_id'], uid, plan, amount, payload)
+        url=inv.get('bot_invoice_url') or inv.get('mini_app_invoice_url') or inv.get('web_app_invoice_url')
+        if not url: raise RuntimeError('CryptoBot не вернул ссылку оплаты')
+        await c.message.edit_text(f'💳 <b>CryptoBot</b>\n\nТариф: <b>{ui.esc(title)}</b>\nСумма: <b>{amount} TON</b>\n\nПосле оплаты доступ активируется автоматически.', reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text='💳 Оплатить CryptoBot', url=url)],[InlineKeyboardButton(text='‹ Назад', callback_data=f'buy:{plan}')]]))
+    except Exception as e:
+        log.exception('CryptoBot invoice failed uid=%s plan=%s',uid,plan); await c.answer(f'Не удалось создать счёт: {str(e)[:180]}',show_alert=True)
+
+@dp.callback_query(F.data.startswith('pay:crypto:'))
+async def pay_crypto(c: CallbackQuery):
+    return await _create_crypto_invoice(c, c.data.split(':',2)[2])
+
+@dp.callback_query(F.data.startswith('pay:xrocket:'))
+async def pay_xrocket(c: CallbackQuery):
+    plan=c.data.split(':',2)[2]
+    plans={'premium_2d':('7','premium',172800,'Премиум · 2 дня'),'chat_24h':('10','chat',86400,'Парсер чатов · 24 часа'),'offers_5d':('25','offers',432000,'Оферы · 5 дней')}
+    if plan not in plans: return await c.answer('Тариф не найден',show_alert=True)
+    amount, kind, seconds, title=plans[plan]; uid=int(c.from_user.id)
+    if not xrocket_pay.configured: return await c.answer('xRocket не настроен. Добавь XROCKET_PAY_API_TOKEN.',show_alert=True)
+    client_id=f'gp_{uid}_{plan}_{int(time.time()*1000)}'
+    try:
+        inv=await xrocket_pay.create_invoice(amount, title, client_id, uid, c.from_user.username)
+        db.save_xrocket_invoice(client_id, str(inv.get('id') or client_id), uid, plan, amount, 'TON', 'active')
+        url=((inv.get('links') or {}).get('telegramBotLink') or (inv.get('links') or {}).get('webLink'))
+        if not url: raise RuntimeError('xRocket не вернул ссылку оплаты')
+        await c.answer()
+        await c.message.edit_text(f'🚀 <b>xRocket</b>\n\nТариф: <b>{ui.esc(title)}</b>\nСумма: <b>{amount} TON</b>\n\nПосле оплаты доступ активируется автоматически.', reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text='🚀 Оплатить через xRocket', url=url)],[InlineKeyboardButton(text='‹ Назад', callback_data=f'buy:{plan}')]]))
+    except Exception as e:
+        log.exception('xRocket invoice failed uid=%s plan=%s',uid,plan); await c.answer(f'Не удалось создать xRocket-счёт: {str(e)[:180]}',show_alert=True)
 
 @dp.callback_query(F.data == 'profile:payments')
 async def v24_profile_payments(c: CallbackQuery):
@@ -1206,6 +1429,95 @@ async def offer_self_back(c: CallbackQuery):
         pass
 
 
+# ───────────────────────── Рассылка ─────────────────────────
+@dp.callback_query(F.data == 'adm:broadcast')
+async def adm_broadcast_start(c: CallbackQuery, state: FSMContext):
+    if not is_admin(c.from_user.id):
+        return await c.answer('Нет доступа', show_alert=True)
+    await c.answer()
+    await state.set_state(S.admin_broadcast)
+    await c.message.edit_text(
+        '📣 <b>РАССЫЛКА</b>\n\n'
+        'Отправь следующим сообщением то, что нужно разослать: <b>текст, фото, GIF, видео, документ, аудио, голосовое или стикер</b>.\n\n'
+        'Поддерживается одно сообщение за рассылку. После получения я покажу подтверждение.',
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text='‹ Назад', callback_data='adm:home')]])
+    )
+
+@dp.callback_query(F.data == 'adm:broadcast_cancel')
+async def adm_broadcast_cancel(c: CallbackQuery, state: FSMContext):
+    if not is_admin(c.from_user.id):
+        return await c.answer('Нет доступа', show_alert=True)
+    await state.clear()
+    await c.answer('Отменено')
+    await c.message.edit_text('⚙️ <b>АДМИН-ПАНЕЛЬ</b>', reply_markup=admin_home_kb())
+
+@dp.message(S.admin_broadcast)
+async def adm_broadcast_preview(m: Message, state: FSMContext):
+    if not is_admin(m.from_user.id):
+        await state.clear(); return
+    await state.update_data(broadcast_chat_id=m.chat.id, broadcast_message_id=m.message_id, broadcast_audience='all')
+    count = len(db.broadcast_user_ids('all'))
+    await m.answer(
+        f'📣 <b>ПРЕДПРОСМОТР РАССЫЛКИ</b>\n\nАудитория: <b>Все</b> · Получателей: <b>{count}</b>\n\nВыбери аудиторию или запускай.',
+        reply_markup=broadcast_audience_kb('all')
+    )
+
+def broadcast_audience_kb(selected='all'):
+    labels=[('all','🌐 Все'),('premium','💎 Premium'),('chat','📡 Парсер чатов'),('offers','🎁 Оферы'),('active','🟢 Активные 7 дней')]
+    rows=[]
+    for key,label in labels:
+        count=len(db.broadcast_user_ids(key))
+        rows.append([InlineKeyboardButton(text=f'{label} · {count}' + (' ✅' if key==selected else ''), callback_data=f'adm:broadcast_audience:{key}')])
+    rows.append([InlineKeyboardButton(text='🚀 Начать рассылку', callback_data='adm:broadcast_send')])
+    rows.append([InlineKeyboardButton(text='✖️ Отмена', callback_data='adm:broadcast_cancel')])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+@dp.callback_query(F.data.startswith('adm:broadcast_audience:'))
+async def adm_broadcast_audience(c: CallbackQuery, state: FSMContext):
+    if not is_admin(c.from_user.id): return await c.answer('Нет доступа', show_alert=True)
+    audience=c.data.split(':')[-1]
+    data=await state.get_data()
+    if not data.get('broadcast_message_id'): return await c.answer('Сначала отправь сообщение для рассылки.', show_alert=True)
+    await state.update_data(broadcast_audience=audience)
+    await c.answer('Аудитория изменена')
+    await c.message.edit_text(f'📣 <b>РАССЫЛКА</b>\n\nАудитория: <b>{ui.esc(audience)}</b>\nПолучателей: <b>{len(db.broadcast_user_ids(audience))}</b>', reply_markup=broadcast_audience_kb(audience))
+
+@dp.callback_query(F.data == 'adm:broadcast_send')
+async def adm_broadcast_send(c: CallbackQuery, state: FSMContext):
+    if not is_admin(c.from_user.id):
+        return await c.answer('Нет доступа', show_alert=True)
+    data = await state.get_data()
+    source_chat = data.get('broadcast_chat_id'); source_message = data.get('broadcast_message_id')
+    if not source_chat or not source_message:
+        await state.clear(); return await c.answer('Сообщение рассылки не найдено.', show_alert=True)
+    await c.answer('Рассылка запущена')
+    await c.message.edit_text('📣 <b>РАССЫЛКА ЗАПУЩЕНА</b>\n\nБот отправляет сообщения безопасной очередью.')
+    await state.clear()
+    asyncio.create_task(run_broadcast(int(source_chat), int(source_message), int(c.from_user.id), data.get('broadcast_audience') or 'all'))
+
+async def run_broadcast(source_chat: int, source_message: int, admin_id: int, audience='all'):
+    rows = db.broadcast_user_ids(audience)
+    sent = failed = 0
+    for uid in rows:
+        try:
+            await bot.copy_message(chat_id=int(uid), from_chat_id=source_chat, message_id=source_message)
+            sent += 1
+        except TelegramRetryAfter as e:
+            await asyncio.sleep(min(int(getattr(e, 'retry_after', 1) or 1), 30) + 0.2)
+            try:
+                await bot.copy_message(chat_id=int(uid), from_chat_id=source_chat, message_id=source_message)
+                sent += 1
+            except Exception:
+                failed += 1
+        except Exception:
+            failed += 1
+        await asyncio.sleep(float(os.getenv('BROADCAST_DELAY', '0.08')))
+    try:
+        await bot.send_message(admin_id, f'✅ <b>РАССЫЛКА ЗАВЕРШЕНА</b>\n\nОтправлено: <b>{sent}</b>\nОшибок: <b>{failed}</b>')
+    except Exception:
+        pass
+    log.info('Broadcast finished admin=%s audience=%s sent=%s failed=%s', admin_id, audience, sent, failed)
+
 # ───────────────────────── новая админка V25 ─────────────────────────
 def admin_home_kb():
     return InlineKeyboardMarkup(inline_keyboard=[
@@ -1214,7 +1526,10 @@ def admin_home_kb():
         [InlineKeyboardButton(text='🔎 Доступ к парсеру', callback_data='adm:parser_access')],
         [InlineKeyboardButton(text='🎁 Доступ к оферам', callback_data='adm:offer_access')],
         [InlineKeyboardButton(text='💳 Тарифы', callback_data='adm:tariffs')],
+        [InlineKeyboardButton(text='📣 Рассылка', callback_data='adm:broadcast')],
         [InlineKeyboardButton(text='📜 Логи', callback_data='adm:logs')],
+        [InlineKeyboardButton(text='🛠 Система и канал логов', callback_data='adm:system')],
+        [InlineKeyboardButton(text='🚧 Технические работы', callback_data='adm:maintenance')],
         [InlineKeyboardButton(text='🔄 Обновить', callback_data='adm:home')],
     ])
 
@@ -1311,11 +1626,21 @@ def offers_admin_kb():
 
 
 def tariffs_text():
-    return ('💳 <b>ТАРИФЫ</b>\n\n'
-            '⚡ <b>7 TON · 2 дня</b>\nОбычный + случайный + поиск по ID.\n\n'
-            '📡 <b>10 TON · 24 часа</b>\nПарсер чатов.\n\n'
-            '🎁 <b>25 TON · 5 дней</b>\nОферы.\n\n'
-            'Оплата: CryptoBot → TON. Доступ выдаётся автоматически после подтверждения платежа.')
+    plans = tariff_config()
+    lines=['💳 <b>ТАРИФЫ</b>','']
+    labels={'premium_2d':'⚡ Premium · 2 дня','chat_24h':'📡 Парсер чатов · 24 часа','offers_5d':'🎁 Оферы · 5 дней'}
+    for key in ('premium_2d','chat_24h','offers_5d'):
+        lines.append(f'{labels[key]}: <b>{plans[key][0]} TON</b>')
+    lines += ['', 'Выбери тариф, чтобы изменить цену. Изменение сохраняется в SQLite.']
+    return '\n'.join(lines)
+
+def tariffs_kb():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=f'⚡ Premium: {tariff_config()["premium_2d"][0]} TON', callback_data='adm:tariff:premium_2d')],
+        [InlineKeyboardButton(text=f'📡 Чаты: {tariff_config()["chat_24h"][0]} TON', callback_data='adm:tariff:chat_24h')],
+        [InlineKeyboardButton(text=f'🎁 Оферы: {tariff_config()["offers_5d"][0]} TON', callback_data='adm:tariff:offers_5d')],
+        [InlineKeyboardButton(text='‹ Назад', callback_data='adm:home')],
+    ])
 
 
 @dp.message(F.text == kb.BTN_ADMIN)
@@ -1450,7 +1775,31 @@ async def adm_offer_access(c: CallbackQuery):
 @dp.callback_query(F.data == 'adm:tariffs')
 async def adm_tariffs(c: CallbackQuery):
     if not is_admin(c.from_user.id): return await c.answer('Нет доступа',show_alert=True)
-    await c.answer(); await c.message.edit_text(tariffs_text(),reply_markup=admin_back())
+    await c.answer(); await c.message.edit_text(tariffs_text(),reply_markup=tariffs_kb())
+
+
+@dp.callback_query(F.data.regexp(r'^adm:tariff:(premium_2d|chat_24h|offers_5d)$'))
+async def adm_tariff_start(c: CallbackQuery, state: FSMContext):
+    if not is_admin(c.from_user.id): return await c.answer('Нет доступа', show_alert=True)
+    key=c.data.split(':')[-1]
+    await state.set_state(S.admin_tariff); await state.update_data(tariff_key=key)
+    current=tariff_config()[key][0]
+    await c.answer(); await c.message.edit_text(f'💳 <b>Изменение тарифа</b>\n\nТекущая цена: <b>{current} TON</b>\n\nОтправь новую цену числом, например <code>12.5</code>.', reply_markup=admin_back('adm:tariffs'))
+
+
+@dp.message(S.admin_tariff)
+async def adm_tariff_value(m: Message, state: FSMContext):
+    if not is_admin(m.from_user.id): await state.clear(); return
+    try:
+        value=float((m.text or '').replace(',','.').strip())
+        if value <= 0 or value > 100000: raise ValueError
+    except Exception:
+        return await m.answer('❌ Введи положительную цену до 100000 TON.')
+    data=await state.get_data(); key=data.get('tariff_key')
+    if key not in tariff_config(): await state.clear(); return await m.answer('❌ Тариф не найден.')
+    db.set_setting('tariff_'+key, str(value).rstrip('0').rstrip('.') if '.' in str(value) else str(int(value)))
+    await state.clear()
+    await m.answer('✅ Цена сохранена.', reply_markup=tariffs_kb())
 
 
 @dp.callback_query(F.data == 'adm:logs')
@@ -1460,6 +1809,74 @@ async def adm_logs(c: CallbackQuery):
         text=''.join(Path('logs/giftparser.log').read_text(encoding='utf-8').splitlines(True)[-35:])[-3800:]
     except Exception as e: text=f'Лог недоступен: {e}'
     await c.answer(); await c.message.edit_text('<b>📜 ЛОГИ</b>\n\n<pre>'+ui.esc(text)+'</pre>',reply_markup=admin_back())
+
+
+def maintenance_kb():
+    enabled=db.get_setting('maintenance_mode','0') == '1'
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=('🔴 Выключить' if enabled else '🟢 Включить'), callback_data='adm:maintenance:toggle')],
+        [InlineKeyboardButton(text='‹ Назад', callback_data='adm:home')],
+    ])
+
+@dp.callback_query(F.data == 'adm:maintenance')
+async def adm_maintenance(c: CallbackQuery):
+    if not is_admin(c.from_user.id): return await c.answer('Нет доступа', show_alert=True)
+    enabled=db.get_setting('maintenance_mode','0') == '1'
+    await c.answer(); await c.message.edit_text('🚧 <b>ТЕХНИЧЕСКИЕ РАБОТЫ</b>\n\nСтатус: <b>'+('включены' if enabled else 'выключены')+'</b>\n\nПри включении обычные пользователи не смогут пользоваться ботом, админы продолжат работу.', reply_markup=maintenance_kb())
+
+@dp.callback_query(F.data == 'adm:maintenance:toggle')
+async def adm_maintenance_toggle(c: CallbackQuery):
+    if not is_admin(c.from_user.id): return await c.answer('Нет доступа', show_alert=True)
+    new='0' if db.get_setting('maintenance_mode','0') == '1' else '1'
+    db.set_setting('maintenance_mode', new)
+    await c.answer('Статус изменён', show_alert=True)
+    enabled=new=='1'
+    await c.message.edit_text('🚧 <b>ТЕХНИЧЕСКИЕ РАБОТЫ</b>\n\nСтатус: <b>'+('включены' if enabled else 'выключены')+'</b>', reply_markup=maintenance_kb())
+
+
+def system_text():
+    log_channel=db.get_setting('log_channel_id') or 'не задан'
+    session=db.get_parser_session()
+    return ('🛠 <b>СИСТЕМА</b>\n\n'
+            f'🤖 Bot: <b>online</b>\n'
+            f'💾 SQLite: <b>WAL</b>\n'
+            f'🔎 Peek API: <b>{"настроен"}</b>\n'
+            f'📡 Telethon: <b>{"подключён" if session and session.get("is_active") else "не подключён"}</b>\n'
+            f'💳 CryptoBot: <b>{"готов" if crypto_pay.configured else "не настроен"}</b>\n'
+            f'🚀 xRocket: <b>{"готов" if xrocket_pay.configured else "не настроен"}</b>\n'
+            f'📣 Рассылка: <b>очередь</b>\n'
+            f'📜 Канал логов: <code>{ui.esc(log_channel)}</code>')
+
+def system_kb():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text='📜 Изменить канал логов', callback_data='adm:log_channel')],
+        [InlineKeyboardButton(text='🔄 Обновить', callback_data='adm:system')],
+        [InlineKeyboardButton(text='‹ Назад', callback_data='adm:home')],
+    ])
+
+@dp.callback_query(F.data == 'adm:system')
+async def adm_system(c: CallbackQuery):
+    if not is_admin(c.from_user.id): return await c.answer('Нет доступа', show_alert=True)
+    await c.answer(); await c.message.edit_text(system_text(), reply_markup=system_kb())
+
+@dp.callback_query(F.data == 'adm:log_channel')
+async def adm_log_channel_start(c: CallbackQuery, state: FSMContext):
+    if not is_owner(c.from_user.id): return await c.answer('Только владелец.', show_alert=True)
+    await state.set_state(S.admin_log_channel); await c.answer()
+    await c.message.edit_text('📜 <b>КАНАЛ ЛОГОВ</b>\n\nПришли ID канала вида <code>-1001234567890</code>.\nБот должен быть администратором этого канала.', reply_markup=admin_back('adm:system'))
+
+@dp.message(S.admin_log_channel)
+async def adm_log_channel_value(m: Message, state: FSMContext):
+    if not is_owner(m.from_user.id): await state.clear(); return
+    raw=(m.text or '').strip()
+    try: cid=int(raw)
+    except ValueError: return await m.answer('❌ Нужен числовой ID канала, например <code>-1001234567890</code>.')
+    db.set_setting('log_channel_id', str(cid))
+    global LOG_CHANNEL_DISABLED
+    LOG_CHANNEL_DISABLED=False
+    await state.clear(); await audit('Канал логов изменён', m.from_user.id, f'Новый канал: <code>{cid}</code>')
+    await m.answer(f'✅ Канал логов сохранён: <code>{cid}</code>', reply_markup=system_kb())
+
 
 # Admin: Business-профили оферов.
 def admin_business_connections_kb():
@@ -1587,6 +2004,20 @@ async def offer_business_connection_update(c: BusinessConnection):
 
 
 @dp.message(F.text.regexp(r'^\s*\.офер(?:\s|$)'))
+async def demo_offer_command_private(m: Message):
+    # DEMO offers must be created in the Business-managed chat where the
+    # command was written. Never turn a normal private chat with the bot into
+    # an offer delivery target, otherwise the seller can receive the offer in
+    # the bot DM instead of the customer's Business chat.
+    try:
+        await m.answer(
+            '⚠️ <b>Офер нужно создавать в Business-чате.</b>\n\n'
+            'Напишите <code>.офер</code> в чате, подключённом к Business-профилю.'
+        )
+    except Exception:
+        log.exception('Could not explain Business-only offer mode to chat=%s', getattr(m.chat, 'id', None))
+
+
 @dp.business_message(F.text.regexp(r'^\s*\.офер(?:\s|$)'))
 async def demo_offer_command(m: Message):
     parsed = parse_offer_command(m.text or '')
@@ -1594,6 +2025,11 @@ async def demo_offer_command(m: Message):
         return
 
     sender_id = int(m.from_user.id) if m.from_user else 0
+    log.info(
+        'OFFER COMMAND RECEIVED sender=%s chat=%s business_connection=%s text=%r',
+        sender_id, getattr(getattr(m, 'chat', None), 'id', None),
+        getattr(m, 'business_connection_id', None), m.text,
+    )
     sender_username = getattr(m.from_user, 'username', None) if m.from_user else None
     business_connection_id = getattr(m, 'business_connection_id', None)
 
@@ -1624,32 +2060,30 @@ async def demo_offer_command(m: Message):
         if not business_owner_id or not bool((bc_row or {}).get('is_enabled', 1)):
             log.warning('Ignoring .офер: Business connection unavailable: %s', business_connection_id)
             return
-        # A command inside a Business-managed chat is valid only when the
-        # person who typed it is the owner of THIS Business connection.
-        # This prevents an unauthorized friend from triggering another user's
-        # Business account by simply writing `.офер` to their chat.
-        if business_owner_id != sender_id:
-            log.info('Ignoring cross-user Business .офер sender=%s business_owner=%s', sender_id, business_owner_id)
-            return
-        if not offer_ready_for_user(sender_id, sender_username):
-            log.info('Ignoring unavailable Business .офер sender=%s', sender_id)
+        # DEMO offers are a bot UI flow, not a real Telegram transaction.
+        # In a Business message, from_user is the customer who wrote in the
+        # managed chat, NOT the Business account owner. Requiring
+        # sender_id == business_owner_id therefore made every Business .офер
+        # silently fail. Authorization is instead tied to the approved active
+        # Business connection itself.
+        if db.offer_user_blocked(business_owner_id) and not is_admin(business_owner_id):
+            log.info('Ignoring blocked Business .офер connection=%s owner=%s', business_connection_id, business_owner_id)
             return
         seller_id = business_owner_id
         seller_display_name = await _business_seller_display_name(business_connection_id)
     else:
-        if not offer_ready_for_user(sender_id, sender_username):
+        # For a normal bot PM, use the sender's own saved Business connection.
+        # Never fall back to OWNER_ID or another user's Business profile.
+        saved_bc = db.get_business_connection_for_user(sender_id)
+        if not saved_bc:
+            log.warning('User %s has no active Business connection; .офер ignored', sender_id)
+            return
+        business_connection_id = saved_bc['connection_id']
+        if not offer_ready_for_user(sender_id, sender_username, business_connection_id):
             log.info('Ignoring normal .офер from user without approved Business access: %s', sender_id)
             return
-        # For a normal bot PM, use the sender's own saved Business connection.
-        # This avoids ever falling back to OWNER_ID for another authorized user.
-        saved_bc = db.get_business_connection_for_user(sender_id)
-        if saved_bc:
-            business_connection_id = saved_bc['connection_id']
-            seller_id = sender_id
-            seller_display_name = await _business_seller_display_name(business_connection_id)
-        else:
-            log.warning('Authorized user %s has no active Business connection; .офер is not sent as OWNER', sender_id)
-            return
+        seller_id = sender_id
+        seller_display_name = await _business_seller_display_name(business_connection_id)
 
     if not seller_display_name:
         seller_display_name = os.getenv('OFFER_SELLER_NAME', '').strip() or 'Пользователь'
@@ -1663,6 +2097,7 @@ async def demo_offer_command(m: Message):
     if not buyer or not buyer.id:
         return
     buyer_id = int(buyer.id)
+    log.info('OFFER DELIVERY TARGET chat=%s sender=%s business_connection=%s', buyer_id, sender_id, business_connection_id)
     buyer_username = getattr(buyer, 'username', None)
     buyer_url = f'https://t.me/{buyer_username}' if buyer_username else f'tg://user?id={buyer_id}'
     # Offer lifetime is intentionally unlimited in this DEMO.
@@ -1694,12 +2129,8 @@ async def demo_offer_command(m: Message):
         text, _ = build_offer_text(offer, parsed['locale'])
         markup = offer_keyboard(offer_id, parsed['locale'])
 
-        # Queue delivery in the background. The handler returns immediately,
-        # while the per-chat + global offer limiter spreads sends across users.
-        task = asyncio.create_task(_deliver_new_offer(m, offer_id, text, markup, business_connection_id))
-        OFFER_DELIVERY_TASKS.add(task)
-        task.add_done_callback(OFFER_DELIVERY_TASKS.discard)
-        log.info('Queued DEMO offer %s; source command=%s queue=%s', offer_id, getattr(m, 'message_id', '?'), len(OFFER_DELIVERY_TASKS))
+        # Deliver synchronously so the author gets an immediate result.
+        await _deliver_new_offer(m, offer_id, text, markup, business_connection_id)
     except Exception:
         if 'offer_id' in locals():
             db.set_offer_status(offer_id, STATUS_DECLINED)
@@ -1707,18 +2138,57 @@ async def demo_offer_command(m: Message):
 
 
 async def _deliver_new_offer(source_message: Message, offer_id: int, text: str, markup, business_connection_id=None):
+    """Deliver a DEMO offer strictly in the originating Business chat.
+
+    IMPORTANT: never fall back to a plain bot message for the OFFER itself.
+    A plain bot send can land in the bot DM / wrong context and was the reason
+    users saw the offer in the bot instead of in the Business conversation.
+    """
     try:
-        sent = await _send_offer_message(source_message, text, markup, business_connection_id=business_connection_id)
+        if not business_connection_id:
+            raise RuntimeError('Business connection отсутствует: офер не отправлен.')
+
+        sent = await _send_offer_message(
+            source_message, text, markup,
+            business_connection_id=business_connection_id,
+        )
         sent_chat_id = int(getattr(getattr(sent, 'chat', None), 'id', source_message.chat.id))
         sent_message_id = int(getattr(sent, 'message_id', 0) or 0)
         db.update_offer_message(offer_id, sent_chat_id, sent_message_id, business_connection_id)
+
+        # Delete the command only AFTER the Business-context offer is actually
+        # delivered. If Telegram blocks the send, keep the original command so
+        # the user is not left with a disappearing message and no offer.
         try:
-            await _delete_offer_command_message(source_message, business_connection_id=business_connection_id)
+            await _delete_offer_command_message(
+                source_message, business_connection_id=business_connection_id
+            )
         except Exception as delete_error:
-            log.warning('Could not delete offer command %s after sending offer %s: %s', getattr(source_message, 'message_id', '?'), offer_id, delete_error)
-        log.info('Delivered DEMO offer %s; source command=%s', offer_id, getattr(source_message, 'message_id', '?'))
+            log.warning(
+                'Could not delete offer command %s after sending offer %s: %s',
+                getattr(source_message, 'message_id', '?'), offer_id, delete_error,
+            )
+        log.info(
+            'Delivered DEMO offer %s strictly in Business chat=%s connection=%s',
+            offer_id, source_message.chat.id, business_connection_id,
+        )
+
+    except OfferPeerFloodError as e:
+        # Do NOT send the offer through normal bot.send_message(). That route
+        # caused the DEMO offer to appear in the bot DM / wrong destination.
+        # Keep the offer pending and report the failure only.
+        log.warning(
+            'DEMO offer %s NOT DELIVERED: Business PEER_FLOOD chat=%s business_connection=%s',
+            offer_id, e.chat_id, e.business_connection_id,
+        )
+        await _notify_offer_delivery_error(source_message, offer_id, e)
+
     except Exception as e:
-        log.error('Failed to deliver queued offer %s: %s', offer_id, e, exc_info=True)
+        log.error('Failed to deliver offer %s: %s', offer_id, e, exc_info=True)
+        try:
+            await _notify_offer_delivery_error(source_message, offer_id, e)
+        except Exception:
+            log.exception('Failed to report offer delivery error offer=%s', offer_id)
 
 
 @dp.callback_query(F.data.regexp(r'^of:(accept|decline):\d+$'))
@@ -1825,30 +2295,52 @@ async def demo_offer_action(c: CallbackQuery):
 async def payment_poll_loop():
     while True:
         try:
-            if not crypto_pay.configured:
-                await asyncio.sleep(60)
-                continue
-            for row in db.active_payment_invoices(100):
-                try:
-                    inv = await crypto_pay.get_invoice(row['invoice_id'])
-                    if not inv:
-                        continue
-                    if inv.get('status') == 'expired':
-                        db.mark_payment_status(row['invoice_id'], 'expired')
-                        continue
-                    if inv.get('status') != 'paid':
-                        continue
-                    if not db.mark_payment_paid(row['invoice_id']):
-                        continue
-                    plan=row['plan']; uid=int(row['user_id'])
-                    seconds={'premium_2d':172800,'chat_24h':86400,'offers_5d':432000}.get(plan)
-                    kind={'premium_2d':'premium','chat_24h':'chat','offers_5d':'offers'}.get(plan)
-                    if seconds and kind:
-                        until=db.grant_entitlement(uid,kind,seconds)
-                        await bot.send_message(uid,f'✅ <b>ОПЛАТА ПОДТВЕРЖДЕНА</b>\n\nДоступ активирован.\n⏳ До: <code>{ui.esc(until[:19].replace("T"," "))}</code>')
-                        log.info('Paid plan activated uid=%s plan=%s until=%s',uid,plan,until)
-                except Exception:
-                    log.exception('Payment check failed invoice=%s',row.get('invoice_id'))
+            if crypto_pay.configured:
+                for row in db.active_payment_invoices(100):
+                    try:
+                        inv = await crypto_pay.get_invoice(row['invoice_id'])
+                        if not inv:
+                            continue
+                        if inv.get('status') == 'expired':
+                            db.mark_payment_status(row['invoice_id'], 'expired')
+                            continue
+                        if inv.get('status') != 'paid':
+                            continue
+                        if not db.mark_payment_paid(row['invoice_id']):
+                            continue
+                        plan=row['plan']; uid=int(row['user_id'])
+                        seconds={'premium_2d':172800,'chat_24h':86400,'offers_5d':432000}.get(plan)
+                        kind={'premium_2d':'premium','chat_24h':'chat','offers_5d':'offers'}.get(plan)
+                        if seconds and kind:
+                            until=db.grant_entitlement(uid,kind,seconds)
+                            try:
+                                await bot.send_message(uid,f'✅ <b>ОПЛАТА ПОДТВЕРЖДЕНА</b>\n\nДоступ активирован.\n⏳ До: <code>{ui.esc(until[:19].replace("T"," "))}</code>')
+                            except Exception: pass
+                            log.info('Paid CryptoBot plan activated uid=%s plan=%s until=%s',uid,plan,until)
+                    except Exception:
+                        log.exception('CryptoBot payment check failed invoice=%s',row.get('invoice_id'))
+            if xrocket_pay.configured:
+                for row in db.active_xrocket_invoices(100):
+                    try:
+                        inv = await xrocket_pay.get_invoice(row['provider_invoice_id'])
+                        payment = inv.get('payment') if isinstance(inv, dict) else None
+                        status = str((payment or {}).get('status') or inv.get('status') or '').lower()
+                        if status == 'paid':
+                            if not db.mark_xrocket_paid(row['client_invoice_id']):
+                                continue
+                            plan=row['plan']; uid=int(row['user_id'])
+                            seconds={'premium_2d':172800,'chat_24h':86400,'offers_5d':432000}.get(plan)
+                            kind={'premium_2d':'premium','chat_24h':'chat','offers_5d':'offers'}.get(plan)
+                            if seconds and kind:
+                                until=db.grant_entitlement(uid,kind,seconds)
+                                try:
+                                    await bot.send_message(uid,f'✅ <b>ОПЛАТА XRocket ПОДТВЕРЖДЕНА</b>\n\nДоступ активирован.\n⏳ До: <code>{ui.esc(until[:19].replace("T"," "))}</code>')
+                                except Exception: pass
+                                log.info('Paid xRocket plan activated uid=%s plan=%s until=%s',uid,plan,until)
+                        elif status in {'expired','failed','cancelled'}:
+                            db.mark_xrocket_status(row['client_invoice_id'],status)
+                    except Exception:
+                        log.exception('xRocket payment check failed client_invoice=%s',row.get('client_invoice_id'))
         except Exception:
             log.exception('Payment polling loop failed')
         await asyncio.sleep(15)
@@ -1857,18 +2349,16 @@ async def payment_poll_loop():
 async def main():
     await bot.delete_webhook(drop_pending_updates=True)
     payment_task = asyncio.create_task(payment_poll_loop())
-    # Восстанавливаем сохранённую MTProto StringSession без повторного запроса кода.
     try:
         restored = await parser_handlers.restore_saved_parser_session(db)
         log.info('Saved parser session restore: %s', restored)
         if restored:
-            resumed = await parser_handlers.resume_interrupted_scan(db)
+            resumed = await parser_handlers.resume_interrupted_scan(db, bot)
             log.info('Interrupted parser scan resume: %s', resumed)
     except Exception:
         log.exception('Failed to restore saved parser session')
-
     log.info('STARTED %s | PRIMARY_OWNER_ID=%s | OWNER_ID=%s | DB=%s', APP_VERSION, PRIMARY_OWNER_ID, OWNER_ID, db_path)
-    log.info('Log channel configured: %s (startup audit disabled to avoid unnecessary SendMessage)', LOG_CHANNEL_ID)
+    log.info('Log channel configured: %s', db.get_setting('log_channel_id') or LOG_CHANNEL_ID)
     await bot.set_my_commands([
         BotCommand(command='start', description='Главное меню'),
         BotCommand(command='stop', description='Остановить текущий поиск'),
@@ -1884,8 +2374,8 @@ async def main():
             pass
         await api.close()
         await crypto_pay.close()
+        await xrocket_pay.close()
         await bot.session.close()
-
 
 if __name__ == '__main__':
     asyncio.run(main())

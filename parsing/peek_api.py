@@ -120,6 +120,8 @@ class PeekAPI:
         self.proxy_url = os.getenv('PROXY_URL') or None
         self.session = None
         self.sem = asyncio.Semaphore(self.concurrency)
+        self.cache = {}
+        self.cache_ttl = float(os.getenv('PEEK_CACHE_TTL', '120'))
 
     async def _ensure_session(self):
         if self.session and not self.session.closed:
@@ -137,6 +139,10 @@ class PeekAPI:
     async def get_gift(self, model, number, retries=4):
         """Вернёт подарок, None (если его нет) или бросит RuntimeError (если не удалось проверить)."""
         await self._ensure_session()
+        cache_key = (str(model), int(number))
+        cached = self.cache.get(cache_key)
+        if cached and cached[0] > asyncio.get_running_loop().time():
+            return cached[1]
         params = {'name': model.replace(' ', ''), 'page': 1, 'sortOrder': 'asc',
                   'giftNumber': number, 'limit': 20}
         last_error = 'неизвестная ошибка'
@@ -156,7 +162,9 @@ class PeekAPI:
                             continue
                         if r.status != 200:
                             raise RuntimeError(f'Peek HTTP {r.status}: {(await r.text())[:250]}')
-                        return self._extract(await r.json(content_type=None), number, model)
+                        result = self._extract(await r.json(content_type=None), number, model)
+                        self.cache[cache_key] = (asyncio.get_running_loop().time() + self.cache_ttl, result)
+                        return result
                 except (aiohttp.ClientError, asyncio.TimeoutError) as e:
                     last_error = f'сеть: {e}'
                     await asyncio.sleep(1.5 * (attempt + 1))

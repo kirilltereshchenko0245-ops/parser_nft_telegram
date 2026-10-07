@@ -18,6 +18,8 @@ class Database:
     @contextmanager
     def _db(self):
         c = sqlite3.connect(self.path, timeout=30)
+        c.execute('PRAGMA busy_timeout=10000')
+        c.execute('PRAGMA synchronous=NORMAL')
         c.row_factory = sqlite3.Row
         try:
             yield c
@@ -171,6 +173,16 @@ class Database:
                 payload TEXT,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 paid_at TIMESTAMP)''')
+            c.execute('''CREATE TABLE IF NOT EXISTS xrocket_invoices(
+                client_invoice_id TEXT PRIMARY KEY,
+                provider_invoice_id TEXT NOT NULL,
+                user_id INTEGER NOT NULL,
+                plan TEXT NOT NULL,
+                amount TEXT NOT NULL,
+                asset TEXT NOT NULL DEFAULT 'TON',
+                status TEXT NOT NULL DEFAULT 'active',
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                paid_at TIMESTAMP)''')
             c.execute('''CREATE TABLE IF NOT EXISTS offer_access_users(
                 user_id INTEGER PRIMARY KEY,
                 added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)''')
@@ -245,6 +257,13 @@ class Database:
                         SELECT id,user_id,chat_id,gift_id,gift_name,gift_slug,is_collectible,is_upgraded,raw_data,found_at
                         FROM parser_gifts_legacy''')
                 c.execute('DROP TABLE parser_gifts_legacy')
+
+            c.execute('CREATE INDEX IF NOT EXISTS idx_users_last_activity ON users(last_activity)')
+            c.execute('CREATE INDEX IF NOT EXISTS idx_history_user_started ON search_history(user_id, started_at DESC)')
+            c.execute('CREATE INDEX IF NOT EXISTS idx_found_user ON found_gifts(user_id, found_at DESC)')
+            c.execute('CREATE INDEX IF NOT EXISTS idx_orders_user_status ON payment_invoices(user_id, status, created_at DESC)')
+            c.execute('CREATE INDEX IF NOT EXISTS idx_xorders_user_status ON xrocket_invoices(user_id, status, created_at DESC)')
+            c.execute('CREATE INDEX IF NOT EXISTS idx_offers_seller_status ON gift_offers(seller_id, status, created_at DESC)')
 
             # Business connection used to update/delete offer messages after creation.
             self._add_col(c, 'gift_offers', 'business_connection_id', 'TEXT')
@@ -593,6 +612,38 @@ class Database:
 
     def payment_history(self, uid, limit=20):
         return self._all('SELECT invoice_id, plan, amount, asset, status, created_at, paid_at FROM payment_invoices WHERE user_id=? ORDER BY created_at DESC LIMIT ?', (int(uid), int(limit)))
+
+    def save_xrocket_invoice(self, client_invoice_id, provider_invoice_id, user_id, plan, amount, asset='TON', status='active'):
+        with self._db() as c:
+            c.execute('''INSERT OR REPLACE INTO xrocket_invoices(client_invoice_id,provider_invoice_id,user_id,plan,amount,asset,status) VALUES(?,?,?,?,?,?,?)''',
+                      (str(client_invoice_id),str(provider_invoice_id),int(user_id),str(plan),str(amount),str(asset),str(status)))
+    def active_xrocket_invoices(self, limit=100):
+        return self._all("SELECT * FROM xrocket_invoices WHERE status='active' ORDER BY created_at LIMIT ?", (int(limit),))
+    def mark_xrocket_paid(self, client_invoice_id):
+        with self._db() as c:
+            c.execute("UPDATE xrocket_invoices SET status='paid', paid_at=CURRENT_TIMESTAMP WHERE client_invoice_id=? AND status!='paid'", (str(client_invoice_id),))
+            return c.rowcount > 0
+    def mark_xrocket_status(self, client_invoice_id, status):
+        with self._db() as c:
+            c.execute("UPDATE xrocket_invoices SET status=? WHERE client_invoice_id=? AND status!='paid'", (str(status),str(client_invoice_id)))
+
+    def user_count(self):
+        row=self._one('SELECT COUNT(*) AS n FROM users')
+        return int((row or {}).get('n') or 0)
+    def all_user_ids(self):
+        return [int(r['user_id']) for r in self._all('SELECT user_id FROM users ORDER BY user_id')]
+    def broadcast_user_ids(self, audience='all'):
+        audience = str(audience or 'all')
+        if audience == 'premium':
+            return [int(r['user_id']) for r in self._all("SELECT user_id FROM users WHERE is_banned=0 AND (premium_until IS NOT NULL AND premium_until > CURRENT_TIMESTAMP)")]
+        if audience == 'offers':
+            return [int(r['user_id']) for r in self._all("SELECT user_id FROM users WHERE is_banned=0 AND (offer_until IS NOT NULL AND offer_until > CURRENT_TIMESTAMP)")]
+        if audience == 'chat':
+            return [int(r['user_id']) for r in self._all("SELECT user_id FROM users WHERE is_banned=0 AND (chat_parser_until IS NOT NULL AND chat_parser_until > CURRENT_TIMESTAMP)")]
+        if audience == 'active':
+            return [int(r['user_id']) for r in self._all("SELECT user_id FROM users WHERE is_banned=0 AND last_activity > datetime('now','-7 days')")]
+        return self.all_user_ids()
+
 
     def is_banned(self, uid):
         return bool((self.get_user(uid) or {}).get('is_banned'))
