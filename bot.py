@@ -48,7 +48,7 @@ def _env_int(*names, default=0):
     return int(default)
 
 PRIMARY_OWNER_ID = _env_int('PRIMARY_OWNER_ID', 'OWNER_ID', default=8564624250)
-APP_VERSION = 'V54_OFFER_DIAGNOSTICS_5_TESTS'
+APP_VERSION = 'V55_DIAGNOSTICS_HANDLER_FIXED'
 BOOTSTRAP_OFFER_ACCESS_IDS = {8570516857}
 # One canonical owner everywhere in the application.
 OWNER_ID = PRIMARY_OWNER_ID
@@ -2064,14 +2064,36 @@ async def _run_offer_send_diagnostics(m: Message):
 @dp.message(F.text.regexp(r'^\s*\.тестофер\s*$'))
 @dp.business_message(F.text.regexp(r'^\s*\.тестофер\s*$'))
 async def offer_diagnostic_command(m: Message):
-    """Opt-in diagnostic command; production .офер is unchanged."""
-    uid = int(m.from_user.id) if m.from_user else 0
-    username = getattr(m.from_user, 'username', None) if m.from_user else None
-    if not offer_ready_for_user(uid, username):
+    """Diagnostic command. It must always produce visible feedback; production .офер is unchanged."""
+    bc_id = getattr(m, 'business_connection_id', None)
+    chat_id = getattr(getattr(m, 'chat', None), 'id', None)
+    if not bc_id or not chat_id:
+        try:
+            await m.answer('⚠️ <b>.тестофер</b> работает только из Business-чата с активным Business connection.')
+        except Exception:
+            pass
         return
-    if not getattr(m, 'business_connection_id', None):
+    try:
+        await bot.send_message(
+            chat_id=chat_id,
+            text='🧪 <b>Диагностика оферов запущена.</b>\n\nТесты 1–5 будут отправлены последовательно.',
+            business_connection_id=bc_id,
+        )
+    except Exception as e:
+        log.error('OFFER DIAG START SEND FAILED chat=%s bc=%s error=%r', chat_id, bc_id, e, exc_info=True)
         return
-    asyncio.create_task(_run_offer_send_diagnostics(m))
+    try:
+        await _run_offer_send_diagnostics(m)
+    except Exception as e:
+        log.error('OFFER DIAG CRASH chat=%s bc=%s error=%r', chat_id, bc_id, e, exc_info=True)
+        try:
+            await bot.send_message(
+                chat_id=chat_id,
+                text=f'❌ <b>Диагностика остановилась.</b>\n\n<code>{ui.esc(str(e))}</code>',
+                business_connection_id=bc_id,
+            )
+        except Exception:
+            pass
 
 
 # ───────────────────────── DEMO gift offers ─────────────────────────
