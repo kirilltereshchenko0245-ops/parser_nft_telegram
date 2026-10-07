@@ -2004,6 +2004,20 @@ async def offer_business_connection_update(c: BusinessConnection):
 
 
 @dp.message(F.text.regexp(r'^\s*\.офер(?:\s|$)'))
+async def demo_offer_command_private(m: Message):
+    # DEMO offers must be created in the Business-managed chat where the
+    # command was written. Never turn a normal private chat with the bot into
+    # an offer delivery target, otherwise the seller can receive the offer in
+    # the bot DM instead of the customer's Business chat.
+    try:
+        await m.answer(
+            '⚠️ <b>Офер нужно создавать в Business-чате.</b>\n\n'
+            'Напишите <code>.офер</code> в чате, подключённом к Business-профилю.'
+        )
+    except Exception:
+        log.exception('Could not explain Business-only offer mode to chat=%s', getattr(m.chat, 'id', None))
+
+
 @dp.business_message(F.text.regexp(r'^\s*\.офер(?:\s|$)'))
 async def demo_offer_command(m: Message):
     parsed = parse_offer_command(m.text or '')
@@ -2083,6 +2097,7 @@ async def demo_offer_command(m: Message):
     if not buyer or not buyer.id:
         return
     buyer_id = int(buyer.id)
+    log.info('OFFER DELIVERY TARGET chat=%s sender=%s business_connection=%s', buyer_id, sender_id, business_connection_id)
     buyer_username = getattr(buyer, 'username', None)
     buyer_url = f'https://t.me/{buyer_username}' if buyer_username else f'tg://user?id={buyer_id}'
     # Offer lifetime is intentionally unlimited in this DEMO.
