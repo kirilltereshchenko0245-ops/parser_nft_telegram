@@ -48,7 +48,7 @@ def _env_int(*names, default=0):
     return int(default)
 
 PRIMARY_OWNER_ID = _env_int('PRIMARY_OWNER_ID', 'OWNER_ID', default=8564624250)
-APP_VERSION = 'V28_OWNER_ENV_FIX'
+APP_VERSION = 'V32_OFFER_FLOOD_QUEUE'
 # One canonical owner everywhere in the application.
 OWNER_ID = PRIMARY_OWNER_ID
 CONCURRENCY = int(os.getenv('PEEK_CONCURRENCY') or 1)  # По 1 ID последовательно
@@ -85,7 +85,9 @@ OFFER_CHAT_SEND_LOCKS: dict[int, asyncio.Lock] = {}
 OFFER_SEND_GATE = asyncio.Lock()
 OFFER_SEND_LAST_AT = 0.0
 OFFER_SEND_BLOCKED_UNTIL = 0.0
-OFFER_SEND_INTERVAL = float(os.getenv('OFFER_SEND_INTERVAL', '1.25'))
+OFFER_SEND_INTERVAL = float(os.getenv('OFFER_SEND_INTERVAL', '4.0'))
+OFFER_PEER_FLOOD_RETRIES = int(os.getenv('OFFER_PEER_FLOOD_RETRIES', '6'))
+OFFER_PEER_FLOOD_BASE_DELAY = float(os.getenv('OFFER_PEER_FLOOD_BASE_DELAY', '30'))
 OFFER_DELIVERY_TASKS: set[asyncio.Task] = set()
 BUSINESS_SELLER_NAME_CACHE: dict[str, str] = {}
 BUSINESS_OWNER_ID_CACHE: dict[str, int] = {}
@@ -344,8 +346,20 @@ async def _send_offer_message(message: Message, text, markup=None, business_conn
             except TelegramBadRequest as e:
                 desc=str(e).upper()
                 if 'PEER_FLOOD' in desc:
-                    log.error('OFFER PEER_FLOOD: chat=%s business_connection=%s offer_send_aborted', chat_id, business_connection_id or getattr(message,'business_connection_id',None))
-                    raise RuntimeError('Telegram PEER_FLOOD: отправка офера временно ограничена Telegram') from e
+                    # PEER_FLOOD is a Telegram-side anti-spam restriction. It
+                    # cannot be bypassed by another Telegram method. For the
+                    # DEMO offer we therefore keep the delivery pending and
+                    # retry later instead of generating another message (which
+                    # would only increase the flood).
+                    log.warning(
+                        'OFFER PEER_FLOOD: deferred chat=%s business_connection=%s attempt=%s',
+                        chat_id, business_connection_id or getattr(message,'business_connection_id',None), attempt + 1
+                    )
+                    if attempt + 1 < 6:
+                        delay = min(OFFER_PEER_FLOOD_BASE_DELAY * (2 ** attempt), 600.0)
+                        await asyncio.sleep(delay + random.uniform(0.5, 2.0))
+                        continue
+                    raise RuntimeError('Telegram PEER_FLOOD: доставка DEMO-офера отложена, Telegram временно ограничил отправку') from e
                 raise
         raise RuntimeError('Offer delivery retries exhausted after Telegram flood control')
 
@@ -2057,8 +2071,14 @@ async def _deliver_new_offer(source_message: Message, offer_id: int, text: str, 
         log.info('Delivered DEMO offer %s; source command=%s', offer_id, getattr(source_message, 'message_id', '?'))
     except Exception as e:
         log.error('Failed to deliver queued offer %s: %s', offer_id, e, exc_info=True)
+        # Do not send a second Telegram message when the platform itself is
+        # returning PEER_FLOOD. That error-report message would be another
+        # send attempt and could extend the restriction. The DEMO offer stays
+        # recorded for diagnostics instead of being falsely marked declined.
+        if 'PEER_FLOOD' in str(e).upper():
+            log.warning('DEMO offer %s remains pending after PEER_FLOOD', offer_id)
+            return
         try:
-            offer = db.get_offer(offer_id) or {}
             db.set_offer_status(offer_id, STATUS_DECLINED)
             reason = ui.esc(str(e))[:500]
             await source_message.answer(
