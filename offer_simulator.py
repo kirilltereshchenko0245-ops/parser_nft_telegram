@@ -119,7 +119,6 @@ def keyboard(offer_id: int, locale: str, status: str = STATUS_PENDING):
 
 def transfer_keyboard(offer: dict, locale: str):
     buyer_url = offer.get('transfer_profile_url') or offer.get('buyer_url')
-    help_url = os.getenv('OFFER_HELP_URL', '').strip()
     rows = []
     if buyer_url:
         rows.append([InlineKeyboardButton(
@@ -127,11 +126,8 @@ def transfer_keyboard(offer: dict, locale: str):
             icon_custom_emoji_id=TRANSFER_EMOJI_ID,
             url=buyer_url,
         )])
-    if help_url:
-        rows.append([InlineKeyboardButton(
-            text='Как передать?' if locale == LOCALE_RU else 'How to transfer?',
-            url=help_url,
-        )])
+    # Deliberately keep only the transfer button. The Telegraph/help URL button
+    # was removed from the DEMO offer flow.
     return InlineKeyboardMarkup(inline_keyboard=rows) if rows else None
 
 
