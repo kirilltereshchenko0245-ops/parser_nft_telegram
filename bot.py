@@ -1816,7 +1816,13 @@ async def adm_grant(c: CallbackQuery):
     _,_,kind,uid_s,seconds_s=c.data.split(':'); uid=int(uid_s); seconds=int(seconds_s)
     db.grant_entitlement(uid,kind,seconds)
     if kind=='premium': db.set_premium(uid,True)
-    await c.answer('Доступ выдан',show_alert=True); await c.message.edit_text(admin_user_text(uid),reply_markup=admin_user_kb(uid))
+    if kind=='offers':
+        # One admin action must be sufficient for DEMO offers. Keep the
+        # entitlement and Business approval in sync for this exact Telegram ID.
+        db.offer_access_add(uid)
+        db.unblock_offer_user(uid)
+        log.info('OFFER ACCESS GRANTED via admin user=%s seconds=%s', uid, seconds)
+    await c.answer('Доступ выдан' + (' — оферы разрешены для Business-профиля.' if kind=='offers' else ''),show_alert=True); await c.message.edit_text(admin_user_text(uid),reply_markup=admin_user_kb(uid))
 
 
 @dp.callback_query(F.data.startswith('adm:trial_reset:'))
@@ -2091,8 +2097,15 @@ async def offer_business_connection_update(c: BusinessConnection):
             is_enabled,
         )
         if is_new and is_enabled and owner_id != OWNER_ID:
-            # Every newly connected Business profile is blocked until the owner approves it.
-            db.block_offer_user(owner_id)
+            # If the admin has already granted the Offers entitlement/access,
+            # do not re-block this Business profile on connection creation.
+            # Otherwise new Business connections remain closed until approval.
+            if db.entitlement_active(owner_id, 'offers') or db.offer_access_allowed(owner_id, getattr(owner, 'username', None), OWNER_ID):
+                db.unblock_offer_user(owner_id)
+                db.offer_access_add(owner_id)
+                log.info('OFFER ACCESS AUTO-APPROVED existing entitlement user=%s connection=%s', owner_id, connection_id)
+            else:
+                db.block_offer_user(owner_id)
             name = ' '.join(x for x in ((getattr(owner, 'first_name', None) or '').strip(), (getattr(owner, 'last_name', None) or '').strip()) if x).strip() or 'Без имени'
             uname = f"@{getattr(owner, 'username', None)}" if getattr(owner, 'username', None) else 'без username'
             try:
