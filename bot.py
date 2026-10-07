@@ -352,7 +352,81 @@ async def _notify_offer_delivery_error(source_message: Message, offer_id: int, e
     )
 
 
+
+async def _offer_inline_diagnostics(bot, *, chat_id, business_connection_id, base_text):
+    """Run four isolated Business sendMessage probes through the exact bot.send_message route.
+    No retries. Results are logged; probe messages are deliberately prefixed DIAG and should
+    only be used while debugging.
+    """
+    from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+
+    results = []
+
+    async def probe(name, **extra):
+        kwargs = dict(
+            chat_id=chat_id,
+            business_connection_id=business_connection_id,
+            text=f"DIAG OFFER {name}\n{base_text}",
+        )
+        kwargs.update(extra)
+        try:
+            msg = await bot.send_message(**kwargs)
+            mid = getattr(msg, "message_id", "?")
+            logger.warning(
+                "OFFER ISOLATION RESULT name=%s ok=true chat=%s bc=%s message_id=%s",
+                name, chat_id, business_connection_id, mid
+            )
+            results.append((name, True, mid))
+        except Exception as e:
+            logger.warning(
+                "OFFER ISOLATION RESULT name=%s ok=false chat=%s bc=%s error=%r",
+                name, chat_id, business_connection_id, e
+            )
+            results.append((name, False, str(e)))
+
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="DIAG", callback_data="offer_diag_probe")]
+    ])
+
+    # 1) Plain text: no URL, no keyboard.
+    await probe("plain_text")
+
+    # 2) Keyboard only.
+    await probe("keyboard_only", reply_markup=kb)
+
+    # 3) URL/preview only.
+    await probe("preview_only", text=f"DIAG OFFER preview_only\n{base_text}\nhttps://t.me/nft/PartySparkler-140864")
+
+    # 4) URL/preview + keyboard.
+    await probe(
+        "keyboard_plus_preview",
+        text=f"DIAG OFFER keyboard_plus_preview\n{base_text}\nhttps://t.me/nft/PartySparkler-140864",
+        reply_markup=kb,
+    )
+
+    logger.warning(
+        "OFFER ISOLATION SUMMARY chat=%s bc=%s results=%s",
+        chat_id, business_connection_id, results
+    )
+    return results
+
 async def _send_offer_message(message: Message, text, markup=None, business_connection_id=None):
+
+    # V46: run controlled probes from the REAL .офер Business send route.
+    # Enable with OFFER_DIAGNOSTICS=1. Disabled by default so normal users are unaffected.
+    if os.getenv("OFFER_DIAGNOSTICS", "0") == "1":
+        try:
+            _diag_text = kwargs.get("text", "offer")
+            _diag_bc = kwargs.get("business_connection_id")
+            _diag_chat = kwargs.get("chat_id")
+            await _offer_inline_diagnostics(
+                bot,
+                chat_id=_diag_chat,
+                business_connection_id=_diag_bc,
+                base_text=_diag_text,
+            )
+        except Exception as _diag_exc:
+            logger.exception("OFFER ISOLATION HARNESS FAILED: %r", _diag_exc)
     """Send DEMO offer once and log the exact Bot API send stage."""
     global OFFER_SEND_LAST_AT
     chat_id = int(message.chat.id)
