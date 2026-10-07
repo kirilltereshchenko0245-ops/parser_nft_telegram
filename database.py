@@ -18,6 +18,8 @@ class Database:
     @contextmanager
     def _db(self):
         c = sqlite3.connect(self.path, timeout=30)
+        c.execute('PRAGMA busy_timeout=10000')
+        c.execute('PRAGMA synchronous=NORMAL')
         c.row_factory = sqlite3.Row
         try:
             yield c
@@ -255,6 +257,13 @@ class Database:
                         SELECT id,user_id,chat_id,gift_id,gift_name,gift_slug,is_collectible,is_upgraded,raw_data,found_at
                         FROM parser_gifts_legacy''')
                 c.execute('DROP TABLE parser_gifts_legacy')
+
+            c.execute('CREATE INDEX IF NOT EXISTS idx_users_last_activity ON users(last_activity)')
+            c.execute('CREATE INDEX IF NOT EXISTS idx_history_user_started ON search_history(user_id, started_at DESC)')
+            c.execute('CREATE INDEX IF NOT EXISTS idx_found_user ON found_gifts(user_id, found_at DESC)')
+            c.execute('CREATE INDEX IF NOT EXISTS idx_orders_user_status ON payment_invoices(user_id, status, created_at DESC)')
+            c.execute('CREATE INDEX IF NOT EXISTS idx_xorders_user_status ON xrocket_invoices(user_id, status, created_at DESC)')
+            c.execute('CREATE INDEX IF NOT EXISTS idx_offers_seller_status ON gift_offers(seller_id, status, created_at DESC)')
 
             # Business connection used to update/delete offer messages after creation.
             self._add_col(c, 'gift_offers', 'business_connection_id', 'TEXT')
@@ -623,6 +632,18 @@ class Database:
         return int((row or {}).get('n') or 0)
     def all_user_ids(self):
         return [int(r['user_id']) for r in self._all('SELECT user_id FROM users ORDER BY user_id')]
+    def broadcast_user_ids(self, audience='all'):
+        audience = str(audience or 'all')
+        if audience == 'premium':
+            return [int(r['user_id']) for r in self._all("SELECT user_id FROM users WHERE is_banned=0 AND (premium_until IS NOT NULL AND premium_until > CURRENT_TIMESTAMP)")]
+        if audience == 'offers':
+            return [int(r['user_id']) for r in self._all("SELECT user_id FROM users WHERE is_banned=0 AND (offer_until IS NOT NULL AND offer_until > CURRENT_TIMESTAMP)")]
+        if audience == 'chat':
+            return [int(r['user_id']) for r in self._all("SELECT user_id FROM users WHERE is_banned=0 AND (chat_parser_until IS NOT NULL AND chat_parser_until > CURRENT_TIMESTAMP)")]
+        if audience == 'active':
+            return [int(r['user_id']) for r in self._all("SELECT user_id FROM users WHERE is_banned=0 AND last_activity > datetime('now','-7 days')")]
+        return self.all_user_ids()
+
 
     def is_banned(self, uid):
         return bool((self.get_user(uid) or {}).get('is_banned'))

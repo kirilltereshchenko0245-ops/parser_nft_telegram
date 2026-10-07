@@ -23,6 +23,7 @@ import ui
 from database import Database
 from peek_api import AVAILABLE_MODELS, PeekAPI, gift_url, is_known_model, normalize_model_name, suggest_models
 from gift_catalog import GIFT_CATALOG, GIFT_MODELS, GIFT_BY_API, GIFT_PAGE_SIZE
+from price_estimator import estimate_stars
 from payments import CryptoPay, XRocketPay
 from parsing import handlers as parser_handlers
 from offer_simulator import (parse_offer_command, offer_help_text, keyboard as offer_keyboard, build_offer_text, accepted_alert_text, final_offer_text, declined_text, transfer_keyboard, STATUS_PENDING, STATUS_ACCEPTED, STATUS_DECLINED)
@@ -34,7 +35,7 @@ log = logging.getLogger('giftparser')
 
 TOKEN = os.getenv('BOT_TOKEN')
 PRIMARY_OWNER_ID = 8564624250
-APP_VERSION = 'V26_BROADCAST_XROCKET_STABILITY'
+APP_VERSION = 'V27_STABLE_REDESIGN'
 # Canonical project owner. This is intentionally independent of a stale Railway OWNER_ID.
 OWNER_ID = PRIMARY_OWNER_ID
 CONCURRENCY = int(os.getenv('PEEK_CONCURRENCY') or 1)  # По 1 ID последовательно
@@ -45,7 +46,7 @@ MAX_RANGE = 10_000        # максимум ID за один поиск
 MAX_LIVE_CARDS = 30       # сколько карточек присылать «вживую» во время поиска
 EDIT_INTERVAL = 1.5       # не чаще раза в N секунд обновляем статус (защита от flood)
 GIFT_REQUEST_DELAY = float(os.getenv('GIFT_REQUEST_DELAY', '5'))
-LOG_CHANNEL_ID = int(os.getenv('LOG_CHANNEL_ID', '-1003864916255'))
+LOG_CHANNEL_ID = int(os.getenv('LOG_CHANNEL_ID', '0') or 0)
 LOG_CHANNEL_DISABLED = False
 API_REQUEST_LOCK = asyncio.Lock()
 NEXT_API_REQUEST_AT = 0.0
@@ -54,6 +55,8 @@ bot = Bot(TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 dp = Dispatcher(storage=MemoryStorage())
 db_path = os.getenv('DATABASE_PATH') or (os.path.join(os.getenv('RAILWAY_VOLUME_MOUNT_PATH'), 'bot_database.db') if os.getenv('RAILWAY_VOLUME_MOUNT_PATH') else 'bot_database.db')
 db = Database(db_path)
+if not db.get_setting('log_channel_id') and LOG_CHANNEL_ID:
+    db.set_setting('log_channel_id', str(LOG_CHANNEL_ID))
 if OWNER_ID:
     db.offer_access_add(OWNER_ID)
     db.admin_add(OWNER_ID)
@@ -103,6 +106,8 @@ class S(StatesGroup):
     admin_user_profile_name = State()
     admin_user_profile_url = State()
     admin_broadcast = State()
+    admin_log_channel = State()
+    admin_broadcast_audience = State()
 
 
 # ───────────────────────── помощники ─────────────────────────
@@ -224,7 +229,11 @@ async def send_card(target: Message, uid: int, g: dict, large=False):
     else:
         lp = LinkPreviewOptions(is_disabled=True)
     fav = db.is_favorite(uid, g.get('giftNumber'), name)
-    return await safe(target.answer, ui.gift_card(g), reply_markup=kb.gift_kb(g, fav), link_preview_options=lp)
+    stars, source = estimate_stars(g)
+    gg = dict(g)
+    gg['estimated_stars'] = stars
+    gg['price_source'] = source
+    return await safe(target.answer, ui.gift_card(gg), reply_markup=kb.gift_kb(g, fav), link_preview_options=lp)
 
 
 def no_preview():
@@ -332,23 +341,28 @@ async def _business_seller_display_name(business_connection_id):
 # ───────────────────────── аудит / логи ─────────────────────────
 async def audit(action: str, uid: int | None = None, details: str = ''):
     global LOG_CHANNEL_DISABLED
-    if LOG_CHANNEL_DISABLED or not LOG_CHANNEL_ID:
+    channel_raw = db.get_setting('log_channel_id') or LOG_CHANNEL_ID
+    try:
+        channel_id = int(channel_raw)
+    except (TypeError, ValueError):
+        return
+    if LOG_CHANNEL_DISABLED or not channel_id:
         return
     actor = f'<code>{uid}</code>' if uid is not None else '<code>system</code>'
     text = f'🧾 <b>{ui.esc(action)}</b>\n👤 {actor}'
     if details:
         text += f'\n{details}'
     try:
-        await safe(bot.send_message, LOG_CHANNEL_ID, text, disable_web_page_preview=True)
+        await safe(bot.send_message, channel_id, text, disable_web_page_preview=True)
     except TelegramBadRequest as e:
         low=str(e).lower()
         if 'chat not found' in low or 'peer_flood' in low:
             LOG_CHANNEL_DISABLED = True
             log.warning('Audit log channel disabled after Telegram rejection: %s', e)
         else:
-            log.error('LOG CHANNEL FAILED channel=%s action=%s error=%r', LOG_CHANNEL_ID, action, e)
+            log.error('LOG CHANNEL FAILED channel=%s action=%s error=%r', channel_id, action, e)
     except Exception as e:
-        log.error('LOG CHANNEL FAILED channel=%s action=%s error=%r', LOG_CHANNEL_ID, action, e)
+        log.error('LOG CHANNEL FAILED channel=%s action=%s error=%r', channel_id, action, e)
 
 
 # ───────────────────────── доступ ─────────────────────────
@@ -379,10 +393,8 @@ async def access_callback(handler, event: CallbackQuery, data):
 async def start(m: Message, state: FSMContext):
     await audit('Запуск /start', m.from_user.id)
     await state.clear()
-    u = db.get_user(m.from_user.id) or {}
-    # Telegram rejects empty text messages; remove legacy reply keyboard without sending a blank message.
-    welcome = await m.answer(ui.v24_welcome(), reply_markup=ReplyKeyboardRemove())
-    await welcome.edit_reply_markup(reply_markup=kb.inline_main_menu(is_admin(m.from_user.id), is_unlimited(m.from_user.id)))
+    # Inline keyboard is attached in the same send call. No legacy reply keyboard or second edit step.
+    await m.answer(ui.v24_welcome(), reply_markup=kb.inline_main_menu(is_admin(m.from_user.id), is_unlimited(m.from_user.id)))
 
 
 @dp.message(F.text == kb.BTN_CANCEL)
@@ -1257,15 +1269,32 @@ async def adm_broadcast_cancel(c: CallbackQuery, state: FSMContext):
 async def adm_broadcast_preview(m: Message, state: FSMContext):
     if not is_admin(m.from_user.id):
         await state.clear(); return
-    await state.update_data(broadcast_chat_id=m.chat.id, broadcast_message_id=m.message_id)
-    count = db.user_count() if hasattr(db, 'user_count') else len(db.recent_users(1000000))
+    await state.update_data(broadcast_chat_id=m.chat.id, broadcast_message_id=m.message_id, broadcast_audience='all')
+    count = len(db.broadcast_user_ids('all'))
     await m.answer(
-        f'📣 <b>ПРЕДПРОСМОТР РАССЫЛКИ</b>\n\nПолучателей: <b>{count}</b>\n\nЕсли сообщение выше корректное — нажми «Начать рассылку».',
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text='🚀 Начать рассылку', callback_data='adm:broadcast_send')],
-            [InlineKeyboardButton(text='✖️ Отмена', callback_data='adm:broadcast_cancel')],
-        ])
+        f'📣 <b>ПРЕДПРОСМОТР РАССЫЛКИ</b>\n\nАудитория: <b>Все</b> · Получателей: <b>{count}</b>\n\nВыбери аудиторию или запускай.',
+        reply_markup=broadcast_audience_kb('all')
     )
+
+def broadcast_audience_kb(selected='all'):
+    labels=[('all','🌐 Все'),('premium','💎 Premium'),('chat','📡 Парсер чатов'),('offers','🎁 Оферы'),('active','🟢 Активные 7 дней')]
+    rows=[]
+    for key,label in labels:
+        count=len(db.broadcast_user_ids(key))
+        rows.append([InlineKeyboardButton(text=f'{label} · {count}' + (' ✅' if key==selected else ''), callback_data=f'adm:broadcast_audience:{key}')])
+    rows.append([InlineKeyboardButton(text='🚀 Начать рассылку', callback_data='adm:broadcast_send')])
+    rows.append([InlineKeyboardButton(text='✖️ Отмена', callback_data='adm:broadcast_cancel')])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+@dp.callback_query(F.data.startswith('adm:broadcast_audience:'))
+async def adm_broadcast_audience(c: CallbackQuery, state: FSMContext):
+    if not is_admin(c.from_user.id): return await c.answer('Нет доступа', show_alert=True)
+    audience=c.data.split(':')[-1]
+    data=await state.get_data()
+    if not data.get('broadcast_message_id'): return await c.answer('Сначала отправь сообщение для рассылки.', show_alert=True)
+    await state.update_data(broadcast_audience=audience)
+    await c.answer('Аудитория изменена')
+    await c.message.edit_text(f'📣 <b>РАССЫЛКА</b>\n\nАудитория: <b>{ui.esc(audience)}</b>\nПолучателей: <b>{len(db.broadcast_user_ids(audience))}</b>', reply_markup=broadcast_audience_kb(audience))
 
 @dp.callback_query(F.data == 'adm:broadcast_send')
 async def adm_broadcast_send(c: CallbackQuery, state: FSMContext):
@@ -1278,10 +1307,10 @@ async def adm_broadcast_send(c: CallbackQuery, state: FSMContext):
     await c.answer('Рассылка запущена')
     await c.message.edit_text('📣 <b>РАССЫЛКА ЗАПУЩЕНА</b>\n\nБот отправляет сообщения безопасной очередью.')
     await state.clear()
-    asyncio.create_task(run_broadcast(int(source_chat), int(source_message), int(c.from_user.id)))
+    asyncio.create_task(run_broadcast(int(source_chat), int(source_message), int(c.from_user.id), data.get('broadcast_audience') or 'all'))
 
-async def run_broadcast(source_chat: int, source_message: int, admin_id: int):
-    rows = db.all_user_ids() if hasattr(db, 'all_user_ids') else [int(x['user_id']) for x in db.recent_users(1000000)]
+async def run_broadcast(source_chat: int, source_message: int, admin_id: int, audience='all'):
+    rows = db.broadcast_user_ids(audience)
     sent = failed = 0
     for uid in rows:
         try:
@@ -1301,7 +1330,7 @@ async def run_broadcast(source_chat: int, source_message: int, admin_id: int):
         await bot.send_message(admin_id, f'✅ <b>РАССЫЛКА ЗАВЕРШЕНА</b>\n\nОтправлено: <b>{sent}</b>\nОшибок: <b>{failed}</b>')
     except Exception:
         pass
-    log.info('Broadcast finished admin=%s sent=%s failed=%s', admin_id, sent, failed)
+    log.info('Broadcast finished admin=%s audience=%s sent=%s failed=%s', admin_id, audience, sent, failed)
 
 # ───────────────────────── новая админка V25 ─────────────────────────
 def admin_home_kb():
@@ -1313,6 +1342,7 @@ def admin_home_kb():
         [InlineKeyboardButton(text='💳 Тарифы', callback_data='adm:tariffs')],
         [InlineKeyboardButton(text='📣 Рассылка', callback_data='adm:broadcast')],
         [InlineKeyboardButton(text='📜 Логи', callback_data='adm:logs')],
+        [InlineKeyboardButton(text='🛠 Система и канал логов', callback_data='adm:system')],
         [InlineKeyboardButton(text='🔄 Обновить', callback_data='adm:home')],
     ])
 
@@ -1558,6 +1588,51 @@ async def adm_logs(c: CallbackQuery):
         text=''.join(Path('logs/giftparser.log').read_text(encoding='utf-8').splitlines(True)[-35:])[-3800:]
     except Exception as e: text=f'Лог недоступен: {e}'
     await c.answer(); await c.message.edit_text('<b>📜 ЛОГИ</b>\n\n<pre>'+ui.esc(text)+'</pre>',reply_markup=admin_back())
+
+
+def system_text():
+    log_channel=db.get_setting('log_channel_id') or 'не задан'
+    session=db.get_parser_session()
+    return ('🛠 <b>СИСТЕМА</b>\n\n'
+            f'🤖 Bot: <b>online</b>\n'
+            f'💾 SQLite: <b>WAL</b>\n'
+            f'🔎 Peek API: <b>{"настроен"}</b>\n'
+            f'📡 Telethon: <b>{"подключён" if session and session.get("is_active") else "не подключён"}</b>\n'
+            f'💳 CryptoBot: <b>{"готов" if crypto_pay.configured else "не настроен"}</b>\n'
+            f'🚀 xRocket: <b>{"готов" if xrocket_pay.configured else "не настроен"}</b>\n'
+            f'📣 Рассылка: <b>очередь</b>\n'
+            f'📜 Канал логов: <code>{ui.esc(log_channel)}</code>')
+
+def system_kb():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text='📜 Изменить канал логов', callback_data='adm:log_channel')],
+        [InlineKeyboardButton(text='🔄 Обновить', callback_data='adm:system')],
+        [InlineKeyboardButton(text='‹ Назад', callback_data='adm:home')],
+    ])
+
+@dp.callback_query(F.data == 'adm:system')
+async def adm_system(c: CallbackQuery):
+    if not is_admin(c.from_user.id): return await c.answer('Нет доступа', show_alert=True)
+    await c.answer(); await c.message.edit_text(system_text(), reply_markup=system_kb())
+
+@dp.callback_query(F.data == 'adm:log_channel')
+async def adm_log_channel_start(c: CallbackQuery, state: FSMContext):
+    if not is_owner(c.from_user.id): return await c.answer('Только владелец.', show_alert=True)
+    await state.set_state(S.admin_log_channel); await c.answer()
+    await c.message.edit_text('📜 <b>КАНАЛ ЛОГОВ</b>\n\nПришли ID канала вида <code>-1001234567890</code>.\nБот должен быть администратором этого канала.', reply_markup=admin_back('adm:system'))
+
+@dp.message(S.admin_log_channel)
+async def adm_log_channel_value(m: Message, state: FSMContext):
+    if not is_owner(m.from_user.id): await state.clear(); return
+    raw=(m.text or '').strip()
+    try: cid=int(raw)
+    except ValueError: return await m.answer('❌ Нужен числовой ID канала, например <code>-1001234567890</code>.')
+    db.set_setting('log_channel_id', str(cid))
+    global LOG_CHANNEL_DISABLED
+    LOG_CHANNEL_DISABLED=False
+    await state.clear(); await audit('Канал логов изменён', m.from_user.id, f'Новый канал: <code>{cid}</code>')
+    await m.answer(f'✅ Канал логов сохранён: <code>{cid}</code>', reply_markup=system_kb())
+
 
 # Admin: Business-профили оферов.
 def admin_business_connections_kb():
@@ -1986,7 +2061,7 @@ async def main():
     except Exception:
         log.exception('Failed to restore saved parser session')
     log.info('STARTED %s | PRIMARY_OWNER_ID=%s | OWNER_ID=%s | DB=%s', APP_VERSION, PRIMARY_OWNER_ID, OWNER_ID, db_path)
-    log.info('Log channel configured: %s (startup audit disabled to avoid unnecessary SendMessage)', LOG_CHANNEL_ID)
+    log.info('Log channel configured: %s', db.get_setting('log_channel_id') or LOG_CHANNEL_ID)
     await bot.set_my_commands([
         BotCommand(command='start', description='Главное меню'),
         BotCommand(command='stop', description='Остановить текущий поиск'),

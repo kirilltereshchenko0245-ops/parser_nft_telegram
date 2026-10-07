@@ -108,6 +108,12 @@ def gift_card(g: dict) -> str:
     if rows:
         parts.append(block(*rows))
 
+    if g.get('estimated_stars'):
+        label = 'Рыночная оценка' if g.get('price_source') == 'market' else 'Примерная оценка'
+        parts.append(f'⭐ <b>{label}:</b> ~{int(g["estimated_stars"]):,} Stars'.replace(',', ' '))
+        if g.get('price_source') != 'market':
+            parts.append('<i>Оценка учитывает модель, фон, узор и доступные данные редкости.</i>')
+
     if g.get('username'):
         u = esc(g['username'])
         parts.append(f'👤 <a href="https://t.me/{u}">@{u}</a>')
