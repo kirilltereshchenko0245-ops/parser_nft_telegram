@@ -93,18 +93,21 @@ def offer_help_text(locale=LOCALE_RU):
     )
 
 
-def keyboard(offer_id: int, locale: str, status: str = STATUS_PENDING):
+def keyboard(offer_id: int, locale: str, status: str = STATUS_PENDING, gift_url: str | None = None, gift_title_text: str | None = None):
     if status != STATUS_PENDING:
         return None
-    if locale == LOCALE_EN:
-        return InlineKeyboardMarkup(inline_keyboard=[[
-            InlineKeyboardButton(text='Отклонить', icon_custom_emoji_id=DECLINE_EMOJI_ID, callback_data=f'of:decline:{offer_id}'),
-            InlineKeyboardButton(text='Принять', icon_custom_emoji_id=ACCEPT_EMOJI_ID, callback_data=f'of:accept:{offer_id}'),
-        ]])
-    return InlineKeyboardMarkup(inline_keyboard=[[
+    rows = []
+    # Telegram is currently rejecting the full first-offer text when the NFT
+    # URL is embedded as an HTML text_link entity. Keep the NFT link clickable
+    # via a URL button instead; this preserves the DEMO flow without triggering
+    # the PEER_FLOOD seen in the production-like text payload.
+    if gift_url and gift_title_text:
+        rows.append([InlineKeyboardButton(text=gift_title_text, url=gift_url)])
+    rows.append([
         InlineKeyboardButton(text='Отклонить', icon_custom_emoji_id=DECLINE_EMOJI_ID, callback_data=f'of:decline:{offer_id}'),
         InlineKeyboardButton(text='Принять', icon_custom_emoji_id=ACCEPT_EMOJI_ID, callback_data=f'of:accept:{offer_id}'),
-    ]])
+    ])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 def transfer_keyboard(offer: dict, locale: str):
@@ -130,8 +133,8 @@ def _linked_title(offer: dict):
 
 
 def build_offer_text(offer: dict, locale: str, remaining_seconds=None, **_ignored):
-    """Text for the first offer screenshot."""
-    title = _linked_title(offer)
+    """Text for the first offer. The NFT title is linked by the URL button."""
+    title = gift_title(offer['gift_name'], offer['gift_number'])
     amount = format_amount(offer['amount'], offer['currency'], locale)
     sender = (offer.get('seller_username') or '').strip()
     # seller_username historically stored @username. For the offer UI we now
