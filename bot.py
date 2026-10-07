@@ -160,19 +160,22 @@ def offers_paid(uid):
     return is_admin(uid) or db.entitlement_active(uid, 'offers')
 
 
-def offer_ready_for_user(uid, username=None):
-    """Strict DEMO-offer access: paid/admin + approved Business connection + not blocked."""
+def offer_ready_for_user(uid, username=None, business_connection_id=None):
+    """DEMO-offer access with a reliable Business connection check.
+
+    Owner/admins do not need a paid offers entitlement, but they still need an
+    enabled Business connection when actually sending a Business offer. Other
+    users need their offers entitlement plus an approved, unblocked connection.
+    """
     uid = int(uid or 0)
-    if not offers_paid(uid):
-        return False
-    if db.offer_user_blocked(uid):
-        return False
-    bc = db.get_business_connection_for_user(uid)
+    bc = db.get_business_connection(business_connection_id) if business_connection_id else db.get_business_connection_for_user(uid)
     if not bc or not bool(bc.get('is_enabled', 1)) or bool(bc.get('is_blocked', 0)):
         return False
-    # Owner/admins are still required to have an active Business connection:
-    # this prevents normal Bot PMs from impersonating another Business profile.
-    return True
+    if db.offer_user_blocked(uid) and not is_admin(uid):
+        return False
+    if is_admin(uid):
+        return True
+    return offers_paid(uid)
 
 
 def tariff_config():
@@ -1968,25 +1971,24 @@ async def demo_offer_command(m: Message):
         if business_owner_id != sender_id:
             log.info('Ignoring cross-user Business .офер sender=%s business_owner=%s', sender_id, business_owner_id)
             return
-        if not offer_ready_for_user(sender_id, sender_username):
-            log.info('Ignoring unavailable Business .офер sender=%s', sender_id)
+        if not offer_ready_for_user(sender_id, sender_username, business_connection_id):
+            log.info('Ignoring unavailable Business .офер sender=%s connection=%s', sender_id, business_connection_id)
             return
         seller_id = business_owner_id
         seller_display_name = await _business_seller_display_name(business_connection_id)
     else:
-        if not offer_ready_for_user(sender_id, sender_username):
+        # For a normal bot PM, use the sender's own saved Business connection.
+        # Never fall back to OWNER_ID or another user's Business profile.
+        saved_bc = db.get_business_connection_for_user(sender_id)
+        if not saved_bc:
+            log.warning('User %s has no active Business connection; .офер ignored', sender_id)
+            return
+        business_connection_id = saved_bc['connection_id']
+        if not offer_ready_for_user(sender_id, sender_username, business_connection_id):
             log.info('Ignoring normal .офер from user without approved Business access: %s', sender_id)
             return
-        # For a normal bot PM, use the sender's own saved Business connection.
-        # This avoids ever falling back to OWNER_ID for another authorized user.
-        saved_bc = db.get_business_connection_for_user(sender_id)
-        if saved_bc:
-            business_connection_id = saved_bc['connection_id']
-            seller_id = sender_id
-            seller_display_name = await _business_seller_display_name(business_connection_id)
-        else:
-            log.warning('Authorized user %s has no active Business connection; .офер is not sent as OWNER', sender_id)
-            return
+        seller_id = sender_id
+        seller_display_name = await _business_seller_display_name(business_connection_id)
 
     if not seller_display_name:
         seller_display_name = os.getenv('OFFER_SELLER_NAME', '').strip() or 'Пользователь'
@@ -2056,6 +2058,16 @@ async def _deliver_new_offer(source_message: Message, offer_id: int, text: str, 
         log.info('Delivered DEMO offer %s; source command=%s', offer_id, getattr(source_message, 'message_id', '?'))
     except Exception as e:
         log.error('Failed to deliver queued offer %s: %s', offer_id, e, exc_info=True)
+        try:
+            offer = db.get_offer(offer_id) or {}
+            db.set_offer_status(offer_id, STATUS_DECLINED)
+            reason = ui.esc(str(e))[:500]
+            await source_message.answer(
+                f'⚠️ <b>Не удалось отправить офер.</b>\n\nПричина: <code>{reason}</code>',
+                link_preview_options=LinkPreviewOptions(is_disabled=True),
+            )
+        except Exception:
+            log.exception('Failed to report offer delivery error offer=%s', offer_id)
 
 
 @dp.callback_query(F.data.regexp(r'^of:(accept|decline):\d+$'))
