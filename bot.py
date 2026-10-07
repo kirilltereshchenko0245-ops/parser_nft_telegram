@@ -180,6 +180,14 @@ def offer_ready_for_user(uid, username=None, business_connection_id=None):
     bc = db.get_business_connection(business_connection_id) if business_connection_id else db.get_business_connection_for_user(uid)
     if not bc or not bool(bc.get('is_enabled', 1)) or bool(bc.get('is_blocked', 0)):
         return False
+    # Access grants must override a stale per-user/per-connection block.
+    # V58/V59 could leave a Business profile marked blocked after an earlier
+    # connection was denied; the user could then have valid offer access but
+    # every `.офер` would silently return.
+    explicitly_allowed = db.offer_access_allowed(uid, username, OWNER_ID)
+    if explicitly_allowed and not is_admin(uid):
+        db.unblock_offer_user(uid)
+        return True
     if db.offer_user_blocked(uid) and not is_admin(uid):
         return False
     if is_admin(uid):
@@ -2113,6 +2121,13 @@ async def demo_offer_command(m: Message):
         if not business_owner_id or not bool((bc_row or {}).get('is_enabled', 1)):
             log.warning('Ignoring .офер: Business connection unavailable: %s', business_connection_id)
             return
+        # A previously stored connection may still carry is_blocked=1 from an
+        # older V58/V59 run. If this owner is explicitly granted offer access
+        # (including the configured bootstrap owner), repair that stale state
+        # before the authorization check.
+        if db.offer_access_allowed(business_owner_id, (bc_row or {}).get('username'), OWNER_ID):
+            db.unblock_offer_user(business_owner_id)
+            bc_row = db.get_business_connection(business_connection_id) or bc_row
         # IMPORTANT: for an incoming Telegram Business message, from_user is
         # normally the CUSTOMER who wrote in the Business chat, not the owner
         # of the connected Business account. Therefore sender_id must NOT be
