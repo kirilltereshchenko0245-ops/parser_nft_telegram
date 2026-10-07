@@ -108,6 +108,7 @@ class S(StatesGroup):
     admin_broadcast = State()
     admin_log_channel = State()
     admin_broadcast_audience = State()
+    admin_tariff = State()
 
 
 # ───────────────────────── помощники ─────────────────────────
@@ -144,6 +145,40 @@ def chat_parser_allowed(uid):
 
 def offers_paid(uid):
     return is_admin(uid) or db.entitlement_active(uid, 'offers')
+
+
+def offer_ready_for_user(uid, username=None):
+    """Strict DEMO-offer access: paid/admin + approved Business connection + not blocked."""
+    uid = int(uid or 0)
+    if not offers_paid(uid):
+        return False
+    if db.offer_user_blocked(uid):
+        return False
+    bc = db.get_business_connection_for_user(uid)
+    if not bc or not bool(bc.get('is_enabled', 1)) or bool(bc.get('is_blocked', 0)):
+        return False
+    # Owner/admins are still required to have an active Business connection:
+    # this prevents normal Bot PMs from impersonating another Business profile.
+    return True
+
+
+def tariff_config():
+    defaults = {
+        'premium_2d': ('7', 'premium', 172800, 'Премиум · 2 дня'),
+        'chat_24h': ('10', 'chat', 86400, 'Парсер чатов · 24 часа'),
+        'offers_5d': ('25', 'offers', 432000, 'Оферы · 5 дней'),
+    }
+    out = {}
+    for key, (amount, kind, seconds, title) in defaults.items():
+        raw = db.get_setting('tariff_' + key)
+        try:
+            amount = str(float(raw)) if raw is not None else amount
+            if amount.endswith('.0'): amount = amount[:-2]
+            if float(amount) <= 0: raise ValueError
+        except Exception:
+            pass
+        out[key] = (amount, kind, seconds, title)
+    return out
 
 
 async def safe(fn, *args, **kwargs):
@@ -233,7 +268,7 @@ async def send_card(target: Message, uid: int, g: dict, large=False):
     gg = dict(g)
     gg['estimated_stars'] = stars
     gg['price_source'] = source
-    return await safe(target.answer, ui.gift_card(gg), reply_markup=kb.gift_kb(g, fav), link_preview_options=lp)
+    return await safe(target.answer, ui.gift_card(gg), link_preview_options=lp)
 
 
 def no_preview():
@@ -372,14 +407,19 @@ async def access_message(handler, event: Message, data):
         uid = event.from_user.id
         db.upsert_user(uid, event.from_user.username, event.from_user.first_name)
         if db.is_banned(uid):
-            await audit('Заблокированный пользователь попытался выполнить действие', uid, f'Текст: <code>{ui.esc(event.text or "")}</code>')
+            await audit('Заблокированный пользователь попытался выполнить действие', uid, f'Text: <code>{ui.esc(event.text or "")}</code>')
             await event.answer('🚫 <b>Доступ ограничен.</b>')
+            return
+        if db.get_setting('maintenance_mode','0') == '1' and not is_admin(uid) and not (event.text or '').startswith('/start'):
+            await event.answer('🚧 <b>Технические работы</b>\n\nБот временно недоступен. Попробуй позже.')
             return
     return await handler(event, data)
 
-
 @dp.callback_query.middleware()
 async def access_callback(handler, event: CallbackQuery, data):
+    if db.get_setting('maintenance_mode','0') == '1' and not is_admin(event.from_user.id) and not (event.data or '').startswith('menu:home'):
+        await event.answer('🚧 Технические работы. Попробуй позже.', show_alert=True)
+        return
     if db.is_banned(event.from_user.id):
         await audit('Заблокированный пользователь нажал кнопку', event.from_user.id, f'Callback: <code>{ui.esc(event.data or "")}</code>')
         await event.answer('🚫 Доступ ограничен', show_alert=True)
@@ -394,7 +434,7 @@ async def start(m: Message, state: FSMContext):
     await audit('Запуск /start', m.from_user.id)
     await state.clear()
     # Inline keyboard is attached in the same send call. No legacy reply keyboard or second edit step.
-    await m.answer(ui.v24_welcome(), reply_markup=kb.inline_main_menu(is_admin(m.from_user.id), is_unlimited(m.from_user.id)))
+    await m.answer(ui.v24_welcome(), reply_markup=kb.main_menu(is_admin(m.from_user.id), is_unlimited(m.from_user.id)))
 
 
 @dp.message(F.text == kb.BTN_CANCEL)
@@ -990,7 +1030,7 @@ async def v24_catalog_query_value(m: Message, state: FSMContext):
     q=(m.text or '').strip().lower()[:24]
     await state.clear(); await show_catalog(m,1,q)
 
-async def show_catalog(target, page=1, query=''):
+async def show_catalog(target, page=1, query='', edit=False):
     items=[]
     for title, model in zip(GIFT_CATALOG, GIFT_MODELS):
         if not query or query in title.lower() or query in model.lower():
@@ -999,12 +1039,15 @@ async def show_catalog(target, page=1, query=''):
     visible=items[(page-1)*GIFT_PAGE_SIZE:page*GIFT_PAGE_SIZE]
     text='🎁 <b>ОБЫЧНЫЙ ПАРСЕР</b>\n\nВыбери NFT-подарок. Листай страницы или ищи по названию.'
     if query: text += f'\n\n🔎 Запрос: <b>{ui.esc(query)}</b>'
-    await target.answer(text, reply_markup=kb.catalog_kb(visible,page,pages,query))
+    if edit:
+        await target.edit_text(text, reply_markup=kb.catalog_kb(visible,page,pages,query))
+    else:
+        await target.answer(text, reply_markup=kb.catalog_kb(visible,page,pages,query))
 
 @dp.callback_query(F.data.startswith('catalog:page:'))
 async def v24_catalog_page(c: CallbackQuery):
     _,_,page,query=(c.data.split(':',3)+[''])[:4]
-    await c.answer(); await show_catalog(c.message,int(page),query)
+    await c.answer(); await show_catalog(c.message,int(page),query,edit=True)
 
 @dp.callback_query(F.data.startswith('catalog:pick:'))
 async def v24_catalog_pick(c: CallbackQuery, state: FSMContext):
@@ -1014,14 +1057,43 @@ async def v24_catalog_pick(c: CallbackQuery, state: FSMContext):
 
 @dp.callback_query(F.data == 'parser_ui:random')
 async def v24_random_menu(c: CallbackQuery):
-    await c.answer(); await c.message.edit_text('🎲 <b>СЛУЧАЙНЫЙ ПАРСЕР</b>\n\nСлучайно выбираю подарок и номер. Сколько проверок сделать?', reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text='1',callback_data='random_v24:1'),InlineKeyboardButton(text='5',callback_data='random_v24:5'),InlineKeyboardButton(text='10',callback_data='random_v24:10'),InlineKeyboardButton(text='20',callback_data='random_v24:20')],
-        [InlineKeyboardButton(text='‹ Парсер',callback_data='menu:parser')]
+    await c.answer()
+    await c.message.edit_text('🎲 <b>СЛУЧАЙНЫЙ ПАРСЕР</b>\n\nВыбери модель. Можно листать каталог, затем выбрать количество проверок.', reply_markup=random_models_kb(1))
+
+
+def random_models_kb(page=1):
+    items=list(zip(GIFT_CATALOG, GIFT_MODELS))
+    per=8; pages=max(1,(len(items)+per-1)//per); page=max(1,min(int(page),pages))
+    visible=items[(page-1)*per:page*per]
+    rows=[]
+    for i in range(0,len(visible),2):
+        rows.append([InlineKeyboardButton(text=a,callback_data=f'random_model:{b}') for a,b in visible[i:i+2]])
+    nav=[]
+    if page>1: nav.append(InlineKeyboardButton(text='‹',callback_data=f'random_models_page:{page-1}'))
+    nav.append(InlineKeyboardButton(text=f'{page}/{pages}',callback_data='noop'))
+    if page<pages: nav.append(InlineKeyboardButton(text='›',callback_data=f'random_models_page:{page+1}'))
+    rows.append(nav)
+    rows.append([InlineKeyboardButton(text='🎲 Любая модель',callback_data='random_model:any')])
+    rows.append([InlineKeyboardButton(text='‹ Парсер',callback_data='menu:parser')])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+@dp.callback_query(F.data.startswith('random_models_page:'))
+async def random_models_page(c: CallbackQuery):
+    await c.answer(); await c.message.edit_reply_markup(reply_markup=random_models_kb(int(c.data.split(':')[1])))
+
+@dp.callback_query(F.data.startswith('random_model:'))
+async def random_model_pick(c: CallbackQuery):
+    model=c.data.split(':',1)[1]
+    await c.answer()
+    label='любые модели' if model=='any' else ui.pretty(model)
+    await c.message.edit_text(f'🎲 <b>СЛУЧАЙНЫЙ ПАРСЕР</b>\n\nМодель: <b>{ui.esc(label)}</b>\n\nСколько проверок сделать?', reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text='1',callback_data=f'random_v24:1:{model}'),InlineKeyboardButton(text='5',callback_data=f'random_v24:5:{model}'),InlineKeyboardButton(text='10',callback_data=f'random_v24:10:{model}'),InlineKeyboardButton(text='20',callback_data=f'random_v24:20:{model}')],
+        [InlineKeyboardButton(text='‹ Модели',callback_data='parser_ui:random')]
     ]))
 
 @dp.callback_query(F.data.startswith('random_v24:'))
 async def v24_random_run(c: CallbackQuery):
-    uid=c.from_user.id; count=int(c.data.split(':')[1])
+    parts=c.data.split(':'); uid=c.from_user.id; count=int(parts[1]); selected_model=parts[2] if len(parts)>2 else 'any'
     if not trial_allowed(uid,'random',count): return await c.answer(f'Осталось: {db.trial_left(uid,"random")}',show_alert=True)
     if uid in ACTIVE: return await c.answer('У тебя уже идёт проверка.',show_alert=True)
     await c.answer('Запускаю…'); ACTIVE.add(uid); db.clear_stop(uid)
@@ -1030,7 +1102,7 @@ async def v24_random_run(c: CallbackQuery):
     try:
         for i in range(count):
             if db.should_stop(uid): break
-            model=random.choice(GIFT_MODELS); number=random.randint(1,100000)
+            model=random.choice(GIFT_MODELS) if selected_model == 'any' else selected_model; number=random.randint(1,100000)
             try: gift=await peek_get_gift(model,number)
             except Exception as e: gift=None; errors+=1; log.warning('V24 random failed model=%s number=%s: %s',model,number,e)
             db.consume_trial_kind(uid,'random',1)
@@ -1058,11 +1130,7 @@ async def v24_chats(c: CallbackQuery,state:FSMContext):
 async def buy_plan(c: CallbackQuery):
     uid = int(c.from_user.id)
     plan = c.data.split(':', 1)[1]
-    plans = {
-        'premium_2d': ('7', 'premium', 172800, 'Премиум · 2 дня'),
-        'chat_24h': ('10', 'chat', 86400, 'Парсер чатов · 24 часа'),
-        'offers_5d': ('25', 'offers', 432000, 'Оферы · 5 дней'),
-    }
+    plans = tariff_config()
     if plan not in plans:
         return await c.answer('Тариф не найден', show_alert=True)
     amount, kind, seconds, title = plans[plan]
@@ -1076,7 +1144,7 @@ async def buy_plan(c: CallbackQuery):
     await c.message.edit_text(f'💳 <b>{ui.esc(title)}</b>\n\nСтоимость: <b>{amount} TON</b>\n\nВыбери способ оплаты:', reply_markup=markup)
 
 async def _create_crypto_invoice(c: CallbackQuery, plan: str):
-    plans = {'premium_2d':('7','premium',172800,'Премиум · 2 дня'),'chat_24h':('10','chat',86400,'Парсер чатов · 24 часа'),'offers_5d':('25','offers',432000,'Оферы · 5 дней')}
+    plans = tariff_config()
     amount, kind, seconds, title = plans[plan]; uid=int(c.from_user.id)
     if not crypto_pay.configured:
         return await c.answer('CryptoBot не настроен.', show_alert=True)
@@ -1088,7 +1156,7 @@ async def _create_crypto_invoice(c: CallbackQuery, plan: str):
         if not url: raise RuntimeError('CryptoBot не вернул ссылку оплаты')
         await c.message.edit_text(f'💳 <b>CryptoBot</b>\n\nТариф: <b>{ui.esc(title)}</b>\nСумма: <b>{amount} TON</b>\n\nПосле оплаты доступ активируется автоматически.', reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text='💳 Оплатить CryptoBot', url=url)],[InlineKeyboardButton(text='‹ Назад', callback_data=f'buy:{plan}')]]))
     except Exception as e:
-        log.exception('CryptoBot invoice failed uid=%s plan=%s',uid,plan); await c.answer('Не удалось создать счёт.',show_alert=True)
+        log.exception('CryptoBot invoice failed uid=%s plan=%s',uid,plan); await c.answer(f'Не удалось создать счёт: {str(e)[:180]}',show_alert=True)
 
 @dp.callback_query(F.data.startswith('pay:crypto:'))
 async def pay_crypto(c: CallbackQuery):
@@ -1110,7 +1178,7 @@ async def pay_xrocket(c: CallbackQuery):
         await c.answer()
         await c.message.edit_text(f'🚀 <b>xRocket</b>\n\nТариф: <b>{ui.esc(title)}</b>\nСумма: <b>{amount} TON</b>\n\nПосле оплаты доступ активируется автоматически.', reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text='🚀 Оплатить через xRocket', url=url)],[InlineKeyboardButton(text='‹ Назад', callback_data=f'buy:{plan}')]]))
     except Exception as e:
-        log.exception('xRocket invoice failed uid=%s plan=%s',uid,plan); await c.answer('Не удалось создать xRocket-счёт.',show_alert=True)
+        log.exception('xRocket invoice failed uid=%s plan=%s',uid,plan); await c.answer(f'Не удалось создать xRocket-счёт: {str(e)[:180]}',show_alert=True)
 
 @dp.callback_query(F.data == 'profile:payments')
 async def v24_profile_payments(c: CallbackQuery):
@@ -1343,6 +1411,7 @@ def admin_home_kb():
         [InlineKeyboardButton(text='📣 Рассылка', callback_data='adm:broadcast')],
         [InlineKeyboardButton(text='📜 Логи', callback_data='adm:logs')],
         [InlineKeyboardButton(text='🛠 Система и канал логов', callback_data='adm:system')],
+        [InlineKeyboardButton(text='🚧 Технические работы', callback_data='adm:maintenance')],
         [InlineKeyboardButton(text='🔄 Обновить', callback_data='adm:home')],
     ])
 
@@ -1439,11 +1508,21 @@ def offers_admin_kb():
 
 
 def tariffs_text():
-    return ('💳 <b>ТАРИФЫ</b>\n\n'
-            '⚡ <b>7 TON · 2 дня</b>\nОбычный + случайный + поиск по ID.\n\n'
-            '📡 <b>10 TON · 24 часа</b>\nПарсер чатов.\n\n'
-            '🎁 <b>25 TON · 5 дней</b>\nОферы.\n\n'
-            'Оплата: CryptoBot → TON. Доступ выдаётся автоматически после подтверждения платежа.')
+    plans = tariff_config()
+    lines=['💳 <b>ТАРИФЫ</b>','']
+    labels={'premium_2d':'⚡ Premium · 2 дня','chat_24h':'📡 Парсер чатов · 24 часа','offers_5d':'🎁 Оферы · 5 дней'}
+    for key in ('premium_2d','chat_24h','offers_5d'):
+        lines.append(f'{labels[key]}: <b>{plans[key][0]} TON</b>')
+    lines += ['', 'Выбери тариф, чтобы изменить цену. Изменение сохраняется в SQLite.']
+    return '\n'.join(lines)
+
+def tariffs_kb():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=f'⚡ Premium: {tariff_config()["premium_2d"][0]} TON', callback_data='adm:tariff:premium_2d')],
+        [InlineKeyboardButton(text=f'📡 Чаты: {tariff_config()["chat_24h"][0]} TON', callback_data='adm:tariff:chat_24h')],
+        [InlineKeyboardButton(text=f'🎁 Оферы: {tariff_config()["offers_5d"][0]} TON', callback_data='adm:tariff:offers_5d')],
+        [InlineKeyboardButton(text='‹ Назад', callback_data='adm:home')],
+    ])
 
 
 @dp.message(F.text == kb.BTN_ADMIN)
@@ -1578,7 +1657,31 @@ async def adm_offer_access(c: CallbackQuery):
 @dp.callback_query(F.data == 'adm:tariffs')
 async def adm_tariffs(c: CallbackQuery):
     if not is_admin(c.from_user.id): return await c.answer('Нет доступа',show_alert=True)
-    await c.answer(); await c.message.edit_text(tariffs_text(),reply_markup=admin_back())
+    await c.answer(); await c.message.edit_text(tariffs_text(),reply_markup=tariffs_kb())
+
+
+@dp.callback_query(F.data.regexp(r'^adm:tariff:(premium_2d|chat_24h|offers_5d)$'))
+async def adm_tariff_start(c: CallbackQuery, state: FSMContext):
+    if not is_admin(c.from_user.id): return await c.answer('Нет доступа', show_alert=True)
+    key=c.data.split(':')[-1]
+    await state.set_state(S.admin_tariff); await state.update_data(tariff_key=key)
+    current=tariff_config()[key][0]
+    await c.answer(); await c.message.edit_text(f'💳 <b>Изменение тарифа</b>\n\nТекущая цена: <b>{current} TON</b>\n\nОтправь новую цену числом, например <code>12.5</code>.', reply_markup=admin_back('adm:tariffs'))
+
+
+@dp.message(S.admin_tariff)
+async def adm_tariff_value(m: Message, state: FSMContext):
+    if not is_admin(m.from_user.id): await state.clear(); return
+    try:
+        value=float((m.text or '').replace(',','.').strip())
+        if value <= 0 or value > 100000: raise ValueError
+    except Exception:
+        return await m.answer('❌ Введи положительную цену до 100000 TON.')
+    data=await state.get_data(); key=data.get('tariff_key')
+    if key not in tariff_config(): await state.clear(); return await m.answer('❌ Тариф не найден.')
+    db.set_setting('tariff_'+key, str(value).rstrip('0').rstrip('.') if '.' in str(value) else str(int(value)))
+    await state.clear()
+    await m.answer('✅ Цена сохранена.', reply_markup=tariffs_kb())
 
 
 @dp.callback_query(F.data == 'adm:logs')
@@ -1588,6 +1691,29 @@ async def adm_logs(c: CallbackQuery):
         text=''.join(Path('logs/giftparser.log').read_text(encoding='utf-8').splitlines(True)[-35:])[-3800:]
     except Exception as e: text=f'Лог недоступен: {e}'
     await c.answer(); await c.message.edit_text('<b>📜 ЛОГИ</b>\n\n<pre>'+ui.esc(text)+'</pre>',reply_markup=admin_back())
+
+
+def maintenance_kb():
+    enabled=db.get_setting('maintenance_mode','0') == '1'
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=('🔴 Выключить' if enabled else '🟢 Включить'), callback_data='adm:maintenance:toggle')],
+        [InlineKeyboardButton(text='‹ Назад', callback_data='adm:home')],
+    ])
+
+@dp.callback_query(F.data == 'adm:maintenance')
+async def adm_maintenance(c: CallbackQuery):
+    if not is_admin(c.from_user.id): return await c.answer('Нет доступа', show_alert=True)
+    enabled=db.get_setting('maintenance_mode','0') == '1'
+    await c.answer(); await c.message.edit_text('🚧 <b>ТЕХНИЧЕСКИЕ РАБОТЫ</b>\n\nСтатус: <b>'+('включены' if enabled else 'выключены')+'</b>\n\nПри включении обычные пользователи не смогут пользоваться ботом, админы продолжат работу.', reply_markup=maintenance_kb())
+
+@dp.callback_query(F.data == 'adm:maintenance:toggle')
+async def adm_maintenance_toggle(c: CallbackQuery):
+    if not is_admin(c.from_user.id): return await c.answer('Нет доступа', show_alert=True)
+    new='0' if db.get_setting('maintenance_mode','0') == '1' else '1'
+    db.set_setting('maintenance_mode', new)
+    await c.answer('Статус изменён', show_alert=True)
+    enabled=new=='1'
+    await c.message.edit_text('🚧 <b>ТЕХНИЧЕСКИЕ РАБОТЫ</b>\n\nСтатус: <b>'+('включены' if enabled else 'выключены')+'</b>', reply_markup=maintenance_kb())
 
 
 def system_text():
@@ -2056,7 +2182,7 @@ async def main():
         restored = await parser_handlers.restore_saved_parser_session(db)
         log.info('Saved parser session restore: %s', restored)
         if restored:
-            resumed = await parser_handlers.resume_interrupted_scan(db)
+            resumed = await parser_handlers.resume_interrupted_scan(db, bot)
             log.info('Interrupted parser scan resume: %s', resumed)
     except Exception:
         log.exception('Failed to restore saved parser session')

@@ -41,6 +41,10 @@ class CryptoPay:
 
     async def get_invoice(self, invoice_id: int):
         rows = await self.call('getInvoices', invoice_ids=str(int(invoice_id)), count=1)
+        if isinstance(rows, dict):
+            rows = rows.get('items') or rows.get('invoices') or rows.get('result') or []
+        if not isinstance(rows, (list, tuple)):
+            return None
         return rows[0] if rows else None
 
     async def close(self):
