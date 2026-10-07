@@ -2038,26 +2038,39 @@ async def _run_offer_send_diagnostics(m: Message):
         ),
     ]])
 
-    # IMPORTANT: these payloads are sent WITHOUT a diagnostic prefix.
-    # This isolates the exact production-like first-offer components.
+    # IMPORTANT: V58 isolates the text itself. V57 proved that removing the
+    # NFT anchor makes the message pass, while the plain NFT URL also passes.
+    # Therefore we split the production text into its HTML/link components.
     exact_text = (
         'Пользователь <b>Тестовый Пользователь</b> предлагает Вам <b>150 Gram</b> за подарок '
         '<a href="https://t.me/nft/PartySparkler-140864">Party Sparkler #140,864</a>.\n\n'
         'Предложение действует ещё <b>6ч</b>.'
     )
-    text_without_link = (
+    plain_url_text = (
         'Пользователь <b>Тестовый Пользователь</b> предлагает Вам <b>150 Gram</b> за подарок '
-        'Party Sparkler #140,864.\n\n'
+        'https://t.me/nft/PartySparkler-140864.\n\n'
         'Предложение действует ещё <b>6ч</b>.'
     )
-    text_without_amount = (
-        'Пользователь <b>Тестовый Пользователь</b> предлагает Вам за подарок '
+    anchor_only_text = '<a href="https://t.me/nft/PartySparkler-140864">Party Sparkler #140,864</a>'
+    anchor_sentence_text = (
+        'за подарок <a href="https://t.me/nft/PartySparkler-140864">Party Sparkler #140,864</a>.'
+    )
+    full_without_anchor = (
+        'Пользователь <b>Тестовый Пользователь</b> предлагает Вам <b>150 Gram</b> за подарок '
+        'Party Sparkler #140,864.\n\nПредложение действует ещё <b>6ч</b>.'
+    )
+    full_with_anchor_no_bold = (
+        'Пользователь Тестовый Пользователь предлагает Вам 150 Gram за подарок '
         '<a href="https://t.me/nft/PartySparkler-140864">Party Sparkler #140,864</a>.\n\n'
-        'Предложение действует ещё <b>6ч</b>.'
+        'Предложение действует ещё 6ч.'
+    )
+    full_with_bold_no_anchor = full_without_anchor
+    text_without_link = (
+        'Пользователь <b>Тестовый Пользователь</b> предлагает Вам <b>150 Gram</b> за подарок '
+        'Party Sparkler #140,864.\n\nПредложение действует ещё <b>6ч</b>.'
     )
 
     tests = [
-        # 1–5 retained as baseline controls.
         ('TEST 1 — обычный текст', 'Business-маршрут + обычный текст.', None, None),
         ('TEST 2 — текст + inline-кнопка', 'Business-маршрут + callback inline-кнопка.', InlineKeyboardMarkup(inline_keyboard=[[
             InlineKeyboardButton(text='Принять', callback_data='offer_diag_accept')
@@ -2070,12 +2083,14 @@ async def _run_offer_send_diagnostics(m: Message):
             InlineKeyboardButton(text='Как передать подарок', url=_offer_diag_help_url())
         ]]), no_preview),
 
-        # 6–10: focused isolation of the failing first-offer payload.
-        ('TEST 6 — первый офер: точный текст без кнопок', exact_text, None, no_preview),
-        ('TEST 7 — первый офер: текст без NFT-ссылки', text_without_link, None, no_preview),
-        ('TEST 8 — первый офер: точный текст + Отклонить', exact_text, decline_kb, no_preview),
-        ('TEST 9 — первый офер: точный текст + Принять', exact_text, accept_kb, no_preview),
-        ('TEST 10 — первый офер: точный текст + две кнопки', exact_text, offer_kb, no_preview),
+        # V58: text-component isolation. All tests are sent without preview.
+        ('TEST 6 — точный первый офер', exact_text, None, no_preview),
+        ('TEST 7 — первый офер без HTML-якоря', text_without_link, None, no_preview),
+        ('TEST 8 — первый офер с обычным URL вместо якоря', plain_url_text, None, no_preview),
+        ('TEST 9 — только HTML-якорь NFT', anchor_only_text, None, no_preview),
+        ('TEST 10 — фраза + HTML-якорь', anchor_sentence_text, None, no_preview),
+        ('TEST 11 — весь текст + якорь, без bold', full_with_anchor_no_bold, None, no_preview),
+        ('TEST 12 — весь текст без якоря', full_without_anchor, None, no_preview),
     ]
 
     results = []
@@ -2099,9 +2114,9 @@ async def _run_offer_send_diagnostics(m: Message):
         )
 
     summary = [
-        '🧪 <b>ОФЕР-ДИАГНОСТИКА V57 ЗАВЕРШЕНА</b>',
+        '🧪 <b>ОФЕР-ДИАГНОСТИКА V58 ЗАВЕРШЕНА</b>',
         '',
-        'V57 проверяет именно компоненты первого офера. TEST 6–10 отправляются без диагностического префикса.',
+        'V58 изолирует HTML/NFT-компоненты первого офера. TEST 6–12 отправляются без диагностического префикса.',
         '',
     ]
     for name, ok, detail in results:
@@ -2111,11 +2126,12 @@ async def _run_offer_send_diagnostics(m: Message):
 
     summary += [
         '',
-        'Интерпретация:',
-        '• TEST 6 ❌ → проблема уже в тексте первого офера.',
-        '• TEST 6 ✅ + TEST 8/9 ❌ → проблема в custom emoji-кнопке.',
-        '• TEST 8/9 ✅ + TEST 10 ❌ → проблема именно в комбинации двух кнопок.',
-        '• TEST 6–10 ✅ → предыдущий PEER_FLOOD был связан с preview/частотой/контекстом отправки, а не с самим payload.',
+        'Интерпретация V58:',
+        '• TEST 6 ❌ + TEST 7/12 ✅ → триггер в HTML-якоре/ссылке или её сочетании с текстом.',
+        '• TEST 8 ✅ + TEST 6 ❌ → обычный URL не является триггером.',
+        '• TEST 9/10 ❌ → проблема именно в HTML-якоре NFT.',
+        '• TEST 11 ❌ + TEST 9/10 ❌ → проверяем сочетание якоря с полным текстом.',
+        '• TEST 12 ✅ → текст без HTML-якоря стабильно проходит.',
     ]
 
     await asyncio.sleep(OFFER_DIAG_DELAY)
