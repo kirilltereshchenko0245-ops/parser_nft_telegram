@@ -1,0 +1,738 @@
+🎁 ПОЛНАЯ ДОКУМЕНТАЦИЯ: Telegram NFT Gift Parser
+📋 СОДЕРЖАНИЕ
+Описание проекта
+Функционал
+Архитектура
+Как работает
+Структура файлов
+База данных
+API и парсинг
+Система лимитов
+Админка
+Деплой
+🎯 ОПИСАНИЕ
+Gift Parser v3.1 - Telegram бот для поиска NFT подарков в Telegram.
+Что делает:
+🔍 Ищет NFT подарки по названию модели
+📊 Проверяет диапазоны ID (например, 100-200)
+🎲 Случайный поиск подарков
+👤 Показывает владельца, ID, видимость
+📈 Ведёт статистику
+Для кого:
+Коллекционеров NFT подарков Telegram
+Трейдеров (проверка редких подарков)
+Исследователей рынка
+⚡️ ФУНКЦИОНАЛ
+Для пользователей:
+1. 🔍 Поиск по модели
+Пример:
+- Вводишь: "Eternal Rose"
+- Вводишь диапазон: "100-200"
+- Бот проверяет все ID от 100 до 200
+- Показывает найденные подарки
+Что показывает:
+✅ Номер подарка (#123)
+👤 Владелец (@username)
+🆔 ID владельца (даже если профиль скрыт)
+👁 Видимость (открыт/скрыт)
+🔗 Ссылки на профиль и подарок
+2. 🎲 Случайный поиск
+- Вводишь количество: "50"
+- Бот случайно выбирает модели и ID
+- Ищет пока не найдёт 50 подарков
+3. 🔎 Поиск по ID
+- Вводишь ID: "12345"
+- Вводишь модель: "Evil Eye"
+- Бот проверяет конкретный подарок
+4. 📊 Профиль
+Статус (пробная/Premium/админ)
+Остаток поисков
+История последних 5 поисков
+5. 📋 Список моделей
+55 моделей подарков:
+💎 Легендарные (DurovsCap, HeroicHelmet...)
+🔥 Редкие (PreciousPeach, PlushPepe...)
+⭐️ Обычные (EternalRose, ToyBear...)
+📦 Массовые (FreshSocks, BerryBox...)
+6. ⏹️ Остановка поиска
+Кнопка "Стоп" во время парсинга
+Команда /stop
+Показывает сколько проверено/найдено
+Показывает последний найденный подарок
+Для админа:
+⚙️ Админ-панель
+Статистика:
+👥 Всего пользователей
+⭐️ Premium пользователей
+🔍 Всего поисков
+✅ Найдено подарков
+🏆 Топ-5 пользователей
+Команды:
+/give_premium @username    # Выдать Premium
+/add_trials @username 25   # Добавить поиски
+/ban @username             # Забанить
+/unban @username           # Разбанить
+/stats                     # Детальная статистика
+🏗 АРХИТЕКТУРА
+Структура проекта:
+parser_nft_telegram/
+├── bot.py                 # Основной бот
+├── database.py            # Работа с БД
+├── peek_api.py            # API для поиска подарков
+├── keyboards.py           # Клавиатуры (не используется в v3.1)
+├── logger_channel.py      # Логи в канал
+├── payments.py            # Платежи (не активно)
+├── .env                   # Секретные данные
+├── requirements.txt       # Зависимости Python
+├── bot_database.db        # SQLite база данных
+└── venv/                  # Виртуальное окружение
+Зависимости:
+aiogram==3.7.0+           # Telegram Bot framework
+aiohttp                   # HTTP запросы
+aiohttp-socks             # Proxy поддержка
+python-socks              # SOCKS proxy
+python-dotenv             # Переменные окружения
+⚙️ КАК РАБОТАЕТ
+1. Инициализация бота
+# bot.py
+bot = Bot(
+    token=BOT_TOKEN,
+    default=DefaultBotProperties(parse_mode=ParseMode.HTML)
+)
+dp = Dispatcher(storage=MemoryStorage())
+db = Database()
+channel_logger = ChannelLogger(bot)
+Что происходит:
+Создаётся бот с токеном из .env
+Инициализируется FSM (Finite State Machine) для диалогов
+Подключается SQLite база данных
+Настраивается логирование в канал
+2. Middleware (проверка доступа)
+@dp.message.middleware()
+async def check_access(handler, event, data):
+    # Проверка бана
+    if db.is_banned(user_id):
+        return "🚫 Вы заблокированы"
+
+    # Регистрация нового пользователя
+    if not db.get_user(user_id):
+        db.add_user(user_id, username)
+        await channel_logger.log_action(...)
+
+    return await handler(event, data)
+Каждое сообщение проходит через:
+Проверку на бан
+Автоматическую регистрацию
+Логирование в канал
+3. FSM States (диалоги)
+class SearchStates(StatesGroup):
+    waiting_for_model = State()        # Ждём модель
+    waiting_for_range = State()        # Ждём диапазон
+    waiting_for_id = State()           # Ждём ID
+    waiting_for_random_count = State() # Ждём количество
+Пример диалога:
+
+
+Пользователь: "🔍 Начать поиск"
+Бот: "Введите название подарка:"
+  → waiting_for_model
+
+Пользователь: "Eternal Rose"
+Бот: "Введи диапазон ID:"
+  → waiting_for_range
+
+Пользователь: "100-200"
+Бот: Начинает парсинг
+  → state.clear()
+4. Процесс парсинга
+async def start_parsing(message, user_id, model, start, end):
+    # 1. Подготовка
+    db.clear_stop_flag(user_id)
+    search_id = db.add_search(user_id, model, start, end)
+
+    # 2. Уменьшаем лимиты (если не админ и не Premium)
+    if not is_admin and not user['is_premium']:
+        checked_ids = end - start + 1
+        db.update_trial_searches(user_id, max(0, new_value))
+
+    # 3. Цикл проверки
+    for gift_id in range(start, end + 1):
+        # Проверка остановки
+        if db.should_stop_parsing(user_id):
+            break
+
+        # Запрос к API
+        gift_data = await peek_gift_info(gift_id, model)
+
+        if gift_data['found']:
+            # Сохраняем в БД
+            db.add_found_gift(...)
+
+            # Отправляем уведомление
+            await message.answer(gift_text)
+
+        # Задержка 7 секунд (с проверкой остановки каждую секунду)
+        for _ in range(7):
+            if db.should_stop_parsing(user_id):
+                break
+            await asyncio.sleep(1)
+
+    # 4. Итог
+    await message.answer(summary)
+Что происходит:
+Очищается флаг остановки
+Создаётся запись в истории поисков
+Уменьшаются лимиты (для обычных пользователей)
+Цикл проверки каждого ID:
+Проверка флага остановки
+Запрос к Peek API
+Если найден → сохранить в БД + уведомление
+Задержка 7 секунд (защита от rate limit)
+Отправка итогового списка
+5. API запросы (peek_api.py)
+async def peek_gift_info(gift_id: int, model: str) -> dict:
+    # Нормализация названия
+    model_for_api = model.replace(" ", "")  # "Eternal Rose" → "EternalRose"
+
+    # Запрос к Peek API
+    params = {
+        "name": model_for_api,
+        "giftNumber": gift_id,
+        "page": 1,
+        "limit": 20
+    }
+
+    async with session.get(PEEK_URL, params=params) as response:
+        data = await response.json()
+        result = extract_gift(data, gift_id)
+
+        return {
+            'found': True,
+            'giftNumber': gift_id,
+            'username': username,
+            'user_id': user_id,
+            'is_visible': bool(username),  # Если username есть = виден
+            'is_upgraded': gift.get('isUpgraded', False)
+        }
+API Endpoint:
+https://server.peek.tg/api/nft/gifts/search
+Что делает:
+Нормализует название модели
+Отправляет GET запрос к Peek API
+Парсит JSON ответ
+Извлекает информацию о подарке
+Определяет видимость по наличию username
+6. Определение видимости
+# Проблема: API возвращает isVisible = true даже для скрытых
+# Решение: проверяем username
+
+username = gift.get('username', '').replace('t.me/', '').lstrip('@')
+is_actually_visible = bool(username)  # Пустой username = скрыт
+Логика:
+Если username пустой → подарок скрыт в профиле
+Если username есть → подарок виден
+📁 СТРУКТУРА ФАЙЛОВ
+bot.py (основной файл)
+Разделы:
+# 1. Импорты и настройки
+BOT_TOKEN, OWNER_ID, LOG_CHANNEL_ID
+
+# 2. FSM States
+SearchStates, AdminStates
+
+# 3. Клавиатуры
+main_menu(), cancel_keyboard(), stop_keyboard(), gift_inline_keyboard()
+
+# 4. Middleware
+check_access() - проверка бана, регистрация
+
+# 5. Команды
+/start, /stop, /help
+
+# 6. Кнопки меню
+"🔍 Начать поиск", "🎲 Случайный поиск", "📊 Профиль", etc.
+
+# 7. Функции парсинга
+start_parsing(), start_random_parsing(), format_gift_summary()
+
+# 8. Админка
+/give_premium, /add_trials, /ban, /unban, /stats
+
+# 9. Запуск
+async def main(), asyncio.run(main())
+database.py
+Таблицы:
+
+
+-- Пользователи
+users (
+    user_id PRIMARY KEY,
+    username,
+    first_name,
+    is_banned BOOLEAN,
+    is_premium BOOLEAN,
+    trial_searches_left INTEGER DEFAULT 25,
+    total_searches INTEGER,
+    total_found INTEGER,
+    registration_date TIMESTAMP,
+    last_activity TIMESTAMP
+)
+
+-- История поисков
+search_history (
+    id PRIMARY KEY,
+    user_id,
+    model,
+    start_id,
+    end_id,
+    last_checked_id,
+    timestamp
+)
+
+-- Найденные подарки
+found_gifts (
+    id PRIMARY KEY,
+    search_id,
+    gift_number,
+    model,
+    owner_username,
+    is_visible,
+    attributes TEXT,
+    found_at TIMESTAMP
+)
+
+-- Настройки бота
+bot_settings (
+    key PRIMARY KEY,
+    value
+)
+Методы:
+# Пользователи
+get_user(user_id)
+add_user(user_id, username, first_name)
+is_banned(user_id)
+ban_user(user_id)
+unban_user(user_id)
+set_premium(user_id, is_premium)
+update_trial_searches(user_id, count)
+
+# Поиски
+add_search(user_id, model, start, end)
+get_user_searches(user_id, limit)
+update_last_search(user_id, model, current_id, end_id)
+get_last_search(user_id)
+
+# Подарки
+add_found_gift(search_id, gift_number, model, ...)
+get_found_gifts(search_id)
+
+# Остановка
+set_stop_flag(user_id, True/False)
+should_stop_parsing(user_id)
+clear_stop_flag(user_id)
+peek_api.py
+Компоненты:
+# 1. Список моделей (55 шт)
+AVAILABLE_MODELS = [
+    "PreciousPeach", "PlushPepe", "HeroicHelmet", ...
+]
+
+# 2. Нормализация названий
+def normalize_model_name(text: str) -> str:
+    # "eternal rose" → "EternalRose"
+    # "EVIL EYE" → "EvilEye"
+
+# 3. API класс
+class PeekAPI:
+    async def get_gift(model, gift_number)
+    def _extract(data, gift_number)
+    def format_gift(gift)
+
+# 4. Обёртка
+async def peek_gift_info(gift_id, model) -> dict
+
+# 5. Форматирование
+def format_summary(gifts, model, start, end) -> list[str]
+Нормализация названий:
+MODEL_NAME_MAP = {
+    'eternalrose': 'EternalRose',
+    'eternal rose': 'EternalRose',
+    'eternal_rose': 'EternalRose',
+    'evileye': 'EvilEye',
+    'evil eye': 'EvilEye',
+    ...
+}
+
+def normalize_model_name(text: str) -> str:
+    text = text.strip().lower()
+
+    # Проверка в маппинге
+    if text in MODEL_NAME_MAP:
+        return MODEL_NAME_MAP[text]
+
+    # Капитализация каждого слова
+    words = text.split()
+    return ''.join(word.capitalize() for word in words)
+logger_channel.py
+Функции:
+class ChannelLogger:
+    def __init__(self, bot)
+
+    async def log_action(user_id, username, action)
+    # Логирует любое действие в канал
+
+    async def log_search(user_id, username, model, start, end)
+    # Логирует начало поиска
+
+    async def log_registration(user_id, username, first_name)
+    # Логирует регистрацию нового пользователя
+Пример лога:
+📊 Лог действия
+⏰ 2026-10-02 12:30:00
+👤 @username
+🔹 Действие: Поиск по модели EternalRose (100-200)
+💾 БАЗА ДАННЫХ
+Схема:
+users
+├── user_id (PK) → Telegram ID
+├── username → @username
+├── first_name → Имя
+├── is_banned → Забанен?
+├── is_premium → Premium?
+├── trial_searches_left → Остаток пробных (25)
+├── total_searches → Всего поисков
+├── total_found → Всего найдено
+├── registration_date → Дата регистрации
+└── last_activity → Последняя активность
+
+search_history
+├── id (PK)
+├── user_id (FK) → users.user_id
+├── model → Название модели
+├── start_id → Начало диапазона
+├── end_id → Конец диапазона
+├── last_checked_id → Последний проверенный ID
+└── timestamp → Время поиска
+
+found_gifts
+├── id (PK)
+├── search_id → search_history.id
+├── gift_number → ID подарка
+├── model → Модель
+├── owner_username → @username владельца
+├── is_visible → Видимость
+├── attributes → JSON данные
+└── found_at → Время находки
+Персистентность:
+Проблема на Railway:
+Railway использует ephemeral storage
+При рестарте контейнера файл bot_database.db удаляется
+Пользователи теряют статистику
+Решение (будущее):
+PostgreSQL (Railway addon)
+MongoDB (внешний)
+Supabase (бесплатный PostgreSQL)
+🎮 СИСТЕМА ЛИМИТОВ
+Три типа пользователей:
+1. 👑 Администратор (OWNER_ID)
+if user_id == OWNER_ID:
+    # Безлимитный доступ
+    # Не расходует лимиты
+    # Доступ к админ-панели
+2. ⭐️ Premium
+
+
+if user['is_premium']:
+    # Безлимитные поиски
+    # Без ограничений на диапазон
+3. 🆓 Пробная версия
+trial_searches_left = 25  # По умолчанию
+
+# При поиске:
+checked_ids = end - start + 1
+if checked_ids > trial_searches_left:
+    return "❌ Превышен лимит!"
+
+# После поиска:
+new_value = trial_searches_left - checked_ids
+db.update_trial_searches(user_id, max(0, new_value))
+Логика подсчёта:
+Пробные поиски = количество ID:
+Пример 1:
+Диапазон: 1-25
+Расход: 25 поисков
+
+Пример 2:
+Диапазон: 100-200
+Расход: 101 поиск
+
+Случайный поиск на 50 подарков:
+Расход: 50 поисков
+Проверки лимитов:
+# 1. Перед началом поиска
+if not is_admin and not is_premium and trial_searches_left <= 0:
+    return "❌ Пробные поиски закончились!"
+
+# 2. Проверка диапазона
+actual_range = end - start + 1
+if not is_admin and not is_premium:
+    if actual_range > trial_searches_left:
+        return "❌ Превышен лимит!"
+
+# 3. После поиска (уменьшение)
+if not is_admin and not is_premium:
+    new_value = trial_searches_left - actual_range
+    db.update_trial_searches(user_id, max(0, new_value))
+⚙️ АДМИНКА
+Доступ:
+OWNER_ID = 7924294552  # Твой Telegram ID
+
+if user_id != OWNER_ID:
+    return "❌ Доступ запрещён"
+Команды:
+1. Выдать Premium
+/give_premium @username
+user = db.get_user_by_username(username)
+db.set_premium(user['user_id'], True)
+
+
+⚙️ АДМИНКА (продолжение)
+Команды (продолжение):
+2. Добавить поиски
+/add_trials @username 25
+new_value = user['trial_searches_left'] + 25
+db.update_trial_searches(user['user_id'], new_value)
+3. Забанить
+/ban @username
+db.ban_user(user['user_id'])
+# Пользователь больше не может использовать бота
+4. Разбанить
+/unban @username
+db.unban_user(user['user_id'])
+# Восстанавливает доступ
+5. Статистика
+/stats
+Показывает:
+👥 Всего пользователей
+⭐️ Premium пользователей
+🚫 Забаненных
+🔍 Всего поисков
+✅ Найдено подарков
+🏆 Топ-5 пользователей по активности
+🚀 ДЕПЛОЙ
+Railway (текущий хостинг)
+Переменные окружения (.env):
+BOT_TOKEN=7929785947:AAH...    # Токен от @BotFather
+OWNER_ID=7924294552            # Твой Telegram ID
+LOG_CHANNEL_ID=-1003864916255  # ID канала для логов
+Файлы для деплоя:
+✅ bot.py          - основной код
+✅ database.py     - база данных
+✅ peek_api.py     - API
+✅ logger_channel.py
+✅ payments.py
+✅ requirements.txt
+✅ Procfile       - команда запуска
+✅ runtime.txt    - версия Python
+Procfile:
+worker: python bot.py
+Команды деплоя:
+git add .
+git commit -m "Update bot"
+git push
+Railway автоматически:
+Обнаруживает изменения
+Строит контейнер
+Запускает бота
+📊 СТАТИСТИКА И ЛОГИРОВАНИЕ
+Логи в канал (-1003864916255)
+Что логируется:
+🆕 Новые пользователи
+🔍 Начало каждого поиска
+⭐️ Выдача Premium
+🚫 Баны/разбаны
+➕ Добавление поисков
+Формат лога:
+📊 Лог действия
+⏰ 2026-10-02 12:30:00
+👤 @username (ID: 123456)
+🔹 Действие: Поиск по модели EvilEye (100-200)
+База данных статистики
+Для каждого пользователя:
+total_searches - всего поисков
+total_found - всего найдено подарков
+last_activity - последняя активность
+Для каждого поиска:
+timestamp - время поиска
+model - модель
+start_id, end_id - диапазон
+🔧 ТЕХНИЧЕСКИЕ ДЕТАЛИ
+Задержки и Rate Limiting
+Защита от блокировки API:
+# Задержка 7 секунд между запросами
+for _ in range(7):
+    if db.should_stop_parsing(user_id):
+        break
+    await asyncio.sleep(1)
+Почему 7 секунд:
+Peek API имеет rate limit
+7 секунд = безопасный интервал
+Проверка остановки каждую секунду
+Retry логика в API
+max_retries = 3
+for attempt in range(max_retries):
+    try:
+        response = await session.get(PEEK_URL, params=params)
+
+        if response.status == 429:  # Rate limit
+            wait_time = 3 + (attempt * 2)  # 3, 5, 7 секунд
+            await asyncio.sleep(wait_time)
+            continue
+
+        return data
+    except Exception as e:
+        if attempt < max_retries - 1:
+            await asyncio.sleep(2)
+        else:
+            raise
+Обработка остановки
+Флаг остановки в памяти:
+stop_parsing_flags = {}  # {user_id: True/False}
+
+def set_stop_flag(user_id, stop):
+    self.stop_parsing_flags[user_id] = stop
+
+def should_stop_parsing(user_id):
+    return self.stop_parsing_flags.get(user_id, False)
+Проверка в цикле:
+for gift_id in range(start, end + 1):
+    if db.should_stop_parsing(user_id):
+        # Сохраняем последний ID
+        db.update_last_search(user_id, model, gift_id, end)
+        return
+
+    # Продолжаем поиск...
+Многосообщенный вывод (Split Messages)
+Проблема: Telegram лимит 4096 символов
+Решение:
+def format_gift_summary(gifts, model, start, end) -> list[str]:
+    messages = []
+    current_msg = "..."
+
+    for gift in gifts:
+        gift_line = f"{i}. #{num} | @{owner}\n"
+
+        # Проверка лимита (оставляем запас)
+        if len(current_msg + gift_line) > 3800:
+            messages.append(current_msg)
+            current_msg = f"Продолжение ({len(messages) + 1})\n\n" + gift_line
+        else:
+            current_msg += gift_line
+
+    messages.append(current_msg)
+    return messages
+Отправка:
+summary_messages = format_gift_summary(found_gifts, model, start, end)
+for part in summary_messages:
+    await message.answer(part)
+🎨 ФОРМАТИРОВАНИЕ СООБЩЕНИЙ
+HTML форматирование
+Поддерживаемые теги:
+<b>жирный</b>
+<i>курсив</i>
+<code>код</code>
+<blockquote>цитата</blockquote>
+<a href="url">ссылка</a>
+Примеры из бота:
+/start:
+
+<i>Привет, Дизейбл!</i>
+
+Рады видеть тебя в Gift Parser
+
+<b>Бот предназначен для поиска любых NFT подарков</b>
+
+<blockquote>Твой статус:
+Твои лимиты:</blockquote>
+
+🆓 Пробная версия: <b>25/25</b> поисков
+Начать поиск:
+Поиск подарков по модели
+
+<blockquote><b>Введите название подарка:</b></blockquote>
+Найденный подарок:
+┏━━━━━━━━━━━━━━━━━━━━━━━┓
+┃  ✅ <b>НАЙДЕН #12345</b>
+┗━━━━━━━━━━━━━━━━━━━━━━━┛
+
+🎁 <b>Модель:</b> <code>EvilEye</code>
+👤 <b>Владелец:</b> @username
+🆔 <b>ID:</b> <code>123456789</code>
+👁 <b>Видимость:</b> 👁 Открыт
+🐛 ИЗВЕСТНЫЕ ПРОБЛЕМЫ И РЕШЕНИЯ
+1. База данных сбрасывается на Railway
+Проблема: Ephemeral storage - файл удаляется при рестарте
+Решение (будущее):
+Использовать PostgreSQL addon
+Или внешний сервис (Supabase, MongoDB Atlas)
+2. API может меняться
+Проблема: Peek API неофициальный, может измениться
+Решение:
+Вся работа с API в peek_api.py
+Легко заменить на другой источник
+3. Rate Limiting
+Проблема: При быстрых запросах API блокирует
+Решение:
+Задержка 7 секунд между запросами
+Retry логика (3 попытки)
+Увеличение задержки при 429 ошибке
+📈 БУДУЩИЕ УЛУЧШЕНИЯ
+1. Платежи (payments.py уже есть)
+# CryptoBot
+# XRocket
+# Stars (Telegram встроенные)
+2. Продолжение парсинга
+# Сохранять last_checked_id
+# Кнопка "Продолжить"
+# Начинать с последнего проверенного ID
+3. Экспорт результатов
+# CSV файл
+# TXT список
+# JSON данные
+4. Фильтры
+# По редкости
+# По цене (если есть в API)
+# По дате находки
+5. Уведомления
+# Отправлять в личку при находке
+# Настройка частоты уведомлений
+# Отключение уведомлений
+📝 КРАТКАЯ СВОДКА
+Что умеет бот:
+✅ Поиск NFT подарков по модели + диапазону ✅ Случайный поиск ✅ Показывает владельца, ID, видимость ✅ Остановка парсинга ✅ Система лимитов (25 пробных / Premium безлимит) ✅ Админ-панель ✅ Логирование в канал ✅ База данных SQLite ✅ Красивое оформление ✅ Работает на Railway
+Технологии:
+Python 3.12
+aiogram 3.7.0 (Telegram Bot API)
+aiohttp (HTTP запросы)
+SQLite (база данных)
+Railway (хостинг)
+Файлы проекта:
+bot.py (520 строк) - основной код
+database.py (450 строк) - БД
+peek_api.py (400 строк) - API
+logger_channel.py (80 строк) - логи
+payments.py (200 строк) - платежи
+Статистика бота:
+55 моделей подарков
+7 секунд задержка между запросами
+4096 символов лимит сообщения
+25 пробных поисков для новых
+Безлимит для Premium/Админа
+🎯 ИТОГ
+Gift Parser v3.1 - полнофункциональный бот для поиска Telegram NFT подарков с:
+Удобным интерфейсом
+Системой лимитов
+Админ-панелью
+Логированием
+Красивым оформлением
+Готов к использованию и работает на Railway! 🚀
