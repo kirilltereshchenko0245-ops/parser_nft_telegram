@@ -311,48 +311,27 @@ class OfferPeerFloodError(RuntimeError):
 
 
 async def _notify_offer_delivery_error(source_message: Message, offer_id: int, error: Exception):
-    """Best-effort immediate diagnostic for the author of .офер.
-
-    A Business connection may itself be the thing Telegram is restricting, so
-    the notification first tries the author's private chat as a normal bot
-    message. If that is unavailable (e.g. the user never started the bot), we
-    try the source chat without the Business connection. Every failure is
-    logged explicitly instead of disappearing in a background task.
-    """
+    """Notify in the exact source chat; never redirect offer diagnostics to owner DM."""
     if not OFFER_ERROR_NOTIFY_ENABLED:
         return
-    sender_id = int(getattr(getattr(source_message, 'from_user', None), 'id', 0) or 0)
     reason = ui.esc(str(error))[:700]
     text = (
         '⚠️ <b>Не удалось отправить DEMO-офер.</b>\n\n'
         f'Причина: <code>{reason}</code>\n\n'
         f'🆔 Офер: <code>{offer_id}</code>\n'
-        'Telegram временно ограничил отправку для этого Business-профиля. '
-        'Офер сохранён и не был удалён.'
+        'Офер сохранён. Попробуйте ещё раз позже.'
     )
-
-    if sender_id:
-        try:
-            await bot.send_message(sender_id, text, link_preview_options=LinkPreviewOptions(is_disabled=True))
-            log.info('Offer error notification sent to author=%s offer=%s', sender_id, offer_id)
-            return
-        except Exception as e:
-            log.warning('Could not notify offer author in private chat author=%s offer=%s: %s', sender_id, offer_id, e)
-
-    # Fallback: try the source chat as the bot, explicitly without the Business
-    # connection. This can work when the chat is directly accessible to the bot.
     try:
         await bot.send_message(
             chat_id=source_message.chat.id,
             text=text,
             link_preview_options=LinkPreviewOptions(is_disabled=True),
         )
-        log.info('Offer error notification sent to source chat=%s offer=%s', source_message.chat.id, offer_id)
+        log.info('Offer error notification sent to SAME source chat=%s offer=%s', source_message.chat.id, offer_id)
     except Exception as e:
         log.error(
-            'OFFER ERROR NOTIFICATION FAILED offer=%s author=%s source_chat=%s error=%r',
-            offer_id, sender_id, getattr(source_message.chat, 'id', None), e,
-            exc_info=True,
+            'OFFER ERROR NOTIFICATION FAILED offer=%s source_chat=%s error=%r',
+            offer_id, getattr(source_message.chat, 'id', None), e, exc_info=True,
         )
 
 
@@ -2138,24 +2117,48 @@ async def demo_offer_command(m: Message):
 
 
 async def _deliver_new_offer(source_message: Message, offer_id: int, text: str, markup, business_connection_id=None):
+    """Deliver a DEMO offer strictly in the originating Business chat.
+
+    IMPORTANT: never fall back to a plain bot message for the OFFER itself.
+    A plain bot send can land in the bot DM / wrong context and was the reason
+    users saw the offer in the bot instead of in the Business conversation.
+    """
     try:
-        sent = await _send_offer_message(source_message, text, markup, business_connection_id=business_connection_id)
+        if not business_connection_id:
+            raise RuntimeError('Business connection отсутствует: офер не отправлен.')
+
+        sent = await _send_offer_message(
+            source_message, text, markup,
+            business_connection_id=business_connection_id,
+        )
         sent_chat_id = int(getattr(getattr(sent, 'chat', None), 'id', source_message.chat.id))
         sent_message_id = int(getattr(sent, 'message_id', 0) or 0)
         db.update_offer_message(offer_id, sent_chat_id, sent_message_id, business_connection_id)
+
+        # Delete the command only AFTER the Business-context offer is actually
+        # delivered. If Telegram blocks the send, keep the original command so
+        # the user is not left with a disappearing message and no offer.
         try:
-            await _delete_offer_command_message(source_message, business_connection_id=business_connection_id)
+            await _delete_offer_command_message(
+                source_message, business_connection_id=business_connection_id
+            )
         except Exception as delete_error:
-            log.warning('Could not delete offer command %s after sending offer %s: %s', getattr(source_message, 'message_id', '?'), offer_id, delete_error)
-        log.info('Delivered DEMO offer %s; source command=%s', offer_id, getattr(source_message, 'message_id', '?'))
+            log.warning(
+                'Could not delete offer command %s after sending offer %s: %s',
+                getattr(source_message, 'message_id', '?'), offer_id, delete_error,
+            )
+        log.info(
+            'Delivered DEMO offer %s strictly in Business chat=%s connection=%s',
+            offer_id, source_message.chat.id, business_connection_id,
+        )
+
     except OfferPeerFloodError as e:
-        # The Business identity is what Telegram has restricted. For a DEMO
-        # offer we do not need to impersonate that Business profile: the offer
-        # is only a bot-side UI simulation. First try the exact same offer as a
-        # normal bot message in the source chat. This is a delivery fallback,
-        # not an attempt to circumvent Telegram's anti-spam restriction.
+        # Safe same-chat fallback: this does NOT bypass the Business restriction
+        # or impersonate the Business profile. It simply sends the same DEMO UI
+        # as an ordinary bot message to the exact chat from the Business update.
+        # Crucially, it never targets the owner/admin DM.
         log.warning(
-            'DEMO offer %s Business delivery blocked by PEER_FLOOD chat=%s business_connection=%s',
+            'DEMO offer %s Business PEER_FLOOD chat=%s business_connection=%s; trying same-chat bot fallback',
             offer_id, e.chat_id, e.business_connection_id,
         )
         fallback = await _send_plain_chat_fallback(source_message, text, markup)
@@ -2164,35 +2167,21 @@ async def _deliver_new_offer(source_message: Message, offer_id: int, text: str, 
             sent_message_id = int(getattr(fallback, 'message_id', 0) or 0)
             db.update_offer_message(offer_id, sent_chat_id, sent_message_id, None)
             try:
-                # Best effort only: the Business delete can itself be restricted.
                 await _delete_offer_command_message(source_message, business_connection_id=business_connection_id)
             except Exception as delete_error:
-                log.info('Fallback offer %s sent, but source command was not deleted: %s', offer_id, delete_error)
+                log.warning('Could not delete offer command %s after same-chat fallback: %s', offer_id, delete_error)
             log.info(
-                'Delivered DEMO offer %s via plain-bot fallback after Business PEER_FLOOD chat=%s',
-                offer_id, source_message.chat.id,
+                'Delivered DEMO offer %s via SAME-CHAT BOT FALLBACK chat=%s (not owner DM)',
+                offer_id, sent_chat_id,
             )
             return
+        # Both allowed delivery paths failed. Keep the original command and
+        # immediately report the diagnostic in the same chat when possible.
+        await _notify_offer_delivery_error(source_message, offer_id, e)
 
-        # If the ordinary bot route is also unavailable, do not fabricate a
-        # successful offer. Keep the DB record and immediately explain the
-        # transport failure to the author.
-        error_text = (
-            '⚠️ <b>Не удалось отправить DEMO-офер.</b>\n\n'
-            'Telegram временно ограничил отправку для этого Business-профиля.\n\n'
-            f'🆔 Офер: <code>{offer_id}</code>\n'
-            'Офер сохранён и не был удалён.'
-        )
-        error_fallback = await _send_plain_chat_fallback(source_message, error_text)
-        if error_fallback:
-            log.info('OFFER ERROR SENT IN SOURCE CHAT offer=%s chat=%s', offer_id, source_message.chat.id)
-        else:
-            await _notify_offer_delivery_error(source_message, offer_id, e)
     except Exception as e:
         log.error('Failed to deliver offer %s: %s', offer_id, e, exc_info=True)
         try:
-            # Keep the offer record so it can be retried/inspected instead of
-            # destroying the DEMO state because of a transport error.
             await _notify_offer_delivery_error(source_message, offer_id, e)
         except Exception:
             log.exception('Failed to report offer delivery error offer=%s', offer_id)
