@@ -3,7 +3,6 @@
 This module only simulates an offer visually. It never transfers Stars/Gram and
 never calls Telegram payment/gift transfer APIs.
 """
-import os
 import re
 from urllib.parse import unquote
 
@@ -11,10 +10,7 @@ from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
 from ui import esc, num, pretty
 
-GIFT_RE = re.compile(
-    r'(?:https?://)?t\.me/(?:nft/)?([^/?#\s]+?)-(\d+)(?:[/?#\s]|$)',
-    re.I,
-)
+GIFT_RE = re.compile(r"(?:https?://)?t\.me/nft/([^/?#\s]+?)-(\d+)(?:[/?#\s]|$)", re.I)
 AMOUNT_RE = re.compile(r"(?P<amount>\d+(?:[.,]\d+)?)\s*(?P<currency>грам(?:м|s)?|gram(?:s)?|зв(?:езд|ёзд)?|stars?|⭐)", re.I)
 LOCALE_RU = 'ru'
 LOCALE_EN = 'en'
@@ -37,12 +33,6 @@ def _currency(raw: str):
 
 
 def parse_offer_command(text: str):
-    _clean_offer_command = (
-        text.strip()
-        .replace("\u200b", "")
-        .replace("`", "")
-        .replace("“", '"').replace("”", '"')
-    )
     text = (text or '').strip()
     m = re.match(r'^\.офер(?:\s+(.+))?$', text, re.I)
     if not m:
@@ -118,6 +108,7 @@ def keyboard(offer_id: int, locale: str, status: str = STATUS_PENDING):
 
 
 def transfer_keyboard(offer: dict, locale: str):
+    # Only the buyer transfer button remains.
     buyer_url = offer.get('transfer_profile_url') or offer.get('buyer_url')
     rows = []
     if buyer_url:
@@ -126,8 +117,6 @@ def transfer_keyboard(offer: dict, locale: str):
             icon_custom_emoji_id=TRANSFER_EMOJI_ID,
             url=buyer_url,
         )])
-    # Deliberately keep only the transfer button. The Telegraph/help URL button
-    # was removed from the DEMO offer flow.
     return InlineKeyboardMarkup(inline_keyboard=rows) if rows else None
 
 
