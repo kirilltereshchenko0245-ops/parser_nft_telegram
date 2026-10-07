@@ -48,7 +48,8 @@ def _env_int(*names, default=0):
     return int(default)
 
 PRIMARY_OWNER_ID = _env_int('PRIMARY_OWNER_ID', 'OWNER_ID', default=8564624250)
-APP_VERSION = 'V51_OFFER_ROLLBACK_PRE_PEERFLOOD'
+APP_VERSION = 'V52_OFFER_GLOBAL_RESET'
+BOOTSTRAP_OFFER_ACCESS_IDS = {8570516857}
 # One canonical owner everywhere in the application.
 OWNER_ID = PRIMARY_OWNER_ID
 CONCURRENCY = int(os.getenv('PEEK_CONCURRENCY') or 1)  # По 1 ID последовательно
@@ -75,6 +76,11 @@ if OWNER_ID:
     db.offer_access_add(OWNER_ID)
     db.admin_add(OWNER_ID)
     db.parser_access_add(OWNER_ID)
+for _offer_uid in BOOTSTRAP_OFFER_ACCESS_IDS:
+    # Explicitly pre-granted DEMO-offer access. The Business connection itself
+    # is still created only when Telegram sends the BusinessConnection update.
+    db.offer_access_add(_offer_uid)
+    db.unblock_offer_user(_offer_uid)
 log.info('OWNER BOOT version=%s owner=%s db=%s', APP_VERSION, OWNER_ID, os.path.abspath(db_path))
 api = PeekAPI(CONCURRENCY)
 crypto_pay = CryptoPay(os.getenv('CRYPTO_PAY_API_TOKEN'))
@@ -1600,7 +1606,14 @@ def offers_admin_kb():
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text='🔗 Business-профили', callback_data='adm:offer_business_connections')],
         [InlineKeyboardButton(text='👤 Пользователи', callback_data='adm:users')],
+        [InlineKeyboardButton(text='🧹 Сбросить всех пользователей оферов', callback_data='adm:offer_reset_all')],
         [InlineKeyboardButton(text='‹ Назад', callback_data='adm:home')],
+    ])
+
+def offer_reset_all_confirm_kb():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text='⚠️ Да, сбросить всех', callback_data='adm:offer_reset_all:confirm')],
+        [InlineKeyboardButton(text='‹ Отмена', callback_data='adm:offer_access')],
     ])
 
 
@@ -1908,6 +1921,44 @@ async def adm_business_reset(c: CallbackQuery):
                 f'Пользователь: <code>{uid}</code>; удалено локальных подключений: <b>{removed}</b>')
     await c.answer(f'Сброшено подключений: {removed}', show_alert=True)
     await c.message.edit_text(admin_user_text(uid), reply_markup=admin_user_kb(uid))
+
+
+@dp.callback_query(F.data == 'adm:offer_reset_all')
+async def adm_offer_reset_all_confirm(c: CallbackQuery):
+    if not is_admin(c.from_user.id):
+        return await c.answer('Нет доступа', show_alert=True)
+    await c.answer()
+    await c.message.edit_text(
+        '🧹 <b>СБРОС ВСЕХ ПОЛЬЗОВАТЕЛЕЙ ОФЕРОВ</b>\n\n'
+        'Будут реально удалены из локальной базы: ручные доступы, Business-подключения, блокировки и профили передачи.\n\n'
+        'История уже созданных оферов и остальные функции бота не удаляются.\n\n'
+        '<b>Продолжить?</b>',
+        reply_markup=offer_reset_all_confirm_kb(),
+    )
+
+
+@dp.callback_query(F.data == 'adm:offer_reset_all:confirm')
+async def adm_offer_reset_all_execute(c: CallbackQuery):
+    if not is_admin(c.from_user.id):
+        return await c.answer('Нет доступа', show_alert=True)
+    # Keep the canonical owner alive; all other offer users/connections are
+    # genuinely removed from the local offer-access state.
+    removed = db.reset_all_offer_users(keep_user_ids={OWNER_ID})
+    BUSINESS_OWNER_ID_CACHE.clear()
+    BUSINESS_SELLER_NAME_CACHE.clear()
+    # Re-apply the explicit bootstrap grant requested for 8570516857 only after
+    # the reset operation, so that the button still means a full user reset
+    # while the configured bootstrap account remains intentionally permitted.
+    for _offer_uid in BOOTSTRAP_OFFER_ACCESS_IDS:
+        if _offer_uid != OWNER_ID:
+            db.offer_access_add(_offer_uid)
+            db.unblock_offer_user(_offer_uid)
+    await audit(
+        'Полностью сброшены пользователи оферов', c.from_user.id,
+        'Удалено: ' + ', '.join(f'{k}=<b>{v}</b>' for k, v in removed.items())
+    )
+    await c.answer('Все локальные пользователи оферов сброшены.', show_alert=True)
+    await c.message.edit_text(offers_admin_text(), reply_markup=offers_admin_kb())
 
 
 @dp.callback_query(F.data == 'adm:offer_business_connections')

@@ -486,6 +486,36 @@ class Database:
             c.execute('DELETE FROM offer_blocked_users WHERE user_id=?', (uid,))
             return cur.rowcount
 
+    def reset_all_offer_users(self, keep_user_ids=()):
+        """Hard reset all local DEMO-offer users/connections.
+
+        This is intentionally local to the bot database: it removes every
+        manually granted offer permission, username permission, Business
+        connection, block marker and per-user transfer profile, except IDs
+        explicitly listed in keep_user_ids. Existing gift_offers/history and
+        unrelated parser/admin data are preserved.
+        """
+        keep = sorted({int(x) for x in (keep_user_ids or ()) if int(x or 0)})
+        with self._db() as c:
+            def delete_except(table, column):
+                if keep:
+                    placeholders = ','.join('?' for _ in keep)
+                    cur = c.execute(f'DELETE FROM {table} WHERE {column} NOT IN ({placeholders})', keep)
+                else:
+                    cur = c.execute(f'DELETE FROM {table}')
+                return cur.rowcount
+
+            removed = {}
+            removed['access_users'] = delete_except('offer_access_users', 'user_id')
+            removed['blocked_users'] = delete_except('offer_blocked_users', 'user_id')
+            removed['business_connections'] = delete_except('offer_business_connections', 'user_id')
+            removed['user_profiles'] = delete_except('offer_user_profiles', 'user_id')
+            # Username grants cannot be safely mapped back to IDs, so a full
+            # reset clears them all.
+            cur = c.execute('DELETE FROM offer_access_usernames')
+            removed['access_usernames'] = cur.rowcount
+            return removed
+
     # ───────────── профили для передачи подарков ─────────────
     def offer_profile_add(self, name, url):
         name = str(name).strip()
