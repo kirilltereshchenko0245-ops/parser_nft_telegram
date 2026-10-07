@@ -388,24 +388,6 @@ async def _send_offer_message(message: Message, text, markup=None, business_conn
                 raise
 
 
-async def _send_plain_chat_fallback(source_message: Message, text, markup=None):
-    """Try a normal bot message in the source chat, without Business identity.
-
-    This is a delivery fallback, not a flood bypass. Telegram may reject it if
-    the bot has no permission to post in that chat.
-    """
-    try:
-        return await bot.send_message(
-            chat_id=source_message.chat.id,
-            text=text,
-            reply_markup=markup,
-            link_preview_options=LinkPreviewOptions(show_above_text=True, prefer_large_media=True),
-        )
-    except Exception as e:
-        log.warning('OFFER PLAIN CHAT FALLBACK FAILED chat=%s error=%r', source_message.chat.id, e)
-        return None
-
-
 async def _delete_offer_command_message(message: Message, business_connection_id=None):
     """Delete the original .офер message after the offer is safely sent."""
     bc_id = business_connection_id or getattr(message, 'business_connection_id', None)
@@ -2169,9 +2151,9 @@ async def demo_offer_command(m: Message):
 async def _deliver_new_offer(source_message: Message, offer_id: int, text: str, markup, business_connection_id=None):
     """Deliver a DEMO offer strictly in the originating Business chat.
 
-    IMPORTANT: never fall back to a plain bot message for the OFFER itself.
-    A plain bot send can land in the bot DM / wrong context and was the reason
-    users saw the offer in the bot instead of in the Business conversation.
+    There is deliberately NO normal-bot fallback for the offer itself.
+    The offer must be sent through the Business connection so the message
+    belongs to the connected Business profile.
     """
     try:
         if not business_connection_id:
@@ -2185,9 +2167,6 @@ async def _deliver_new_offer(source_message: Message, offer_id: int, text: str, 
         sent_message_id = int(getattr(sent, 'message_id', 0) or 0)
         db.update_offer_message(offer_id, sent_chat_id, sent_message_id, business_connection_id)
 
-        # Delete the command only AFTER the Business-context offer is actually
-        # delivered. If Telegram blocks the send, keep the original command so
-        # the user is not left with a disappearing message and no offer.
         try:
             await _delete_offer_command_message(
                 source_message, business_connection_id=business_connection_id
@@ -2203,32 +2182,13 @@ async def _deliver_new_offer(source_message: Message, offer_id: int, text: str, 
         )
 
     except OfferPeerFloodError as e:
-        # Safe same-chat fallback: this does NOT bypass the Business restriction
-        # or impersonate the Business profile. It simply sends the same DEMO UI
-        # as an ordinary bot message to the exact chat from the Business update.
-        # Crucially, it never targets the owner/admin DM.
+        # Important: do not redirect the offer to the bot DM or use a normal
+        # bot-message fallback. Report the failure in the originating chat.
         log.warning(
-            'DEMO offer %s Business PEER_FLOOD chat=%s business_connection=%s; trying same-chat bot fallback',
+            'DEMO offer %s Business PEER_FLOOD chat=%s business_connection=%s',
             offer_id, e.chat_id, e.business_connection_id,
         )
-        fallback = await _send_plain_chat_fallback(source_message, text, markup)
-        if fallback:
-            sent_chat_id = int(getattr(getattr(fallback, 'chat', None), 'id', source_message.chat.id))
-            sent_message_id = int(getattr(fallback, 'message_id', 0) or 0)
-            db.update_offer_message(offer_id, sent_chat_id, sent_message_id, None)
-            try:
-                await _delete_offer_command_message(source_message, business_connection_id=business_connection_id)
-            except Exception as delete_error:
-                log.warning('Could not delete offer command %s after same-chat fallback: %s', offer_id, delete_error)
-            log.info(
-                'Delivered DEMO offer %s via SAME-CHAT BOT FALLBACK chat=%s (not owner DM)',
-                offer_id, sent_chat_id,
-            )
-            return
-        # Both allowed delivery paths failed. Keep the original command and
-        # immediately report the diagnostic in the same chat when possible.
         await _notify_offer_delivery_error(source_message, offer_id, e)
-
     except Exception as e:
         log.error('Failed to deliver offer %s: %s', offer_id, e, exc_info=True)
         try:
@@ -2256,8 +2216,12 @@ async def demo_offer_action(c: CallbackQuery):
             return await c.answer('Сообщение офера недоступно.', show_alert=True)
 
         locale = offer['locale'] or 'ru'
-        old_message = c.message
-        bc_id = offer.get('business_connection_id') or getattr(old_message, 'business_connection_id', None)
+        message = c.message
+        bc_id = (
+            getattr(c, 'business_connection_id', None)
+            or offer.get('business_connection_id')
+            or getattr(message, 'business_connection_id', None)
+        )
 
         if action == 'accept':
             new_text = final_offer_text(offer, locale)
@@ -2270,67 +2234,76 @@ async def demo_offer_action(c: CallbackQuery):
             alert = None
             new_status = STATUS_DECLINED
 
-        # Close the callback immediately. The state change below is done by
-        # sending a NEW message, never by editMessageText. This prevents the
-        # Telegram client from showing the "edited/изменено" marker.
+        # Variant A: keep ONE message and edit it in the same Business context.
+        # This intentionally may show Telegram's normal "edited" marker.
         try:
             await c.answer(alert, show_alert=True) if alert else await c.answer()
         except Exception:
             pass
 
         try:
-            # Send the final state as a fresh message first, so the offer is
-            # never lost if Telegram rejects the subsequent deletion.
-            sent = await _send_offer_message(
-                old_message,
-                new_text,
-                new_markup,
-                business_connection_id=bc_id,
-            )
-            sent_chat_id = int(getattr(getattr(sent, 'chat', None), 'id', old_message.chat.id))
-            sent_message_id = int(getattr(sent, 'message_id', 0) or 0)
-
-            # Only after the replacement exists, remove the old interactive
-            # offer. The resulting message is therefore completely new and
-            # has no Telegram "изменено" label.
-            try:
-                if bc_id:
-                    await safe(
-                        bot.delete_business_messages,
-                        business_connection_id=bc_id,
-                        message_ids=[old_message.message_id],
-                    )
-                else:
-                    await safe(
-                        bot.delete_message,
-                        chat_id=old_message.chat.id,
-                        message_id=old_message.message_id,
-                    )
-            except Exception as delete_error:
-                # Keeping the old message is preferable to losing the final
-                # state. Its buttons will still be guarded by DB status.
-                log.warning(
-                    'Could not delete old offer %s after replacement: %s',
-                    offer_id,
-                    delete_error,
+            if bc_id:
+                edited = await bot.edit_message_text(
+                    chat_id=message.chat.id,
+                    message_id=message.message_id,
+                    text=new_text,
+                    reply_markup=new_markup,
+                    business_connection_id=bc_id,
+                    link_preview_options=LinkPreviewOptions(
+                        show_above_text=True,
+                        prefer_large_media=True,
+                    ),
+                )
+            else:
+                edited = await bot.edit_message_text(
+                    chat_id=message.chat.id,
+                    message_id=message.message_id,
+                    text=new_text,
+                    reply_markup=new_markup,
+                    link_preview_options=LinkPreviewOptions(
+                        show_above_text=True,
+                        prefer_large_media=True,
+                    ),
                 )
 
-            db.update_offer_message(offer_id, sent_chat_id, sent_message_id, bc_id)
+            db.update_offer_message(
+                offer_id,
+                int(message.chat.id),
+                int(message.message_id),
+                bc_id,
+            )
             db.set_offer_status(offer_id, new_status)
             log.info(
-                'Offer %s moved to %s using a new message (no edit)',
-                offer_id,
-                new_status,
+                'Offer %s moved to %s by EDITING SAME MESSAGE chat=%s message=%s connection=%s',
+                offer_id, new_status, message.chat.id, message.message_id, bc_id,
             )
         except TelegramRetryAfter as e:
             log.warning(
-                'Could not create replacement for offer %s: flood retry_after=%s',
-                offer_id,
-                getattr(e, 'retry_after', '?'),
+                'Could not edit offer %s: flood retry_after=%s',
+                offer_id, getattr(e, 'retry_after', '?'),
             )
+            try:
+                await c.answer(
+                    f'Telegram временно ограничил изменение сообщения. Повторите через {getattr(e, "retry_after", "несколько")} сек.',
+                    show_alert=True,
+                )
+            except Exception:
+                pass
+        except TelegramBadRequest as e:
+            if 'PEER_FLOOD' in str(e).upper():
+                log.warning('Offer %s edit PEER_FLOOD connection=%s chat=%s', offer_id, bc_id, message.chat.id)
+            else:
+                log.exception('Could not edit offer %s after %s', offer_id, action)
+            try:
+                await c.answer('Не удалось обновить офер. Попробуйте ещё раз.', show_alert=True)
+            except Exception:
+                pass
         except Exception:
-            log.exception('Could not replace offer %s after %s', offer_id, action)
-
+            log.exception('Could not edit offer %s after %s', offer_id, action)
+            try:
+                await c.answer('Не удалось обновить офер. Попробуйте ещё раз.', show_alert=True)
+            except Exception:
+                pass
 
 
 
