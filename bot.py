@@ -1653,6 +1653,7 @@ def admin_user_kb(uid):
         [InlineKeyboardButton(text='💎 Выдать 2 дня Premium', callback_data=f'adm:grant:premium:{uid}:172800')],
         [InlineKeyboardButton(text='📡 Выдать 24ч парсера чатов', callback_data=f'adm:grant:chat:{uid}:86400')],
         [InlineKeyboardButton(text='🎁 Выдать 5 дней оферов', callback_data=f'adm:grant:offers:{uid}:432000')],
+        [InlineKeyboardButton(text='♻️ Сбросить Business-сессии', callback_data=f'adm:business_reset:{uid}')],
         [InlineKeyboardButton(text='🔎 Выдать доступ к парсеру', callback_data=f'adm:parser_user:add:{uid}')],
         [InlineKeyboardButton(text='🚫 Снять ручной доступ к парсеру', callback_data=f'adm:parser_user:remove:{uid}')],
         [InlineKeyboardButton(text=('🛡 Снять администратора' if admin_target else '🛡 Сделать администратором'), callback_data=f'adm:admin_toggle:{uid}')],
@@ -1958,15 +1959,50 @@ async def adm_log_channel_value(m: Message, state: FSMContext):
 
 # Admin: Business-профили оферов.
 def admin_business_connections_kb():
-    rows=db.business_connections_list(); buttons=[]
-    for row in rows[:30]:
-        uid=int(row['user_id']); name=(' @'+row['username']) if row.get('username') else (row.get('first_name') or str(uid))
-        blocked=db.offer_user_blocked(uid)
-        action='🟢 Разрешить' if blocked else '🔴 Заблокировать'
-        action_cb='unblock' if blocked else 'block'
-        buttons.append([InlineKeyboardButton(text=f'{action} · {str(name).strip()[:20]}',callback_data=f'adm:offer_conn:{action_cb}:{uid}')])
-    buttons.append([InlineKeyboardButton(text='‹ Назад',callback_data='adm:offer_access')])
+    rows = db.business_connections_list()
+    buttons = []
+    # Show one row per Business owner. Older duplicate connection records are
+    # intentionally hidden here; the per-user reset button removes them.
+    seen = set()
+    for row in rows[:100]:
+        uid = int(row['user_id'])
+        if uid in seen:
+            continue
+        seen.add(uid)
+        name = (' @' + row['username']) if row.get('username') else (row.get('first_name') or str(uid))
+        blocked = db.offer_user_blocked(uid)
+        action = '🟢 Разрешить' if blocked else '🔴 Заблокировать'
+        action_cb = 'unblock' if blocked else 'block'
+        buttons.append([InlineKeyboardButton(
+            text=f'{action} · {str(name).strip()[:20]}',
+            callback_data=f'adm:offer_conn:{action_cb}:{uid}'
+        )])
+    buttons.append([InlineKeyboardButton(text='‹ Назад', callback_data='adm:offer_access')])
     return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+@dp.callback_query(F.data.regexp(r'^adm:business_reset:-?\d+$'))
+async def adm_business_reset(c: CallbackQuery):
+    if not is_admin(c.from_user.id):
+        return await c.answer('Нет доступа', show_alert=True)
+    uid = int(c.data.split(':')[2])
+    u = db.get_user(uid)
+    if not u:
+        return await c.answer('Пользователь не найден', show_alert=True)
+
+    removed = db.reset_business_sessions(uid)
+    BUSINESS_OWNER_ID_CACHE_KEYS = [k for k, v in BUSINESS_OWNER_ID_CACHE.items() if int(v or 0) == uid]
+    for key in BUSINESS_OWNER_ID_CACHE_KEYS:
+        BUSINESS_OWNER_ID_CACHE.pop(key, None)
+        BUSINESS_SELLER_NAME_CACHE.pop(key, None)
+
+    # Keep the user's offer permission/paid entitlement. The reset is only a
+    # local session cleanup; the next Business update will create one fresh row.
+    db.offer_access_add(uid)
+    await audit('Сброшены Business-сессии офера', c.from_user.id,
+                f'Пользователь: <code>{uid}</code>; удалено локальных подключений: <b>{removed}</b>')
+    await c.answer(f'Сброшено подключений: {removed}', show_alert=True)
+    await c.message.edit_text(admin_user_text(uid), reply_markup=admin_user_kb(uid))
+
 
 @dp.callback_query(F.data == 'adm:offer_business_connections')
 async def adm_offer_business_connections(c: CallbackQuery):

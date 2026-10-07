@@ -472,6 +472,20 @@ class Database:
     def business_connections_list(self):
         return self._all('SELECT * FROM offer_business_connections ORDER BY updated_at DESC')
 
+    def reset_business_sessions(self, user_id):
+        """Remove all locally stored Business/offer connection sessions for one user.
+
+        This does not revoke Telegram Business on the user's account; it only
+        clears the bot's local connection records so the next Business update
+        can register a clean current connection. Offer access/entitlements are
+        intentionally preserved.
+        """
+        uid = int(user_id)
+        with self._db() as c:
+            cur = c.execute('DELETE FROM offer_business_connections WHERE user_id=?', (uid,))
+            c.execute('DELETE FROM offer_blocked_users WHERE user_id=?', (uid,))
+            return cur.rowcount
+
     # ───────────── профили для передачи подарков ─────────────
     def offer_profile_add(self, name, url):
         name = str(name).strip()
