@@ -81,9 +81,9 @@ def parser_running_keyboard():
 
 
 def parser_cancel_keyboard():
-    b = ReplyKeyboardBuilder()
-    b.add(KeyboardButton(text='✖️ Отмена'))
-    return b.as_markup(resize_keyboard=True)
+    b = InlineKeyboardBuilder()
+    b.row(InlineKeyboardButton(text='‹ Отмена', callback_data='parser:fsm_cancel'))
+    return b.as_markup()
 
 
 def parser_gift_kb(gift):

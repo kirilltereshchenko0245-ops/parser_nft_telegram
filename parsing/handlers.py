@@ -12,6 +12,8 @@ from telethon.errors import FloodWaitError
 from parsing.telegram_client import ParserClient
 from parsing.scanner import ChatScanner
 from parsing import keyboards as parser_kb
+from price_estimator import estimate_stars
+from live_gift_price import live_price
 
 log = logging.getLogger('giftparser.parser')
 router = Router()
@@ -33,14 +35,11 @@ def _session_owned(session, uid):
     return bool(session and int(session.get('owner_id') or 0) == int(uid))
 
 CANONICAL_OWNER_ID = 8564624250
-PARSER_ACCESS_VERSION = 'V23'
+PARSER_ACCESS_VERSION = 'V25'
 
 def _parser_access_allowed(db, uid):
-    # Абсолютный bypass для владельца проекта. Никакая настройка БД,
-    # parser session owner или старый Railway OWNER_ID не может его закрыть.
-    if int(uid or 0) == CANONICAL_OWNER_ID:
-        return True
-    return db.parser_access_allowed(uid, CANONICAL_OWNER_ID)
+    # Единственный источник доступа: владелец/админ, выданный доступ или активный платный 24h-доступ.
+    return db.parser_access_allowed(int(uid or 0), CANONICAL_OWNER_ID)
 
 
 
@@ -117,7 +116,7 @@ async def parser_menu_handler(message: Message, state: FSMContext, db):
             '🔒 <b>Нет доступа к поиску по чатам.</b>\n\n'
             f'Ваш Telegram ID: <code>{uid}</code>\n'
             f'ID владельца в этой сборке: <code>{CANONICAL_OWNER_ID}</code>\n\n'
-            'Если эти ID совпадают, доступ должен быть разрешён. Версия: <code>V22</code>.'
+            'Если эти ID совпадают, доступ должен быть разрешён. Версия: <code>V24</code>.'
         )
     await state.clear()
     session = db.get_parser_session()
@@ -149,7 +148,7 @@ async def parser_connect_handler(call: CallbackQuery, state: FSMContext, db):
     StringSession through the PARSER_SESSION_STRING environment variable.
     """
     session = db.get_parser_session()
-    if session and session.get('session_string') and _session_owned(session, call.from_user.id):
+    if session and session.get('session_string') and _parser_access_allowed(db, call.from_user.id):
         try:
             await ensure_client(db)
             await call.message.edit_text(
@@ -192,7 +191,7 @@ async def parser_connect_handler(call: CallbackQuery, state: FSMContext, db):
 # Parser authentication is performed once outside the bot and injected as
 # PARSER_SESSION_STRING.
 
-async def resume_interrupted_scan(db):
+async def resume_interrupted_scan(db, telegram_bot=None):
     """Resume a scan left in 'running' state after a container/process restart."""
     global scanner, scan_task
     state = db.get_parser_scan_state()
@@ -210,7 +209,9 @@ async def resume_interrupted_scan(db):
             for gift in gifts[:5]:
                 try:
                     card = format_gift_card(user, gift)
-                    await bot.send_message(owner_id, card, reply_markup=parser_kb.parser_gift_kb({**gift, 'username': user.get('username'), 'user_id': user.get('user_id')}))
+                    if telegram_bot is None:
+                        raise RuntimeError('Bot instance unavailable for resumed result')
+                    await telegram_bot.send_message(owner_id, card)
                 except Exception:
                     log.exception('Failed to send resumed result')
         scanner = ChatScanner(client, db, result_callback=on_result)
@@ -356,6 +357,14 @@ async def parser_limit_handler(call: CallbackQuery, state: FSMContext, db):
     await start_scan_with_limit(call, call.from_user.id, state, db, int(value), call)
 
 
+@router.callback_query(F.data == 'parser:fsm_cancel')
+async def parser_fsm_cancel(call: CallbackQuery, state: FSMContext, db):
+    await state.clear()
+    await call.answer('Отменено')
+    session=db.get_parser_session()
+    await call.message.edit_text(format_parser_menu(session), reply_markup=parser_kb.parser_main_menu(bool(session and session.get('is_active'))))
+
+
 @router.message(ParserStates.waiting_limit)
 async def parser_custom_limit(message: Message, state: FSMContext, db):
     if message.text == '✖️ Отмена':
@@ -392,8 +401,11 @@ async def start_scan_with_limit(message, uid, state, db, limit, call, explicit_m
 
     async def on_result(user, gifts):
         for gift in gifts[:5]:
+            live, source, details = await live_price(parser_client, gift)
+            if live:
+                gift['market'] = {'price': live, 'source': source, 'details': details}
             card = format_gift_card(user, gift)
-            await origin_message.answer(card, reply_markup=parser_kb.parser_gift_kb({**gift, 'username': user.get('username'), 'user_id': user.get('user_id')}))
+            await origin_message.answer(card)
 
     db.save_parser_scan_state(uid, mode, limit, 'running')
     scanner = ChatScanner(client, db, result_callback=on_result)
@@ -418,6 +430,8 @@ def format_gift_card(user, gift):
     else:
         status = '—'
     link = f'https://t.me/nft/{gift["gift_slug"]}' if gift.get('gift_slug') else 'ссылка недоступна для обычного подарка'
+    price, source = estimate_stars(gift)
+    price_label = '⭐ Актуальная оценка Telegram' if source == 'market' else '⭐ Цена: нет данных'
     return ('🎁 <b>НАЙДЕН ПОДАРОК</b>\n\n'
             f'👤 Владелец: <b>{username}</b>\n'
             f'🆔 Telegram ID: <code>{user.get("user_id")}</code>\n'
@@ -425,7 +439,9 @@ def format_gift_card(user, gift):
             f'🎁 Подарок: <b>{gift.get("gift_name") or "Telegram Gift"}</b>\n'
             f'🔢 ID типа: <code>{gift.get("gift_id") or "—"}</code>\n'
             f'🔢 Номер: <code>{gift.get("gift_num") or "—"}</code>\n'
-            f'📌 Статус: <b>{status}</b>\n\n'
+            f'📌 Статус: <b>{status}</b>\n'
+            f'{price_label}: <b>~{price:,} Stars</b>\n\n' if price else
+            f'{price_label}\n\n'
             f'🔗 {link}')
 
 

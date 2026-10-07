@@ -108,6 +108,12 @@ def gift_card(g: dict) -> str:
     if rows:
         parts.append(block(*rows))
 
+    if g.get('estimated_stars'):
+        label = 'Рыночная оценка' if g.get('price_source') == 'market' else 'Примерная оценка'
+        parts.append(f'⭐ <b>{label}:</b> ~{int(g["estimated_stars"]):,} Stars'.replace(',', ' '))
+        if g.get('price_source') != 'market':
+            parts.append('<i>Оценка учитывает модель, фон, узор и доступные данные редкости.</i>')
+
     if g.get('username'):
         u = esc(g['username'])
         parts.append(f'👤 <a href="https://t.me/{u}">@{u}</a>')
@@ -294,4 +300,66 @@ def models_text(page: int, pages: int) -> str:
     return (
         f'🎁 <b>{small("Models")} · Каталог моделей</b>\n'
         f'<i>Нажмите на модель — и сразу введёте диапазон · стр. {page}/{pages}</i>'
+    )
+
+# ───────────────────────── V24 redesign ─────────────────────────
+def v24_welcome(first_name='Дизейбл', admin=False):
+    return (
+        'Привет, <b>Дизейбл</b>! 👋\n\n'
+        'Рады видеть тебя в <b>GiftParser</b> 🎁\n\n'
+        'Выбери действие ниже 👇'
+    )
+
+def v24_profile(user: dict, uid: int, username=None, admin=False, premium_until=None, chat_until=None, offer_until=None):
+    lines = [
+        f'🆔 <code>{uid}</code>',
+        f'👤 {esc("@" + username) if username else "Без username"}',
+        f'🔎 Обычный парсер: <b>{user.get("trial_regular_left", 20)}/20</b>',
+        f'🎲 Случайный: <b>{user.get("trial_random_left", 20)}/20</b>',
+        f'🆔 Поиск по ID: <b>{user.get("trial_id_left", 20)}/20</b>',
+    ]
+    if admin:
+        lines.append('👑 <b>Владелец / администратор</b>')
+    else:
+        if premium_until:
+            lines.append(f'💎 Премиум до: <code>{esc(str(premium_until)[:19].replace("T", " "))}</code>')
+        if chat_until:
+            lines.append(f'📡 Чаты до: <code>{esc(str(chat_until)[:19].replace("T", " "))}</code>')
+        if offer_until:
+            lines.append(f'🎁 Оферы до: <code>{esc(str(offer_until)[:19].replace("T", " "))}</code>')
+    return '👤 <b>ПРОФИЛЬ</b>\n\n' + block(*lines)
+
+
+def v24_premium():
+    return (
+        '💎 <b>ПРЕМИУМ</b>\n\n'
+        'Выбери доступ, который нужен:\n\n'
+        '⚡ <b>7 TON · 2 дня</b>\n'
+        'Обычный парсер + случайный + поиск по ID.\n'
+        'Оферы и парсер чатов не входят.\n\n'
+        '📡 <b>10 TON · 24 часа</b>\n'
+        'Полный доступ к парсеру чатов.\n\n'
+        '🎁 <b>25 TON · 5 дней</b>\n'
+        'Полный доступ к оферам.\n\n'
+        'Оплата через CryptoBot в TON. После оплаты доступ включится автоматически.'
+    )
+
+
+def v24_offers(available=False, until=None):
+    if available:
+        tail = f'\n\n⏳ Доступ до: <code>{esc(str(until)[:19].replace("T", " "))}</code>' if until else ''
+        return '🎁 <b>ОФЕРЫ</b>\n\n🟢 Доступ активен.' + tail + '\n\nНастрой профиль передачи и используй оферы в Business-аккаунте.'
+    return '🎁 <b>ОФЕРЫ</b>\n\n🔒 Доступ закрыт.\n\nОткрывается покупкой пакета <b>25 TON · 5 дней</b> в разделе «Премиум».'
+
+
+def v24_install():
+    return (
+        '📖 <b>ИНСТРУКЦИЯ ПО УСТАНОВКЕ ОФЕРОВ</b>\n\n'
+        '1. Открой Telegram → Настройки.\n'
+        '2. Открой раздел <b>Telegram Business</b>.\n'
+        '3. Подключи GiftParser как Business-бота.\n'
+        '4. Вернись в GiftParser и дождись подтверждения подключения.\n'
+        '5. Открой «Оферы» и настрой профиль передачи.\n'
+        '6. Для создания предложения используй команду <code>.офер</code> в Business-чате.\n\n'
+        '⚠️ Оферы в этом боте — DEMO-интерфейс: подарок и TON вручную не переводятся ботом.'
     )

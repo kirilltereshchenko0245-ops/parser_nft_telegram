@@ -4,6 +4,7 @@ import os
 import random
 import re
 import time
+from pathlib import Path
 from datetime import datetime, timezone, timedelta
 
 from aiogram import Bot, Dispatcher, F
@@ -14,15 +15,19 @@ from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
-from aiogram.types import BotCommand, BufferedInputFile, BusinessConnection, CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, LinkPreviewOptions, Message
+from aiogram.types import BotCommand, BufferedInputFile, BusinessConnection, CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, LinkPreviewOptions, Message, ReplyKeyboardRemove
 from dotenv import load_dotenv
 
 import keyboards as kb
 import ui
 from database import Database
 from peek_api import AVAILABLE_MODELS, PeekAPI, gift_url, is_known_model, normalize_model_name, suggest_models
+from gift_catalog import GIFT_CATALOG, GIFT_MODELS, GIFT_BY_API, GIFT_PAGE_SIZE
+from price_estimator import estimate_stars
+from live_gift_price import live_price
+from payments import CryptoPay, XRocketPay
 from parsing import handlers as parser_handlers
-from offer_simulator import (parse_offer_command, offer_help_text, keyboard as offer_keyboard, build_offer_text, accepted_alert_text, final_offer_text, declined_text, transfer_keyboard, STATUS_PENDING, STATUS_ACCEPTED, STATUS_DECLINED)
+from offer_simulator import (parse_offer_command, offer_help_text, keyboard as offer_keyboard, build_offer_text, gift_title, accepted_alert_text, final_offer_text, declined_text, transfer_keyboard, STATUS_PENDING, STATUS_ACCEPTED, STATUS_DECLINED)
 
 load_dotenv()
 os.makedirs('logs', exist_ok=True)
@@ -30,9 +35,22 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s | %(levelname)s | %(
 log = logging.getLogger('giftparser')
 
 TOKEN = os.getenv('BOT_TOKEN')
-PRIMARY_OWNER_ID = 8564624250
-APP_VERSION = 'V23_PARSER_ACCESS_SINGLE_SOURCE'
-# Canonical project owner. This is intentionally independent of a stale Railway OWNER_ID.
+# Canonical owner comes from Railway/Environment variables.
+# PRIMARY_OWNER_ID has priority when explicitly set; OWNER_ID remains a compatible fallback.
+def _env_int(*names, default=0):
+    for name in names:
+        raw = os.getenv(name)
+        if raw is not None and str(raw).strip():
+            try:
+                return int(str(raw).strip())
+            except ValueError:
+                pass
+    return int(default)
+
+PRIMARY_OWNER_ID = _env_int('PRIMARY_OWNER_ID', 'OWNER_ID', default=8564624250)
+APP_VERSION = 'V59_OFFER_FIXED_V7'
+BOOTSTRAP_OFFER_ACCESS_IDS = set()
+# One canonical owner everywhere in the application.
 OWNER_ID = PRIMARY_OWNER_ID
 CONCURRENCY = int(os.getenv('PEEK_CONCURRENCY') or 1)  # По 1 ID последовательно
 if not TOKEN:
@@ -42,7 +60,7 @@ MAX_RANGE = 10_000        # максимум ID за один поиск
 MAX_LIVE_CARDS = 30       # сколько карточек присылать «вживую» во время поиска
 EDIT_INTERVAL = 1.5       # не чаще раза в N секунд обновляем статус (защита от flood)
 GIFT_REQUEST_DELAY = float(os.getenv('GIFT_REQUEST_DELAY', '5'))
-LOG_CHANNEL_ID = int(os.getenv('LOG_CHANNEL_ID', '-1003864916255'))
+LOG_CHANNEL_ID = int(os.getenv('LOG_CHANNEL_ID', '0') or 0)
 LOG_CHANNEL_DISABLED = False
 API_REQUEST_LOCK = asyncio.Lock()
 NEXT_API_REQUEST_AT = 0.0
@@ -51,20 +69,38 @@ bot = Bot(TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 dp = Dispatcher(storage=MemoryStorage())
 db_path = os.getenv('DATABASE_PATH') or (os.path.join(os.getenv('RAILWAY_VOLUME_MOUNT_PATH'), 'bot_database.db') if os.getenv('RAILWAY_VOLUME_MOUNT_PATH') else 'bot_database.db')
 db = Database(db_path)
+if not db.get_setting('log_channel_id') and LOG_CHANNEL_ID:
+    db.set_setting('log_channel_id', str(LOG_CHANNEL_ID))
 if OWNER_ID:
+    # Bootstrap/migrate the current owner into every owner-level permission table.
     db.offer_access_add(OWNER_ID)
     db.admin_add(OWNER_ID)
-db.admin_add(PRIMARY_OWNER_ID)
-db.parser_access_add(PRIMARY_OWNER_ID)
-log.info('PARSER ACCESS BOOT version=%s owner=%s db=%s', APP_VERSION, PRIMARY_OWNER_ID, os.path.abspath(db_path))
+    db.parser_access_add(OWNER_ID)
+# V7 one-time clean offer reset. Set OFFER_DB_RESET_V7=1 for the first deploy;
+# after the reset the flag is recorded in bot_settings so restarts do not wipe data again.
+if os.getenv('OFFER_DB_RESET_V7', '0').strip().lower() in {'1','true','yes'} and db.get_setting('offer_db_reset_v7_done') != '1':
+    try:
+        reset_result = db.reset_offer_state_v7(keep_user_ids={OWNER_ID})
+        db.offer_access_add(OWNER_ID)
+        db.unblock_offer_user(OWNER_ID)
+        db.set_setting('offer_db_reset_v7_done', '1')
+        log.warning('V7 OFFER DB RESET COMPLETE: %s', reset_result)
+    except Exception:
+        log.exception('V7 OFFER DB RESET FAILED')
+log.info('OWNER BOOT version=%s owner=%s db=%s', APP_VERSION, OWNER_ID, os.path.abspath(db_path))
 api = PeekAPI(CONCURRENCY)
+crypto_pay = CryptoPay(os.getenv('CRYPTO_PAY_API_TOKEN'))
+xrocket_pay = XRocketPay(os.getenv('XROCKET_PAY_API_TOKEN'))
 ACTIVE: set[int] = set()  # пользователи с запущенным поиском
 OFFER_ACTION_LOCKS: dict[int, asyncio.Lock] = {}
 OFFER_CHAT_SEND_LOCKS: dict[int, asyncio.Lock] = {}
 OFFER_SEND_GATE = asyncio.Lock()
 OFFER_SEND_LAST_AT = 0.0
 OFFER_SEND_BLOCKED_UNTIL = 0.0
-OFFER_SEND_INTERVAL = float(os.getenv('OFFER_SEND_INTERVAL', '1.25'))
+OFFER_SEND_INTERVAL = float(os.getenv('OFFER_SEND_INTERVAL', '4.0'))
+OFFER_PEER_FLOOD_RETRIES = int(os.getenv('OFFER_PEER_FLOOD_RETRIES', '6'))
+OFFER_PEER_FLOOD_BASE_DELAY = float(os.getenv('OFFER_PEER_FLOOD_BASE_DELAY', '30'))
+OFFER_ERROR_NOTIFY_ENABLED = os.getenv('OFFER_ERROR_NOTIFY_ENABLED', '1').strip().lower() not in {'0','false','no'}
 OFFER_DELIVERY_TASKS: set[asyncio.Task] = set()
 BUSINESS_SELLER_NAME_CACHE: dict[str, str] = {}
 BUSINESS_OWNER_ID_CACHE: dict[str, int] = {}
@@ -94,8 +130,13 @@ class S(StatesGroup):
     offer_access_username_add = State()
     offer_user_profile_name = State()
     offer_user_profile_url = State()
+    catalog_query = State()
     admin_user_profile_name = State()
     admin_user_profile_url = State()
+    admin_broadcast = State()
+    admin_log_channel = State()
+    admin_broadcast_audience = State()
+    admin_tariff = State()
 
 
 # ───────────────────────── помощники ─────────────────────────
@@ -107,20 +148,74 @@ def is_admin(uid):
 
 
 def is_unlimited(uid):
-    return is_admin(uid) or bool((db.get_user(uid) or {}).get('is_premium'))
+    return is_admin(uid) or db.entitlement_active(uid, 'premium') or bool((db.get_user(uid) or {}).get('is_premium'))
 
 
 def user_menu(uid):
-    parser_visible = is_owner(uid) or is_admin(uid) or db.parser_access_allowed(uid, OWNER_ID)
-    return kb.main_menu(is_admin(uid), bool((db.get_user(uid) or {}).get('is_premium')), parser_visible)
+    return kb.inline_main_menu(is_admin(uid), is_unlimited(uid))
 
 
 def trial_left(uid):
-    return int((db.get_user(uid) or {}).get('trial_searches_left', ui.TRIAL_DEFAULT))
+    return db.trial_left(uid, 'regular')
 
 
 def allowed(uid, count):
     return is_unlimited(uid) or count <= trial_left(uid)
+
+
+def trial_allowed(uid, kind, count=1):
+    return is_unlimited(uid) or db.trial_left(uid, kind) >= int(count)
+
+
+def chat_parser_allowed(uid):
+    return is_admin(uid) or db.parser_access_allowed(uid, OWNER_ID)
+
+
+def offers_paid(uid):
+    return is_admin(uid) or db.entitlement_active(uid, 'offers')
+
+
+def offer_ready_for_user(uid, username=None, business_connection_id=None):
+    """Return whether an active Business connection may send DEMO offers.
+
+    Business offers are enabled by default for an active connection. The only
+    local deny-list is ``offer_blocked_users``; this prevents the old V58/V59
+    access gate from silently swallowing every `.офер` while `.привет` keeps
+    working. The admin UI can still explicitly block a Business owner.
+    """
+    uid = int(uid or 0)
+    bc = db.get_business_connection(business_connection_id) if business_connection_id else db.get_business_connection_for_user(uid)
+    if not bc or not bool(bc.get('is_enabled', 1)):
+        return False
+    # Explicit user block wins. Do not use the stale per-connection
+    # ``is_blocked`` flag as an implicit deny: V58/V59 left many valid
+    # connections with that flag set and made `.офер` silently return.
+    row = db._one('SELECT 1 AS ok FROM offer_blocked_users WHERE user_id=?', (uid,)) if uid else None
+    if row:
+        return False
+    # Repair legacy connection rows on first successful use.
+    if bool(bc.get('is_blocked', 0)):
+        db.unblock_offer_user(uid)
+    return True
+
+
+def tariff_config():
+    defaults = {
+        'premium_2d': ('7', 'premium', 172800, 'Премиум · 2 дня'),
+        'chat_24h': ('10', 'chat', 86400, 'Парсер чатов · 24 часа'),
+        'offers_5d': ('25', 'offers', 432000, 'Оферы · 5 дней'),
+    }
+    out = {}
+    for key, (amount, kind, seconds, title) in defaults.items():
+        raw = db.get_setting('tariff_' + key)
+        try:
+            amount = str(float(raw)) if raw is not None else amount
+            if amount.endswith('.0'): amount = amount[:-2]
+            if float(amount) <= 0: raise ValueError
+        except Exception:
+            pass
+        out[key] = (amount, kind, seconds, title)
+    return out
 
 
 async def safe(fn, *args, **kwargs):
@@ -206,7 +301,11 @@ async def send_card(target: Message, uid: int, g: dict, large=False):
     else:
         lp = LinkPreviewOptions(is_disabled=True)
     fav = db.is_favorite(uid, g.get('giftNumber'), name)
-    return await safe(target.answer, ui.gift_card(g), reply_markup=kb.gift_kb(g, fav), link_preview_options=lp)
+    stars, source = estimate_stars(g)
+    gg = dict(g)
+    gg['estimated_stars'] = stars
+    gg['price_source'] = source
+    return await safe(target.answer, ui.gift_card(gg), link_preview_options=lp)
 
 
 def no_preview():
@@ -250,10 +349,7 @@ async def _send_offer_message(message: Message, text, markup=None, business_conn
                         chat_id=message.chat.id,
                         text=text,
                         reply_markup=markup,
-                        # The offer text intentionally contains no NFT URL.
-                        # Keep previews disabled so Telegram cannot attach a
-                        # preview to any accidental URL in the payload.
-                        link_preview_options=LinkPreviewOptions(is_disabled=True),
+                        link_preview_options=LinkPreviewOptions(show_above_text=True, prefer_large_media=True),
                     )
                     bc_id = business_connection_id or getattr(message, 'business_connection_id', None)
                     if bc_id:
@@ -313,22 +409,28 @@ async def _business_seller_display_name(business_connection_id):
 # ───────────────────────── аудит / логи ─────────────────────────
 async def audit(action: str, uid: int | None = None, details: str = ''):
     global LOG_CHANNEL_DISABLED
-    if LOG_CHANNEL_DISABLED or not LOG_CHANNEL_ID:
+    channel_raw = db.get_setting('log_channel_id') or LOG_CHANNEL_ID
+    try:
+        channel_id = int(channel_raw)
+    except (TypeError, ValueError):
+        return
+    if LOG_CHANNEL_DISABLED or not channel_id:
         return
     actor = f'<code>{uid}</code>' if uid is not None else '<code>system</code>'
     text = f'🧾 <b>{ui.esc(action)}</b>\n👤 {actor}'
     if details:
         text += f'\n{details}'
     try:
-        await safe(bot.send_message, LOG_CHANNEL_ID, text, disable_web_page_preview=True)
+        await safe(bot.send_message, channel_id, text, disable_web_page_preview=True)
     except TelegramBadRequest as e:
-        if 'chat not found' in str(e).lower():
+        low=str(e).lower()
+        if 'chat not found' in low or 'peer_flood' in low:
             LOG_CHANNEL_DISABLED = True
-            log.warning('Audit log channel disabled: chat %s is unavailable', LOG_CHANNEL_ID)
+            log.warning('Audit log channel disabled after Telegram rejection: %s', e)
         else:
-            log.error('LOG CHANNEL FAILED channel=%s action=%s error=%r', LOG_CHANNEL_ID, action, e)
+            log.error('LOG CHANNEL FAILED channel=%s action=%s error=%r', channel_id, action, e)
     except Exception as e:
-        log.error('LOG CHANNEL FAILED channel=%s action=%s error=%r', LOG_CHANNEL_ID, action, e)
+        log.error('LOG CHANNEL FAILED channel=%s action=%s error=%r', channel_id, action, e)
 
 
 # ───────────────────────── доступ ─────────────────────────
@@ -338,14 +440,19 @@ async def access_message(handler, event: Message, data):
         uid = event.from_user.id
         db.upsert_user(uid, event.from_user.username, event.from_user.first_name)
         if db.is_banned(uid):
-            await audit('Заблокированный пользователь попытался выполнить действие', uid, f'Текст: <code>{ui.esc(event.text or "")}</code>')
+            await audit('Заблокированный пользователь попытался выполнить действие', uid, f'Text: <code>{ui.esc(event.text or "")}</code>')
             await event.answer('🚫 <b>Доступ ограничен.</b>')
+            return
+        if db.get_setting('maintenance_mode','0') == '1' and not is_admin(uid) and not (event.text or '').startswith('/start'):
+            await event.answer('🚧 <b>Технические работы</b>\n\nБот временно недоступен. Попробуй позже.')
             return
     return await handler(event, data)
 
-
 @dp.callback_query.middleware()
 async def access_callback(handler, event: CallbackQuery, data):
+    if db.get_setting('maintenance_mode','0') == '1' and not is_admin(event.from_user.id) and not (event.data or '').startswith('menu:home'):
+        await event.answer('🚧 Технические работы. Попробуй позже.', show_alert=True)
+        return
     if db.is_banned(event.from_user.id):
         await audit('Заблокированный пользователь нажал кнопку', event.from_user.id, f'Callback: <code>{ui.esc(event.data or "")}</code>')
         await event.answer('🚫 Доступ ограничен', show_alert=True)
@@ -359,14 +466,20 @@ async def access_callback(handler, event: CallbackQuery, data):
 async def start(m: Message, state: FSMContext):
     await audit('Запуск /start', m.from_user.id)
     await state.clear()
-    u = db.get_user(m.from_user.id) or {}
-    await m.answer(ui.welcome(u, is_admin(m.from_user.id)), reply_markup=user_menu(m.from_user.id))
+    # Inline keyboard is attached in the same send call. No legacy reply keyboard or second edit step.
+    await m.answer(ui.v24_welcome(), reply_markup=kb.main_menu(is_admin(m.from_user.id), is_unlimited(m.from_user.id)))
 
 
 @dp.message(F.text == kb.BTN_CANCEL)
 async def cancel_action(m: Message, state: FSMContext):
     await state.clear()
     await m.answer('↩️ Действие отменено.', reply_markup=user_menu(m.from_user.id))
+
+@dp.callback_query(F.data == 'fsm:cancel')
+async def cancel_callback(c: CallbackQuery, state: FSMContext):
+    await state.clear()
+    await c.answer('Отменено')
+    await c.message.edit_text(ui.v24_welcome(), reply_markup=kb.inline_main_menu(is_admin(c.from_user.id), is_unlimited(c.from_user.id)))
 
 
 @dp.message(Command('stop'))
@@ -405,12 +518,12 @@ async def help_command(m: Message):
 @dp.message(F.text == kb.BTN_PROFILE)
 async def profile(m: Message):
     uid = m.from_user.id
-    await m.answer(ui.profile(db.get_user(uid) or {}, uid, m.from_user.username, db.stats(), is_admin(uid)))
+    await m.answer(ui.v24_profile(db.get_user(uid) or {}, uid, m.from_user.username, is_admin(uid), db.entitlement_until(uid, 'premium'), db.entitlement_until(uid, 'chat'), db.entitlement_until(uid, 'offers')), reply_markup=kb.profile_menu_kb())
 
 
 @dp.message(F.text == kb.BTN_PREMIUM)
 async def premium(m: Message):
-    await m.answer(ui.premium_text())
+    await m.answer(ui.v24_premium(), reply_markup=kb.premium_menu_kb())
 
 
 # ───────────────────────── выбор модели ─────────────────────────
@@ -426,19 +539,8 @@ async def ask_range(target: Message, state: FSMContext, model: str):
 
 @dp.message(F.text == kb.BTN_SEARCH)
 async def new_search(m: Message, state: FSMContext):
-    await audit('Открыт новый поиск', m.from_user.id)
-    if not allowed(m.from_user.id, 1):
-        return await m.answer('🆓 <b>Лимит Trial закончился.</b>\n\n💎 Подключите Premium для продолжения.')
-    await state.set_state(S.model)
-    last = db.last_resumable_search(m.from_user.id)
-    last_line = ''
-    if last:
-        last_line = f'\n\n<i>Последний парсинг: #{last["id"]} · последний проверенный ID <code>{last["last_checked_id"]}</code></i>'
-    await m.answer(
-        '🔎 <b>Новый поиск</b>\n\nВведите название модели:\n'
-        + ui.block('<code>Plush Pepe</code>', '<code>Eternal Rose</code>') +
-        '\n<i>Или выберите модель через «🎁 Модели».</i>' + last_line,
-        reply_markup=kb.cancel())
+    await state.clear()
+    await m.answer('🔎 <b>ПАРСЕР</b>\n\nВыбери режим:', reply_markup=kb.parser_menu_kb())
 
 
 @dp.message(S.model)
@@ -495,7 +597,7 @@ async def range_step(m: Message, state: FSMContext):
 
 
 # ───────────────────────── поиск по диапазону ─────────────────────────
-async def run_search(chat: Message, uid: int, model: str, start: int, end: int, sid=None):
+async def run_search(chat: Message, uid: int, model: str, start: int, end: int, sid=None, trial_kind='regular'):
     if uid in ACTIVE:
         return await chat.answer('⏳ У вас уже идёт поиск. Остановите его кнопкой под статусом или командой /stop.')
 
@@ -580,8 +682,8 @@ async def run_search(chat: Message, uid: int, model: str, start: int, end: int, 
 
             # ── Trial списывается по ходу поиска, а не в конце
             if not unlimited:
-                db.consume_trial(uid, len(nums))
-                if trial_left(uid) <= 0 and current <= end:
+                db.consume_trial_kind(uid, trial_kind, len(nums))
+                if db.trial_left(uid, trial_kind) <= 0 and current <= end:
                     db.update_search(sid, nums[-1], checked, found, 'stopped')
                     await edit(msg, ui.search_card('running', model, start, end, checked, total, found,
                                                    shown_cards=MAX_LIVE_CARDS))
@@ -642,8 +744,8 @@ async def id_number(m: Message, state: FSMContext):
         return await m.answer('❌ Номер должен быть положительным числом.')
     n = int(text)
     uid = m.from_user.id
-    if not allowed(uid, 1):
-        return await m.answer('🆓 <b>Лимит Trial закончился.</b>\n\n💎 Подключите Premium для продолжения.')
+    if not trial_allowed(uid, 'id', 1):
+        return await m.answer('🆓 <b>Бесплатные проверки по ID закончились.</b>\n\n💎 Открой Премиум, чтобы продолжить.')
     if uid in ACTIVE:
         return await m.answer('⏳ Сначала завершите или остановите текущую проверку.')
     model = (await state.get_data())['model']
@@ -653,7 +755,7 @@ async def id_number(m: Message, state: FSMContext):
     try:
         g = await peek_get_gift(model, n)
         if not is_unlimited(uid):
-            db.consume_trial(uid, 1)
+            db.consume_trial_kind(uid, 'id', 1)
         if not g:
             return await m.answer(f'🔎 {ui.esc(ui.pretty(model))} <code>#{n}</code> — не найден.')
         await send_card(m, uid, g, large=True)
@@ -900,6 +1002,260 @@ async def export_txt(c: CallbackQuery):
                      '<i>Формат: № | модель | узор | фон | владелец | ссылка</i>')
 
 
+
+# ───────────────────────── V24 inline navigation ─────────────────────────
+@dp.callback_query(F.data == 'menu:home')
+async def v24_home(c: CallbackQuery, state: FSMContext):
+    await state.clear(); await c.answer()
+    await c.message.edit_text(ui.v24_welcome(), reply_markup=kb.inline_main_menu(is_admin(c.from_user.id), is_unlimited(c.from_user.id)))
+
+@dp.callback_query(F.data == 'menu:parser')
+async def v24_parser_menu(c: CallbackQuery, state: FSMContext):
+    await state.clear(); await c.answer()
+    await c.message.edit_text('🔎 <b>ПАРСЕР</b>\n\nВыбери нужный режим:', reply_markup=kb.parser_menu_kb())
+
+@dp.callback_query(F.data == 'menu:premium')
+async def v24_premium_menu(c: CallbackQuery):
+    await c.answer(); await c.message.edit_text(ui.v24_premium(), reply_markup=kb.premium_menu_kb())
+
+@dp.callback_query(F.data == 'menu:profile')
+async def v24_profile_menu(c: CallbackQuery):
+    uid=c.from_user.id; await c.answer()
+    await c.message.edit_text(ui.v24_profile(db.get_user(uid) or {}, uid, c.from_user.username, is_admin(uid), db.entitlement_until(uid,'premium'), db.entitlement_until(uid,'chat'), db.entitlement_until(uid,'offers')), reply_markup=kb.profile_menu_kb())
+
+@dp.callback_query(F.data == 'menu:help')
+async def v24_help_menu(c: CallbackQuery):
+    await c.answer(); await c.message.edit_text('❓ <b>ПОМОЩЬ</b>\n\n🔎 Обычный парсер — выбираешь подарок и диапазон ID.\n🎲 Случайный — случайные модели и номера.\n🆔 Поиск по ID — точная проверка одного подарка.\n📡 Парсер чатов — поиск NFT у пользователей выбранных Telegram-чатов.\n\nБесплатно доступно по 20 проверок для обычного, случайного и ID-поиска. Платные доступы включаются автоматически после оплаты.', reply_markup=kb.inline_main_menu(is_admin(c.from_user.id), is_unlimited(c.from_user.id)))
+
+@dp.callback_query(F.data == 'menu:admin')
+async def v24_admin_menu(c: CallbackQuery):
+    if not is_admin(c.from_user.id):
+        return await c.answer('Нет доступа', show_alert=True)
+    await c.answer(); await c.message.edit_text('⚙️ <b>АДМИН-ПАНЕЛЬ</b>\n\nВыбери раздел:', reply_markup=admin_home_kb())
+
+@dp.callback_query(F.data == 'menu:offers')
+async def v24_offers_menu(c: CallbackQuery):
+    uid=c.from_user.id; await c.answer()
+    if not offers_paid(uid):
+        return await c.message.edit_text(ui.v24_offers(False), reply_markup=kb.offers_locked_kb())
+    if not offer_ready_for_user(uid, getattr(c.from_user,'username',None)):
+        return await c.message.edit_text('🎁 <b>ОФЕРЫ</b>\n\nДоступ оплачен, но Business-профиль ещё не подключён/не одобрен.\n\nОбратись к @witensea, если подключение уже сделано.', reply_markup=kb.offers_active_kb())
+    await c.message.edit_text(ui.v24_offers(True, db.entitlement_until(uid,'offers')), reply_markup=kb.offers_active_kb())
+
+@dp.callback_query(F.data == 'offers:install')
+async def v24_offers_install(c: CallbackQuery):
+    await c.answer(); await c.message.edit_text(ui.v24_install(), reply_markup=kb.offers_active_kb())
+
+@dp.callback_query(F.data == 'parser_ui:regular')
+async def v24_regular(c: CallbackQuery, state: FSMContext):
+    uid=c.from_user.id
+    if not trial_allowed(uid,'regular',1):
+        return await c.answer('Бесплатные проверки закончились. Открой Премиум.', show_alert=True)
+    await state.clear(); await c.answer()
+    await show_catalog(c.message, 1, '')
+
+@dp.callback_query(F.data == 'catalog:query')
+async def v24_catalog_query(c: CallbackQuery, state: FSMContext):
+    await state.set_state(S.catalog_query); await c.answer(); await c.message.answer('🔎 <b>ПОИСК ПОДАРКА</b>\n\nНапиши название, например: <code>Party Sparkler</code>')
+
+@dp.message(S.catalog_query)
+async def v24_catalog_query_value(m: Message, state: FSMContext):
+    q=(m.text or '').strip().lower()[:24]
+    await state.clear(); await show_catalog(m,1,q)
+
+async def show_catalog(target, page=1, query='', edit=False):
+    items=[]
+    for title, model in zip(GIFT_CATALOG, GIFT_MODELS):
+        if not query or query in title.lower() or query in model.lower():
+            items.append((title,model))
+    pages=max(1,(len(items)+GIFT_PAGE_SIZE-1)//GIFT_PAGE_SIZE); page=max(1,min(page,pages))
+    visible=items[(page-1)*GIFT_PAGE_SIZE:page*GIFT_PAGE_SIZE]
+    text='🎁 <b>ОБЫЧНЫЙ ПАРСЕР</b>\n\nВыбери NFT-подарок. Листай страницы или ищи по названию.'
+    if query: text += f'\n\n🔎 Запрос: <b>{ui.esc(query)}</b>'
+    if edit:
+        await target.edit_text(text, reply_markup=kb.catalog_kb(visible,page,pages,query))
+    else:
+        await target.answer(text, reply_markup=kb.catalog_kb(visible,page,pages,query))
+
+@dp.callback_query(F.data.startswith('catalog:page:'))
+async def v24_catalog_page(c: CallbackQuery):
+    _,_,page,query=(c.data.split(':',3)+[''])[:4]
+    await c.answer(); await show_catalog(c.message,int(page),query,edit=True)
+
+@dp.callback_query(F.data.startswith('catalog:pick:'))
+async def v24_catalog_pick(c: CallbackQuery, state: FSMContext):
+    model=c.data.split(':',2)[2]; await c.answer()
+    if not trial_allowed(c.from_user.id,'regular',1): return await c.message.answer('🆓 Лимит обычного парсера закончился. Открой Премиум.')
+    await ask_range(c.message,state,model)
+
+@dp.callback_query(F.data == 'parser_ui:random')
+async def v24_random_menu(c: CallbackQuery):
+    await c.answer()
+    await c.message.edit_text('🎲 <b>СЛУЧАЙНЫЙ ПАРСЕР</b>\n\nВыбери модель. Можно листать каталог, затем выбрать количество проверок.', reply_markup=random_models_kb(1))
+
+
+def random_models_kb(page=1):
+    items=list(zip(GIFT_CATALOG, GIFT_MODELS))
+    per=8; pages=max(1,(len(items)+per-1)//per); page=max(1,min(int(page),pages))
+    visible=items[(page-1)*per:page*per]
+    rows=[]
+    for i in range(0,len(visible),2):
+        rows.append([InlineKeyboardButton(text=a,callback_data=f'random_model:{b}') for a,b in visible[i:i+2]])
+    nav=[]
+    if page>1: nav.append(InlineKeyboardButton(text='‹',callback_data=f'random_models_page:{page-1}'))
+    nav.append(InlineKeyboardButton(text=f'{page}/{pages}',callback_data='noop'))
+    if page<pages: nav.append(InlineKeyboardButton(text='›',callback_data=f'random_models_page:{page+1}'))
+    rows.append(nav)
+    rows.append([InlineKeyboardButton(text='🎲 Любая модель',callback_data='random_model:any')])
+    rows.append([InlineKeyboardButton(text='‹ Парсер',callback_data='menu:parser')])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+@dp.callback_query(F.data.startswith('random_models_page:'))
+async def random_models_page(c: CallbackQuery):
+    await c.answer(); await c.message.edit_reply_markup(reply_markup=random_models_kb(int(c.data.split(':')[1])))
+
+@dp.callback_query(F.data.startswith('random_model:'))
+async def random_model_pick(c: CallbackQuery):
+    model=c.data.split(':',1)[1]
+    await c.answer()
+    label='любые модели' if model=='any' else ui.pretty(model)
+    await c.message.edit_text(f'🎲 <b>СЛУЧАЙНЫЙ ПАРСЕР</b>\n\nМодель: <b>{ui.esc(label)}</b>\n\nСколько проверок сделать?', reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text='1',callback_data=f'random_v24:1:{model}'),InlineKeyboardButton(text='5',callback_data=f'random_v24:5:{model}'),InlineKeyboardButton(text='10',callback_data=f'random_v24:10:{model}'),InlineKeyboardButton(text='20',callback_data=f'random_v24:20:{model}')],
+        [InlineKeyboardButton(text='‹ Модели',callback_data='parser_ui:random')]
+    ]))
+
+@dp.callback_query(F.data.startswith('random_v24:'))
+async def v24_random_run(c: CallbackQuery):
+    parts=c.data.split(':'); uid=c.from_user.id; count=int(parts[1]); selected_model=parts[2] if len(parts)>2 else 'any'
+    if not trial_allowed(uid,'random',count): return await c.answer(f'Осталось: {db.trial_left(uid,"random")}',show_alert=True)
+    if uid in ACTIVE: return await c.answer('У тебя уже идёт проверка.',show_alert=True)
+    await c.answer('Запускаю…'); ACTIVE.add(uid); db.clear_stop(uid)
+    status=await c.message.edit_text(f'🎲 Проверяю <b>{count}</b> случайных подарков…',reply_markup=kb.running_kb())
+    found=0; errors=0; prices=[]; owners=set(); results=[]
+    try:
+        try:
+            await parser_handlers.ensure_client(db)
+        except Exception:
+            pass
+        for i in range(count):
+            if db.should_stop(uid): break
+            model=random.choice(GIFT_MODELS) if selected_model == 'any' else selected_model; number=random.randint(1,100000)
+            try: gift=await peek_get_gift(model,number)
+            except Exception as e: gift=None; errors+=1; log.warning('Random failed model=%s number=%s: %s',model,number,e)
+            db.consume_trial_kind(uid,'random',1)
+            if not gift: continue
+            found+=1
+            gift['gift_slug'] = gift.get('gift_slug') or f'{gift.get("model") or model}-{gift.get("giftNumber") or number}'
+            live, source, details = await live_price(parser_handlers.parser_client, gift)
+            if live:
+                gift['market'] = {'price': live, 'source': source, 'details': details}
+                prices.append(live)
+            owner = gift.get('username') or gift.get('userId') or gift.get('owner')
+            if owner: owners.add(str(owner))
+            results.append(gift)
+            await send_card(c.message,uid,gift)
+        total=sum(prices) if prices else 0
+        avg=round(total/len(prices)) if prices else 0
+        owner_text=', '.join(f'@{x}' if not x.isdigit() else x for x in list(owners)[:15]) or 'не определены'
+        summary=(f'🎲 <b>СЛУЧАЙНЫЙ ПАРСЕР ЗАВЕРШЁН</b>\n\n'
+                 f'🔎 Проверено: <b>{count}</b>\n'
+                 f'🎁 Найдено подарков: <b>{found}</b>\n'
+                 f'👤 Владельцев: <b>{len(owners)}</b>\n'
+                 f'👥 Владельцы: <b>{ui.esc(owner_text)}</b>\n'
+                 f'⭐ Оценено по Telegram: <b>{len(prices)}/{found}</b>\n'
+                 f'💰 Суммарная оценка: <b>~{total:,} Stars</b>\n'
+                 f'📊 Средняя цена: <b>~{avg:,} Stars</b>' if prices else
+                 f'🎲 <b>СЛУЧАЙНЫЙ ПАРСЕР ЗАВЕРШЁН</b>\n\nПроверено: <b>{count}</b>\nНайдено подарков: <b>{found}</b>\nВладельцев: <b>{len(owners)}</b>\n⚠️ Актуальную цену Telegram не удалось получить для найденных подарков.')
+        await edit(status,summary,reply_markup=kb.inline_main_menu(is_admin(uid),is_unlimited(uid)))
+    finally:
+        ACTIVE.discard(uid); db.clear_stop(uid)
+
+@dp.callback_query(F.data == 'parser_ui:id')
+async def v24_id(c: CallbackQuery,state:FSMContext):
+    if not trial_allowed(c.from_user.id,'id',1): return await c.answer('Бесплатные проверки по ID закончились. Открой Премиум.',show_alert=True)
+    await c.answer(); await state.set_state(S.id_model); await c.message.answer('🆔 <b>ПОИСК ПО ID</b>\n\nНапиши название NFT-подарка:',reply_markup=kb.cancel())
+
+@dp.callback_query(F.data == 'parser_ui:chats')
+async def v24_chats(c: CallbackQuery,state:FSMContext):
+    uid=c.from_user.id
+    if not chat_parser_allowed(uid): return await c.answer('🔒 Доступ к парсеру чатов не активен. Купи пакет 10 TON на 24 часа.',show_alert=True)
+    await c.answer()
+    from parsing import keyboards as parser_kb
+    session=db.get_parser_session()
+    await c.message.edit_text(parser_handlers.format_parser_menu(session),reply_markup=parser_kb.parser_main_menu(bool(session and session.get('is_active'))))
+
+@dp.callback_query(F.data.startswith('buy:'))
+async def buy_plan(c: CallbackQuery):
+    uid = int(c.from_user.id)
+    plan = c.data.split(':', 1)[1]
+    plans = tariff_config()
+    if plan not in plans:
+        return await c.answer('Тариф не найден', show_alert=True)
+    amount, kind, seconds, title = plans[plan]
+    await c.answer()
+    payload = f'{uid}:{plan}:{int(time.time())}'
+    markup = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text='💳 CryptoBot', callback_data=f'pay:crypto:{plan}')],
+        [InlineKeyboardButton(text='🚀 xRocket', callback_data=f'pay:xrocket:{plan}')],
+        [InlineKeyboardButton(text='‹ Премиум', callback_data='menu:premium')],
+    ])
+    await c.message.edit_text(f'💳 <b>{ui.esc(title)}</b>\n\nСтоимость: <b>{amount} TON</b>\n\nВыбери способ оплаты:', reply_markup=markup)
+
+async def _create_crypto_invoice(c: CallbackQuery, plan: str):
+    plans = tariff_config()
+    amount, kind, seconds, title = plans[plan]; uid=int(c.from_user.id)
+    if not crypto_pay.configured:
+        return await c.answer('CryptoBot не настроен.', show_alert=True)
+    payload=f'{uid}:{plan}:{int(time.time())}'
+    try:
+        inv=await crypto_pay.create_invoice(amount, f'GiftParser — {title}', payload)
+        db.save_payment_invoice(inv['invoice_id'], uid, plan, amount, payload)
+        url=inv.get('bot_invoice_url') or inv.get('mini_app_invoice_url') or inv.get('web_app_invoice_url')
+        if not url: raise RuntimeError('CryptoBot не вернул ссылку оплаты')
+        await c.message.edit_text(f'💳 <b>CryptoBot</b>\n\nТариф: <b>{ui.esc(title)}</b>\nСумма: <b>{amount} TON</b>\n\nПосле оплаты доступ активируется автоматически.', reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text='💳 Оплатить CryptoBot', url=url)],[InlineKeyboardButton(text='‹ Назад', callback_data=f'buy:{plan}')]]))
+    except Exception as e:
+        log.exception('CryptoBot invoice failed uid=%s plan=%s',uid,plan); await c.answer(f'Не удалось создать счёт: {str(e)[:180]}',show_alert=True)
+
+@dp.callback_query(F.data.startswith('pay:crypto:'))
+async def pay_crypto(c: CallbackQuery):
+    return await _create_crypto_invoice(c, c.data.split(':',2)[2])
+
+@dp.callback_query(F.data.startswith('pay:xrocket:'))
+async def pay_xrocket(c: CallbackQuery):
+    plan=c.data.split(':',2)[2]
+    plans={'premium_2d':('7','premium',172800,'Премиум · 2 дня'),'chat_24h':('10','chat',86400,'Парсер чатов · 24 часа'),'offers_5d':('25','offers',432000,'Оферы · 5 дней')}
+    if plan not in plans: return await c.answer('Тариф не найден',show_alert=True)
+    amount, kind, seconds, title=plans[plan]; uid=int(c.from_user.id)
+    if not xrocket_pay.configured: return await c.answer('xRocket не настроен. Добавь XROCKET_PAY_API_TOKEN.',show_alert=True)
+    client_id=f'gp_{uid}_{plan}_{int(time.time()*1000)}'
+    try:
+        inv=await xrocket_pay.create_invoice(amount, title, client_id, uid, c.from_user.username)
+        db.save_xrocket_invoice(client_id, str(inv.get('id') or client_id), uid, plan, amount, 'TON', 'active')
+        url=((inv.get('links') or {}).get('telegramBotLink') or (inv.get('links') or {}).get('webLink'))
+        if not url: raise RuntimeError('xRocket не вернул ссылку оплаты')
+        await c.answer()
+        await c.message.edit_text(f'🚀 <b>xRocket</b>\n\nТариф: <b>{ui.esc(title)}</b>\nСумма: <b>{amount} TON</b>\n\nПосле оплаты доступ активируется автоматически.', reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text='🚀 Оплатить через xRocket', url=url)],[InlineKeyboardButton(text='‹ Назад', callback_data=f'buy:{plan}')]]))
+    except Exception as e:
+        log.exception('xRocket invoice failed uid=%s plan=%s',uid,plan); await c.answer(f'Не удалось создать xRocket-счёт: {str(e)[:180]}',show_alert=True)
+
+@dp.callback_query(F.data == 'profile:payments')
+async def v24_profile_payments(c: CallbackQuery):
+    rows=db.payment_history(c.from_user.id,20)
+    await c.answer()
+    if not rows:
+        return await c.message.edit_text('💳 <b>ИСТОРИЯ ПОКУПОК</b>\n\nПокупок пока нет.', reply_markup=kb.profile_menu_kb())
+    labels={'premium_2d':'Premium · 2 дня','chat_24h':'Парсер чатов · 24 часа','offers_5d':'Оферы · 5 дней'}
+    lines=[]
+    for r in rows:
+        status='✅ оплачено' if r['status']=='paid' else ('⌛ ожидает' if r['status']=='active' else f'• {r["status"]}')
+        lines.append(f'• <b>{ui.esc(labels.get(r["plan"],r["plan"]))}</b> · {ui.esc(str(r["amount"]))} TON · {status}')
+    await c.message.edit_text('💳 <b>ИСТОРИЯ ПОКУПОК</b>\n\n'+'\n'.join(lines), reply_markup=kb.profile_menu_kb())
+
+
+@dp.callback_query(F.data == 'profile:favorites')
+async def v24_profile_favorites(c: CallbackQuery):
+    await c.answer(); await favorites(c.message)
+
 # ───────────────────────── каталог моделей ─────────────────────────
 async def show_models(target: Message, page: int, edit_mode=False):
     markup, pages = kb.models_kb(page)
@@ -950,12 +1306,11 @@ def personal_offer_profile_kb(uid):
 @dp.message(F.text == kb.BTN_OFFERS)
 async def offers_tab(m: Message):
     uid = int(m.from_user.id)
+    if not offers_paid(uid):
+        return await m.answer(ui.v24_offers(False), reply_markup=kb.offers_locked_kb())
     if not offer_ready_for_user(uid, getattr(m.from_user, 'username', None)):
-        return await m.answer(
-            '🎁 <b>Оферы</b>\n\n'
-            'Для подключения оферов обратитесь к овнеру: @witensea'
-        )
-    await m.answer(personal_offer_profile_text(uid), reply_markup=personal_offer_profile_kb(uid))
+        return await m.answer('🎁 <b>ОФЕРЫ</b>\n\nДоступ куплен, но Business-профиль ещё не подключён или не одобрен владельцем.\n\n@witensea', reply_markup=kb.offers_active_kb())
+    await m.answer(ui.v24_offers(True, db.entitlement_until(uid, 'offers')), reply_markup=kb.offers_active_kb())
 
 
 @dp.callback_query(F.data == 'offer:self:profile')
@@ -978,7 +1333,12 @@ async def offer_self_profile_name(m: Message, state: FSMContext):
         return await m.answer('❌ Название должно быть от 1 до 64 символов.')
     await state.update_data(personal_profile_name=name)
     await state.set_state(S.offer_user_profile_url)
-    await m.answer('🔗 Отправь ссылку Telegram-профиля: <code>https://t.me/username</code> или <code>tg://user?id=123456789</code>')
+    await m.answer(
+        '🔗 <b>Куда передавать подарок?</b>\n\n'
+        'Отправь username <b>без @</b>. Например: <code>witensea</code>\n'
+        'Бот автоматически сделает ссылку: <code>tg://send_gift?to=witensea</code>\n\n'
+        'Также можно отправить готовую ссылку <code>tg://send_gift?to=username</code>.'
+    )
 
 
 @dp.message(S.offer_user_profile_url)
@@ -986,9 +1346,20 @@ async def offer_self_profile_url(m: Message, state: FSMContext):
     uid = int(m.from_user.id)
     if not offer_ready_for_user(uid, getattr(m.from_user, 'username', None)):
         await state.clear(); return
-    url = (m.text or '').strip()
-    if not re.match(r'^(?:https?://t\.me/[^\s]+|tg://user\?id=-?\d+)$', url, re.I):
-        return await m.answer('❌ Нужна Telegram-ссылка профиля.')
+    raw = (m.text or '').strip()
+    # New transfer format: plain Telegram username -> tg://send_gift?to=username.
+    # Keep compatibility with already saved/full links as well.
+    username = raw.lstrip('@').strip()
+    if re.fullmatch(r'[A-Za-z0-9_]{5,32}', username):
+        url = f'tg://send_gift?to={username}'
+    elif re.fullmatch(r'tg://send_gift\?to=[A-Za-z0-9_]{5,32}', raw, re.I):
+        url = raw
+    elif re.fullmatch(r'tg://user\?id=-?\d+', raw, re.I):
+        url = raw
+    elif re.fullmatch(r'https?://t\.me/[A-Za-z0-9_]{5,32}/?', raw, re.I):
+        url = f'tg://send_gift?to={raw.rstrip('/').rsplit('/', 1)[-1]}'
+    else:
+        return await m.answer('❌ Отправь username без @, например <code>witensea</code>.')
     data = await state.get_data(); name = data.get('personal_profile_name') or 'Мой профиль'
     db.offer_user_profile_set(uid, name, url)
     await state.clear()
@@ -1014,665 +1385,623 @@ async def offer_self_back(c: CallbackQuery):
         pass
 
 
-# ───────────────────────── админка ─────────────────────────
+# ───────────────────────── Рассылка ─────────────────────────
+@dp.callback_query(F.data == 'adm:broadcast')
+async def adm_broadcast_start(c: CallbackQuery, state: FSMContext):
+    if not is_admin(c.from_user.id):
+        return await c.answer('Нет доступа', show_alert=True)
+    await c.answer()
+    await state.set_state(S.admin_broadcast)
+    await c.message.edit_text(
+        '📣 <b>РАССЫЛКА</b>\n\n'
+        'Отправь следующим сообщением то, что нужно разослать: <b>текст, фото, GIF, видео, документ, аудио, голосовое или стикер</b>.\n\n'
+        'Поддерживается одно сообщение за рассылку. После получения я покажу подтверждение.',
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text='‹ Назад', callback_data='adm:home')]])
+    )
+
+@dp.callback_query(F.data == 'adm:broadcast_cancel')
+async def adm_broadcast_cancel(c: CallbackQuery, state: FSMContext):
+    if not is_admin(c.from_user.id):
+        return await c.answer('Нет доступа', show_alert=True)
+    await state.clear()
+    await c.answer('Отменено')
+    await c.message.edit_text('⚙️ <b>АДМИН-ПАНЕЛЬ</b>', reply_markup=admin_home_kb())
+
+@dp.message(S.admin_broadcast)
+async def adm_broadcast_preview(m: Message, state: FSMContext):
+    if not is_admin(m.from_user.id):
+        await state.clear(); return
+    await state.update_data(broadcast_chat_id=m.chat.id, broadcast_message_id=m.message_id, broadcast_audience='all')
+    count = len(db.broadcast_user_ids('all'))
+    await m.answer(
+        f'📣 <b>ПРЕДПРОСМОТР РАССЫЛКИ</b>\n\nАудитория: <b>Все</b> · Получателей: <b>{count}</b>\n\nВыбери аудиторию или запускай.',
+        reply_markup=broadcast_audience_kb('all')
+    )
+
+def broadcast_audience_kb(selected='all'):
+    labels=[('all','🌐 Все'),('premium','💎 Premium'),('chat','📡 Парсер чатов'),('offers','🎁 Оферы'),('active','🟢 Активные 7 дней')]
+    rows=[]
+    for key,label in labels:
+        count=len(db.broadcast_user_ids(key))
+        rows.append([InlineKeyboardButton(text=f'{label} · {count}' + (' ✅' if key==selected else ''), callback_data=f'adm:broadcast_audience:{key}')])
+    rows.append([InlineKeyboardButton(text='🚀 Начать рассылку', callback_data='adm:broadcast_send')])
+    rows.append([InlineKeyboardButton(text='✖️ Отмена', callback_data='adm:broadcast_cancel')])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+@dp.callback_query(F.data.startswith('adm:broadcast_audience:'))
+async def adm_broadcast_audience(c: CallbackQuery, state: FSMContext):
+    if not is_admin(c.from_user.id): return await c.answer('Нет доступа', show_alert=True)
+    audience=c.data.split(':')[-1]
+    data=await state.get_data()
+    if not data.get('broadcast_message_id'): return await c.answer('Сначала отправь сообщение для рассылки.', show_alert=True)
+    await state.update_data(broadcast_audience=audience)
+    await c.answer('Аудитория изменена')
+    await c.message.edit_text(f'📣 <b>РАССЫЛКА</b>\n\nАудитория: <b>{ui.esc(audience)}</b>\nПолучателей: <b>{len(db.broadcast_user_ids(audience))}</b>', reply_markup=broadcast_audience_kb(audience))
+
+@dp.callback_query(F.data == 'adm:broadcast_send')
+async def adm_broadcast_send(c: CallbackQuery, state: FSMContext):
+    if not is_admin(c.from_user.id):
+        return await c.answer('Нет доступа', show_alert=True)
+    data = await state.get_data()
+    source_chat = data.get('broadcast_chat_id'); source_message = data.get('broadcast_message_id')
+    if not source_chat or not source_message:
+        await state.clear(); return await c.answer('Сообщение рассылки не найдено.', show_alert=True)
+    await c.answer('Рассылка запущена')
+    await c.message.edit_text('📣 <b>РАССЫЛКА ЗАПУЩЕНА</b>\n\nБот отправляет сообщения безопасной очередью.')
+    await state.clear()
+    asyncio.create_task(run_broadcast(int(source_chat), int(source_message), int(c.from_user.id), data.get('broadcast_audience') or 'all'))
+
+async def run_broadcast(source_chat: int, source_message: int, admin_id: int, audience='all'):
+    rows = db.broadcast_user_ids(audience)
+    sent = failed = 0
+    for uid in rows:
+        try:
+            await bot.copy_message(chat_id=int(uid), from_chat_id=source_chat, message_id=source_message)
+            sent += 1
+        except TelegramRetryAfter as e:
+            await asyncio.sleep(min(int(getattr(e, 'retry_after', 1) or 1), 30) + 0.2)
+            try:
+                await bot.copy_message(chat_id=int(uid), from_chat_id=source_chat, message_id=source_message)
+                sent += 1
+            except Exception:
+                failed += 1
+        except Exception:
+            failed += 1
+        await asyncio.sleep(float(os.getenv('BROADCAST_DELAY', '0.08')))
+    try:
+        await bot.send_message(admin_id, f'✅ <b>РАССЫЛКА ЗАВЕРШЕНА</b>\n\nОтправлено: <b>{sent}</b>\nОшибок: <b>{failed}</b>')
+    except Exception:
+        pass
+    log.info('Broadcast finished admin=%s audience=%s sent=%s failed=%s', admin_id, audience, sent, failed)
+
+# ───────────────────────── новая админка V25 ─────────────────────────
 def admin_home_kb():
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text='📊 Статистика', callback_data='adm:stats')],
         [InlineKeyboardButton(text='👥 Управление пользователями', callback_data='adm:users')],
-        [InlineKeyboardButton(text='🛡 Администраторы', callback_data='adm:admins')],
-        [InlineKeyboardButton(text='🔎 Найти пользователя', callback_data='adm:userfind')],
-        [InlineKeyboardButton(text='🔎 Последние поиски', callback_data='adm:searches')],
-        [InlineKeyboardButton(text='📜 Логи', callback_data='adm:logs')],
-        [InlineKeyboardButton(text='🔐 Доступ к парсеру', callback_data='adm:parser_access')],
+        [InlineKeyboardButton(text='🔎 Доступ к парсеру', callback_data='adm:parser_access')],
         [InlineKeyboardButton(text='🎁 Доступ к оферам', callback_data='adm:offer_access')],
+        [InlineKeyboardButton(text='💳 Тарифы', callback_data='adm:tariffs')],
+        [InlineKeyboardButton(text='📣 Рассылка', callback_data='adm:broadcast')],
+        [InlineKeyboardButton(text='📜 Логи', callback_data='adm:logs')],
+        [InlineKeyboardButton(text='🛠 Система и канал логов', callback_data='adm:system')],
+        [InlineKeyboardButton(text='🚧 Технические работы', callback_data='adm:maintenance')],
         [InlineKeyboardButton(text='🔄 Обновить', callback_data='adm:home')],
     ])
 
 
+def admin_back(data='adm:home'):
+    return InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text='‹ Назад', callback_data=data)]])
+
+
 def admin_users_kb(rows):
-    buttons = []
+    buttons=[]
     for u in rows:
-        uid = u['user_id']
-        name = '@' + u['username'] if u.get('username') else str(u.get('first_name') or uid)
-        tag = '💎' if u['is_premium'] else ('🚫' if u['is_banned'] else '👤')
-        buttons.append([InlineKeyboardButton(text=f'{tag} {name[:24]}', callback_data=f'adm:user:{uid}')])
-    buttons.append([InlineKeyboardButton(text='⬅️ Панель', callback_data='adm:home')])
+        uid=int(u['user_id'])
+        name=(' @'+u['username']) if u.get('username') else (u.get('first_name') or str(uid))
+        tag='🚫' if u.get('is_banned') else ('💎' if u.get('is_premium') else '👤')
+        buttons.append([InlineKeyboardButton(text=f'{tag} {str(name).strip()[:28]}', callback_data=f'adm:user:{uid}')])
+    buttons += [
+        [InlineKeyboardButton(text='🔎 Найти пользователя', callback_data='adm:userfind')],
+        [InlineKeyboardButton(text='‹ Назад', callback_data='adm:home')],
+    ]
     return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+
+def admin_user_text(uid):
+    u=db.get_user(uid) or {}
+    parser_direct=bool(db._one('SELECT 1 AS ok FROM parser_access_users WHERE user_id=?',(uid,)))
+    offer_until=db.entitlement_until(uid,'offers')
+    chat_until=db.entitlement_until(uid,'chat')
+    premium_until=db.entitlement_until(uid,'premium')
+    role='👑 Владелец' if is_owner(uid) else ('🛡 Администратор' if is_admin(uid) else '👤 Пользователь')
+    lines=[
+        f'👤 <b>ПРОФИЛЬ ПОЛЬЗОВАТЕЛЯ</b>', '',
+        f'🆔 <code>{uid}</code>',
+        f'👤 {ui.esc("@"+u["username"] if u.get("username") else u.get("first_name") or "Без имени")}',
+        f'🏷 {role}',
+        f'🚫 Бан: <b>{"да" if u.get("is_banned") else "нет"}</b>',
+        '',
+        f'💎 Премиум: <b>{"активен" if db.entitlement_active(uid,"premium") else "нет"}</b>' + (f' до <code>{ui.esc(str(premium_until)[:19].replace("T"," "))}</code>' if premium_until else ''),
+        f'📡 Парсер чатов: <b>{"доступен" if db.entitlement_active(uid,"chat") else ("выдан вручную" if parser_direct else "нет")}</b>' + (f' до <code>{ui.esc(str(chat_until)[:19].replace("T"," "))}</code>' if chat_until else ''),
+        f'🎁 Оферы: <b>{"активны" if db.entitlement_active(uid,"offers") else "нет"}</b>' + (f' до <code>{ui.esc(str(offer_until)[:19].replace("T"," "))}</code>' if offer_until else ''),
+        '',
+        f'🔎 Поисков: <b>{u.get("total_searches",0)}</b> · 🎁 Находок: <b>{u.get("total_found",0)}</b>',
+    ]
+    return '\n'.join(lines)
+
+
+def admin_user_kb(uid):
+    admin_target=is_admin(uid) and not is_owner(uid)
+    buttons=[
+        [InlineKeyboardButton(text='💎 Выдать 2 дня Premium', callback_data=f'adm:grant:premium:{uid}:172800')],
+        [InlineKeyboardButton(text='📡 Выдать 24ч парсера чатов', callback_data=f'adm:grant:chat:{uid}:86400')],
+        [InlineKeyboardButton(text='🎁 Выдать 5 дней оферов', callback_data=f'adm:grant:offers:{uid}:432000')],
+        [InlineKeyboardButton(text='♻️ Сбросить Business-сессии', callback_data=f'adm:business_reset:{uid}')],
+        [InlineKeyboardButton(text='🔎 Выдать доступ к парсеру', callback_data=f'adm:parser_user:add:{uid}')],
+        [InlineKeyboardButton(text='🚫 Снять ручной доступ к парсеру', callback_data=f'adm:parser_user:remove:{uid}')],
+        [InlineKeyboardButton(text=('🛡 Снять администратора' if admin_target else '🛡 Сделать администратором'), callback_data=f'adm:admin_toggle:{uid}')],
+        [InlineKeyboardButton(text=('✅ Разбанить' if db.is_banned(uid) else '🚫 Заблокировать'), callback_data=f'adm:ban:{uid}')],
+        [InlineKeyboardButton(text='🔄 Сбросить бесплатные лимиты', callback_data=f'adm:trial_reset:{uid}')],
+        [InlineKeyboardButton(text='‹ Пользователи', callback_data='adm:users')],
+    ]
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+
+def parser_access_text():
+    mode=db.get_parser_setting('access_mode','owner') or 'owner'
+    labels={'owner':'👑 Только владелец + ручные разрешения','premium':'💎 Владелец + Premium + ручные разрешения','developers':'🛡 Владелец + разработчики + ручные разрешения','all':'🌐 Все пользователи'}
+    return '🔎 <b>ДОСТУП К ПАРСЕРУ ЧАТОВ</b>\n\nТекущий режим: <b>'+labels.get(mode,labels['owner'])+'</b>\n\nВыбери правило доступа ниже.'
+
+
+def parser_access_kb():
+    mode=db.get_parser_setting('access_mode','owner') or 'owner'
+    names=[('owner','👑 Для владельца'),('premium','💎 Для Premium'),('developers','🛡 Для разработчиков'),('all','🌐 Для всех')]
+    rows=[]
+    for key,label in names:
+        rows.append([InlineKeyboardButton(text=label + (' ✅' if key==mode else ''), callback_data=f'adm:parser_mode:{key}')])
+    rows.append([InlineKeyboardButton(text='‹ Назад', callback_data='adm:home')])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def offers_admin_text():
+    active=db._one("SELECT COUNT(*) n FROM users WHERE offer_until IS NOT NULL AND offer_until > CURRENT_TIMESTAMP")
+    connections=len(db.business_connections_list())
+    return ('🎁 <b>ДОСТУП К ОФЕРАМ</b>\n\n'
+            f'🟢 Активных доступов: <b>{int((active or {}).get("n",0))}</b>\n'
+            f'🔗 Business-подключений: <b>{connections}</b>\n\n'
+            'Покупка: <b>25 TON · 5 дней</b>.\n'
+            'Владелец и администраторы имеют служебный доступ.')
+
+
+def offers_admin_kb():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text='🔗 Business-профили', callback_data='adm:offer_business_connections')],
+        [InlineKeyboardButton(text='👤 Пользователи', callback_data='adm:users')],
+        [InlineKeyboardButton(text='🧹 Сбросить всех пользователей оферов', callback_data='adm:offer_reset_all')],
+        [InlineKeyboardButton(text='‹ Назад', callback_data='adm:home')],
+    ])
+
+def offer_reset_all_confirm_kb():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text='⚠️ Да, сбросить всех', callback_data='adm:offer_reset_all:confirm')],
+        [InlineKeyboardButton(text='‹ Отмена', callback_data='adm:offer_access')],
+    ])
+
+
+def tariffs_text():
+    plans = tariff_config()
+    lines=['💳 <b>ТАРИФЫ</b>','']
+    labels={'premium_2d':'⚡ Premium · 2 дня','chat_24h':'📡 Парсер чатов · 24 часа','offers_5d':'🎁 Оферы · 5 дней'}
+    for key in ('premium_2d','chat_24h','offers_5d'):
+        lines.append(f'{labels[key]}: <b>{plans[key][0]} TON</b>')
+    lines += ['', 'Выбери тариф, чтобы изменить цену. Изменение сохраняется в SQLite.']
+    return '\n'.join(lines)
+
+def tariffs_kb():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=f'⚡ Premium: {tariff_config()["premium_2d"][0]} TON', callback_data='adm:tariff:premium_2d')],
+        [InlineKeyboardButton(text=f'📡 Чаты: {tariff_config()["chat_24h"][0]} TON', callback_data='adm:tariff:chat_24h')],
+        [InlineKeyboardButton(text=f'🎁 Оферы: {tariff_config()["offers_5d"][0]} TON', callback_data='adm:tariff:offers_5d')],
+        [InlineKeyboardButton(text='‹ Назад', callback_data='adm:home')],
+    ])
 
 
 @dp.message(F.text == kb.BTN_ADMIN)
 async def admin(m: Message):
-    await audit('Открыта админ-панель', m.from_user.id)
-    if is_admin(m.from_user.id):
-        await m.answer('⚙️ <b>Админ-панель</b>\n\nУправление пользователями, поисками и логами.', reply_markup=admin_home_kb())
-
-
-def admin_admins_kb():
-    buttons = [[InlineKeyboardButton(text='➕ Добавить администратора', callback_data='adm:admins:add')]]
-    for row in db.admin_list():
-        uid = int(row['user_id'])
-        if uid == OWNER_ID:
-            continue
-        buttons.append([InlineKeyboardButton(text=f'🗑 Удалить ID {uid}', callback_data=f'adm:admins:remove:{uid}')])
-    buttons.append([InlineKeyboardButton(text='⬅️ Панель', callback_data='adm:home')])
-    return InlineKeyboardMarkup(inline_keyboard=buttons)
-
-def admin_admins_text():
-    rows = db.admin_list()
-    lines = ['🛡 <b>Администраторы</b>', '', f'👑 Владелец: <code>{OWNER_ID}</code>']
-    extra = [r for r in rows if int(r['user_id']) != int(OWNER_ID)]
-    lines.append('')
-    lines.append('<b>Дополнительные администраторы:</b>')
-    lines.extend([f'• <code>{int(r["user_id"])}</code>' for r in extra] or ['• нет'])
-    lines.append('')
-    lines.append('Администраторы получают полный доступ к админке, поиску по чатам, пользователям, логам, оферам и профилям.')
-    return '\n'.join(lines)
-
-@dp.callback_query(F.data == 'adm:admins')
-async def adm_admins(c: CallbackQuery, state: FSMContext):
-    if not is_admin(c.from_user.id):
-        return await c.answer('Нет доступа', show_alert=True)
-    await state.clear()
-    await c.answer()
-    await c.message.edit_text(admin_admins_text(), reply_markup=admin_admins_kb())
-
-@dp.callback_query(F.data == 'adm:admins:add')
-async def adm_admins_add_start(c: CallbackQuery, state: FSMContext):
-    if not is_admin(c.from_user.id):
-        return await c.answer('Нет доступа', show_alert=True)
-    await c.answer()
-    await state.set_state(S.admin_add)
-    await c.message.answer('➕ <b>Добавить администратора</b>\n\nОтправь Telegram ID пользователя, например:\n<code>123456789</code>')
-
-@dp.message(S.admin_add)
-async def adm_admins_add_value(m: Message, state: FSMContext):
-    if not is_admin(m.from_user.id):
-        await state.clear()
-        return
-    raw = (m.text or '').strip()
-    if not raw.lstrip('-').isdigit() or int(raw) <= 0:
-        return await m.answer('❌ Нужен корректный Telegram ID.')
-    uid = int(raw)
-    db.admin_add(uid)
-    await state.clear()
-    await audit('Добавлен администратор', m.from_user.id, f'ID: <code>{uid}</code>')
-    await m.answer('✅ <b>Администратор добавлен.</b>', reply_markup=admin_admins_kb())
-
-@dp.callback_query(F.data.regexp(r'^adm:admins:remove:-?\d+$'))
-async def adm_admins_remove(c: CallbackQuery):
-    if not is_admin(c.from_user.id):
-        return await c.answer('Нет доступа', show_alert=True)
-    uid = int(c.data.rsplit(':', 1)[1])
-    if uid == OWNER_ID:
-        return await c.answer('Владельца удалить нельзя.', show_alert=True)
-    removed = db.admin_remove(uid)
-    await audit('Удалён администратор', c.from_user.id, f'ID: <code>{uid}</code>')
-    await c.answer('Администратор удалён' if removed else 'Такого администратора нет')
-    await c.message.edit_text(admin_admins_text(), reply_markup=admin_admins_kb())
-
-def stats_text():
-    s = db.stats()
-    return (f'📈 <b>{ui.small("Stats")} · Статистика</b>\n\n' + ui.block(
-        ui.kv('👥', 'Пользователей', ui.num(s['users'])),
-        ui.kv('💎', 'Premium', ui.num(s['premium'])),
-        ui.kv('🚫', 'Банов', ui.num(s['banned'])),
-        ui.kv('🔎', 'Поисков', ui.num(s['searches'])),
-        ui.kv('🎁', 'Находок', ui.num(s['found'])),
-        ui.kv('⚡', 'Активных поисков', len(ACTIVE))))
-
-
-@dp.callback_query(F.data == 'adm:parser_access')
-async def adm_parser_access(c: CallbackQuery):
-    if not is_admin(c.from_user.id):
-        return await c.answer('Нет доступа', show_alert=True)
-    # This setting means whether access is restricted to owner/admins + explicit grants.
-    restricted = db.parser_admin_only()
-    db.set_parser_admin_only(not restricted)
-    state = '🌐 Все пользователи' if restricted else '🔒 Только владелец/админы + выданный доступ'
-    await audit('Изменён доступ к парсеру', c.from_user.id, f'Режим: <b>{state}</b>')
-    await c.answer(state, show_alert=True)
-    await c.message.edit_reply_markup(reply_markup=admin_home_kb())
-
-def offer_access_kb():
-    mode = db.offer_access_mode()
-    rows = db.offer_access_list()
-    usernames = db.offer_access_username_list()
-    buttons = [
-        [InlineKeyboardButton(text=('👑 Только владелец' if mode == 'owner' else '👑 Только владелец'), callback_data='adm:offer_access:mode:owner')],
-        [InlineKeyboardButton(text=('🌐 Все пользователи' if mode != 'all' else '🌐 Все пользователи ✅'), callback_data='adm:offer_access:mode:all')],
-        [InlineKeyboardButton(text='➕ Исключение по Telegram ID', callback_data='adm:offer_access:add')],
-        [InlineKeyboardButton(text='➕ Исключение по @username', callback_data='adm:offer_access:add_username')],
-        [InlineKeyboardButton(text='👤 Подключённые Business-профили', callback_data='adm:offer_business_connections')],
-    ]
-    for row in rows:
-        uid = int(row['user_id'])
-        if uid == OWNER_ID:
-            continue
-        buttons.append([InlineKeyboardButton(text=f'🗑 ID {uid}', callback_data=f'adm:offer_access:remove:{uid}')])
-    for row in usernames:
-        username = str(row['username'])
-        buttons.append([InlineKeyboardButton(text=f'🗑 @{username}', callback_data=f'adm:offer_access:remove_username:{username}')])
-    buttons.append([InlineKeyboardButton(text='⬅️ Панель', callback_data='adm:home')])
-    return InlineKeyboardMarkup(inline_keyboard=buttons)
-
-
-def offer_access_text():
-    mode = db.offer_access_mode()
-    mode_text = '👑 Только владелец + исключения' if mode == 'owner' else '🌐 Все пользователи'
-    rows = db.offer_access_list()
-    usernames = db.offer_access_username_list()
-    lines = [f'Режим: <b>{mode_text}</b>', '']
-    if mode == 'owner':
-        lines.append('Владелец может использовать <code>.офер</code> всегда. Остальным доступ даётся через исключение по ID или @username.')
-    else:
-        lines.append('Любой пользователь может использовать <code>.офер</code>. Список исключений при этом сохраняется для режима владельца.')
-    lines.append('')
-    exceptions = []
-    for row in rows:
-        uid = int(row['user_id'])
-        if uid != OWNER_ID:
-            exceptions.append(f'• ID <code>{uid}</code>')
-    for row in usernames:
-        exceptions.append(f'• @{ui.esc(str(row["username"]))}')
-    lines.append('<b>Исключения:</b>')
-    lines.extend(exceptions or ['• нет'])
-    return '🎁 <b>Доступ к оферам</b>\n\n' + '\n'.join(lines)
-
-
-def offer_user_allowed(user_id, username=None):
-    return db.offer_access_allowed(user_id, username=username, owner_id=OWNER_ID)
-
-
-def offer_ready_for_user(user_id, username=None):
-    """Offers require an active, approved Business connection.
-
-    The legacy allow-list remains supported for compatibility, but a connected
-    Business profile that the owner has explicitly unblocked is sufficient.
-    A user without Business can never open the offer settings or create an
-    offer, even if an old ID/@username exception exists.
-    """
-    uid = int(user_id or 0)
-    if not uid:
-        return False
-    if db.offer_user_blocked(uid):
-        return False
-    connection = db.get_business_connection_for_user(uid)
-    if not connection or not int(connection.get('is_enabled', 0) or 0):
-        return False
-    if int(connection.get('is_blocked', 1) or 0):
-        return False
-    return True
-
-
-@dp.callback_query(F.data == 'adm:offer_access')
-async def adm_offer_access(c: CallbackQuery, state: FSMContext):
-    if not is_admin(c.from_user.id):
-        return await c.answer('Нет доступа', show_alert=True)
-    await state.clear()
-    await c.answer()
-    await c.message.edit_text(offer_access_text(), reply_markup=offer_access_kb())
-
-
-@dp.callback_query(F.data.regexp(r'^adm:offer_access:mode:(owner|all)$'))
-async def adm_offer_access_mode(c: CallbackQuery):
-    if not is_admin(c.from_user.id):
-        return await c.answer('Нет доступа', show_alert=True)
-    mode = c.data.rsplit(':', 1)[1]
-    db.set_offer_access_mode(mode)
-    text = '👑 Режим «Только владелец + исключения» включён.' if mode == 'owner' else '🌐 Режим «Все пользователи» включён.'
-    await c.answer(text, show_alert=True)
-    await c.message.edit_text(offer_access_text(), reply_markup=offer_access_kb())
-
-
-@dp.callback_query(F.data == 'adm:offer_access:add')
-async def adm_offer_access_add_start(c: CallbackQuery, state: FSMContext):
-    if not is_admin(c.from_user.id):
-        return await c.answer('Нет доступа', show_alert=True)
-    await c.answer()
-    await state.set_state(S.offer_access_add)
-    await c.message.answer('➕ <b>Исключение по Telegram ID</b>\n\nОтправь Telegram ID пользователя, например:\n<code>123456789</code>', reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text='⬅️ Отмена', callback_data='adm:offer_access')]]))
-
-
-@dp.message(S.offer_access_add)
-async def adm_offer_access_add_value(m: Message, state: FSMContext):
-    if not is_admin(m.from_user.id):
-        await state.clear()
-        return
-    raw = (m.text or '').strip()
-    if not raw.lstrip('-').isdigit():
-        return await m.answer('❌ Нужен именно Telegram ID, например <code>123456789</code>.')
-    uid = int(raw)
-    if uid <= 0:
-        return await m.answer('❌ Некорректный Telegram ID.')
-    db.offer_access_add(uid)
-    await state.clear()
-    await audit('Добавлено исключение к оферам', m.from_user.id, f'ID: <code>{uid}</code>')
-    await m.answer('✅ <b>Исключение по ID добавлено.</b>\n\n' + offer_access_text(), reply_markup=offer_access_kb())
-
-
-@dp.callback_query(F.data == 'adm:offer_access:add_username')
-async def adm_offer_access_username_start(c: CallbackQuery, state: FSMContext):
-    if not is_admin(c.from_user.id):
-        return await c.answer('Нет доступа', show_alert=True)
-    await c.answer()
-    await state.set_state(S.offer_access_username_add)
-    await c.message.answer('➕ <b>Исключение по @username</b>\n\nОтправь username, например:\n<code>@username</code>', reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text='⬅️ Отмена', callback_data='adm:offer_access')]]))
-
-
-@dp.message(S.offer_access_username_add)
-async def adm_offer_access_username_value(m: Message, state: FSMContext):
-    if not is_admin(m.from_user.id):
-        await state.clear()
-        return
-    username = (m.text or '').strip().lstrip('@')
-    if not re.fullmatch(r'[A-Za-z0-9_]{5,32}', username):
-        return await m.answer('❌ Некорректный username. Пример: <code>@username</code>.')
-    db.offer_access_username_add(username)
-    await state.clear()
-    await audit('Добавлено исключение к оферам', m.from_user.id, f'Username: <code>@{ui.esc(username)}</code>')
-    await m.answer('✅ <b>Исключение по @username добавлено.</b>\n\n' + offer_access_text(), reply_markup=offer_access_kb())
-
-
-@dp.callback_query(F.data.regexp(r'^adm:offer_access:remove:-?\d+$'))
-async def adm_offer_access_remove(c: CallbackQuery):
-    if not is_admin(c.from_user.id):
-        return await c.answer('Нет доступа', show_alert=True)
-    uid = int(c.data.rsplit(':', 1)[1])
-    if uid == OWNER_ID:
-        return await c.answer('Владельца удалить нельзя.', show_alert=True)
-    removed = db.offer_access_remove(uid)
-    await audit('Удалено исключение к оферам', c.from_user.id, f'ID: <code>{uid}</code>')
-    await c.answer('Исключение удалено' if removed else 'Такого ID нет')
-    await c.message.edit_text(offer_access_text(), reply_markup=offer_access_kb())
-
-
-@dp.callback_query(F.data.regexp(r'^adm:offer_access:remove_username:.+$'))
-async def adm_offer_access_username_remove(c: CallbackQuery):
-    if not is_admin(c.from_user.id):
-        return await c.answer('Нет доступа', show_alert=True)
-    username = c.data.split(':', 3)[3]
-    removed = db.offer_access_username_remove(username)
-    await audit('Удалено исключение к оферам', c.from_user.id, f'Username: <code>@{ui.esc(username)}</code>')
-    await c.answer('Исключение удалено' if removed else 'Такого username нет')
-    await c.message.edit_text(offer_access_text(), reply_markup=offer_access_kb())
-
-def offer_business_connections_text():
-    rows = db.business_connections_list()
-    if not rows:
-        return '👤 <b>Подключённые Business-профили</b>\n\nПока нет сохранённых подключений.'
-    lines = ['👤 <b>Подключённые Business-профили</b>', '', '🟡 Новые подключения по умолчанию заблокированы.']
-    for row in rows:
-        name = ' '.join(x for x in (row.get('first_name') or '', row.get('last_name') or '') if x).strip() or 'Без имени'
-        username = f" @{row['username']}" if row.get('username') else ''
-        if not row.get('is_enabled'):
-            status = '⚪ отключён'
-        elif row.get('is_blocked', 1):
-            status = '🔴 заблокирован'
-        else:
-            status = '🟢 разрешён'
-        lines.append(f"• <b>{ui.esc(name)}</b>{ui.esc(username)} — <code>{row['user_id']}</code> — {status}")
-    return '\n'.join(lines)
-
-
-def offer_business_connections_kb():
-    rows = db.business_connections_list()
-    buttons = []
-    seen = set()
-    for row in rows:
-        uid = int(row['user_id'])
-        if uid in seen:
-            continue
-        seen.add(uid)
-        name = ' '.join(x for x in (row.get('first_name') or '', row.get('last_name') or '') if x).strip() or str(uid)
-        if db.offer_user_blocked(uid):
-            buttons.append([InlineKeyboardButton(text=f'🟢 Разрешить {name[:24]}', callback_data=f'adm:offer_conn:unblock:{uid}')])
-        else:
-            buttons.append([InlineKeyboardButton(text=f'🔴 Заблокировать {name[:22]}', callback_data=f'adm:offer_conn:block:{uid}')])
-        buttons.append([InlineKeyboardButton(text=f'🎯 Профиль {name[:20]}', callback_data=f'adm:offer_conn:profile:{uid}')])
-    buttons.append([InlineKeyboardButton(text='⬅️ Назад', callback_data='adm:offer_access')])
-    return InlineKeyboardMarkup(inline_keyboard=buttons)
-
-
-@dp.callback_query(F.data == 'adm:offer_business_connections')
-async def adm_offer_business_connections(c: CallbackQuery):
-    if not is_admin(c.from_user.id):
-        return await c.answer('Нет доступа', show_alert=True)
-    await c.answer()
-    await c.message.edit_text(offer_business_connections_text(), reply_markup=offer_business_connections_kb())
-
-
-@dp.callback_query(F.data.regexp(r'^adm:offer_conn:(block|unblock):-?\d+$'))
-async def adm_offer_connection_toggle(c: CallbackQuery):
-    if not is_admin(c.from_user.id):
-        return await c.answer('Нет доступа', show_alert=True)
-    _, _, action, uid_s = c.data.split(':')
-    uid = int(uid_s)
-    if uid == OWNER_ID:
-        return await c.answer('Владельца нельзя заблокировать.', show_alert=True)
-    if action == 'block':
-        db.block_offer_user(uid)
-        await c.answer('Профиль заблокирован')
-    else:
-        db.unblock_offer_user(uid)
-        await c.answer('Доступ к оферам разрешён')
-    await c.message.edit_text(offer_business_connections_text(), reply_markup=offer_business_connections_kb())
-
-
-@dp.callback_query(F.data.regexp(r'^adm:offer_conn:profile:-?\d+$'))
-async def adm_offer_connection_profile(c: CallbackQuery, state: FSMContext):
-    if not is_admin(c.from_user.id):
-        return await c.answer('Нет доступа', show_alert=True)
-    uid=int(c.data.rsplit(':',1)[1])
-    profile=db.offer_user_profile_get(uid)
-    title='Настроен' if profile else 'не настроен'
-    text=(f'🎯 <b>Профиль передачи пользователя {uid}</b>\n\n'
-          f'Статус: <b>{title}</b>\n')
-    if profile:
-        text += f'Название: <b>{ui.esc(profile["name"])}</b>\nURL: <code>{ui.esc(profile["url"])}</code>\n\n'
-    text += 'Этот профиль применяется только к его новым оферам.'
-    buttons=[[InlineKeyboardButton(text='✏️ Изменить', callback_data=f'adm:offer_conn:profile_edit:{uid}')]]
-    if profile:
-        buttons.append([InlineKeyboardButton(text='🗑 Удалить профиль', callback_data=f'adm:offer_conn:profile_remove:{uid}')])
-    buttons.append([InlineKeyboardButton(text='⬅️ Назад', callback_data='adm:offer_business_connections')])
-    await c.answer()
-    await c.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
-
-
-@dp.callback_query(F.data.regexp(r'^adm:offer_conn:profile_edit:-?\d+$'))
-async def adm_offer_connection_profile_edit_start(c: CallbackQuery, state: FSMContext):
-    if not is_admin(c.from_user.id):
-        return await c.answer('Нет доступа', show_alert=True)
-    uid=int(c.data.rsplit(':',1)[1])
-    await state.update_data(admin_profile_uid=uid)
-    await state.set_state(S.admin_user_profile_name)
-    await c.answer()
-    await c.message.answer(f'✏️ <b>Профиль передачи для {uid}</b>\n\nОтправь название профиля.')
-
-
-@dp.message(S.admin_user_profile_name)
-async def adm_user_profile_name(m: Message, state: FSMContext):
-    if not is_admin(m.from_user.id):
-        await state.clear(); return
-    name=(m.text or '').strip()
-    if not name or len(name)>64:
-        return await m.answer('❌ Название должно быть от 1 до 64 символов.')
-    await state.update_data(admin_profile_name=name)
-    await state.set_state(S.admin_user_profile_url)
-    await m.answer('🔗 Отправь Telegram-ссылку профиля: <code>https://t.me/username</code> или <code>tg://user?id=123456789</code>')
-
-
-@dp.message(S.admin_user_profile_url)
-async def adm_user_profile_url(m: Message, state: FSMContext):
-    if not is_admin(m.from_user.id):
-        await state.clear(); return
-    url=(m.text or '').strip()
-    if not re.match(r'^(?:https?://t\.me/[^\s]+|tg://user\?id=-?\d+)$', url, re.I):
-        return await m.answer('❌ Нужна Telegram-ссылка профиля.')
-    data=await state.get_data(); uid=int(data.get('admin_profile_uid') or 0); name=data.get('admin_profile_name') or 'Профиль'
-    if not uid:
-        await state.clear(); return await m.answer('❌ Пользователь не найден.')
-    db.offer_user_profile_set(uid,name,url)
-    await state.clear()
-    await m.answer(f'✅ Профиль передачи пользователя <code>{uid}</code> сохранён.\n\nНовые оферы этого пользователя будут использовать только его URL.')
-
-
-@dp.callback_query(F.data.regexp(r'^adm:offer_conn:profile_remove:-?\d+$'))
-async def adm_user_profile_remove(c: CallbackQuery):
-    if not is_admin(c.from_user.id):
-        return await c.answer('Нет доступа', show_alert=True)
-    uid=int(c.data.rsplit(':',1)[1])
-    db.offer_user_profile_remove(uid)
-    await c.answer('Профиль удалён')
-    profile=db.offer_user_profile_get(uid)
-    text=f'🎯 <b>Профиль передачи пользователя {uid}</b>\n\n⚪ Профиль не настроен.'
-    await c.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text='✏️ Добавить профиль', callback_data=f'adm:offer_conn:profile_edit:{uid}')],
-        [InlineKeyboardButton(text='⬅️ Назад', callback_data='adm:offer_business_connections')],
-    ]))
-
-
-@dp.callback_query(F.data == 'adm:stats')
-async def adm_stats(c: CallbackQuery):
-    if not is_admin(c.from_user.id):
-        return await c.answer('Нет доступа', show_alert=True)
-    await c.answer()
-    await c.message.answer(stats_text())
-
-
-@dp.callback_query(F.data == 'adm:userfind')
-async def adm_userfind_start(c: CallbackQuery, state: FSMContext):
-    if not is_admin(c.from_user.id):
-        return await c.answer('Нет доступа', show_alert=True)
-    await c.answer()
-    await state.set_state(S.admin_user_search)
-    await c.message.answer('🔎 <b>Поиск пользователя</b>\n\nВведите Telegram ID или username, например <code>123456789</code> или <code>@kod30</code>.', reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text='⬅️ Отмена', callback_data='adm:home')]]))
-
-
-@dp.message(S.admin_user_search)
-async def adm_userfind_value(m: Message, state: FSMContext):
-    if not is_admin(m.from_user.id):
-        await state.clear()
-        return
-    rows = db.search_users(m.text or '', 10)
-    await state.clear()
-    await audit('Поиск пользователя администратором', m.from_user.id, f'Запрос: <code>{ui.esc(m.text or "")}</code> · найдено: <b>{len(rows)}</b>')
-    if not rows:
-        return await m.answer('❌ Пользователь не найден.', reply_markup=admin_home_kb())
-    lines = []
-    for u in rows:
-        name = '@' + u['username'] if u.get('username') else (u.get('first_name') or '—')
-        tag = '💎' if u['is_premium'] else ('🚫' if u['is_banned'] else '👤')
-        lines.append(f'{tag} <code>{u["user_id"]}</code> · {ui.esc(name)}')
-    await m.answer('🔎 <b>Результаты поиска</b>\n\n' + ui.block(*lines), reply_markup=admin_users_kb(rows))
-
-
-@dp.callback_query(F.data == 'adm:users')
-async def adm_users(c: CallbackQuery):
-    if not is_admin(c.from_user.id):
-        return await c.answer('Нет доступа', show_alert=True)
-    await c.answer()
-    rows = db.recent_users(10)
-    lines = []
-    for u in rows:
-        tag = '💎' if u['is_premium'] else ('🚫' if u['is_banned'] else '•')
-        name = f'@{u["username"]}' if u['username'] else (u['first_name'] or '—')
-        lines.append(f'{tag} <code>{u["user_id"]}</code> · {ui.esc(name)}')
-    text = '👥 <b>Пользователи</b>\n\n' + (ui.block(*lines) if lines else 'Пользователей пока нет.') + '\n\n<i>Управление — кнопками ниже.</i>'
-    await c.message.answer(text, reply_markup=admin_users_kb(rows))
-
-
-
-@dp.callback_query(F.data == 'adm:searches')
-async def adm_searches(c: CallbackQuery):
-    if not is_admin(c.from_user.id):
-        return await c.answer('Нет доступа', show_alert=True)
-    await c.answer()
-    rows = db.recent_searches(12)
-    lines = []
-    for x in rows:
-        lines.append(f"{'✅' if x['status']=='completed' else '⏹' if x['status']=='stopped' else '🔎' if x['status']=='in_progress' else '⚠️'} <b>#{x['id']}</b> · <code>{x['user_id']}</code> · {ui.esc(ui.pretty(x['model']))} · <code>{x['last_checked_id']}</code>")
-    text = '🔎 <b>Последние поиски</b>\n\n' + (ui.block(*lines) if lines else 'Поисков пока нет.')
-    await c.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text='⬅️ Панель', callback_data='adm:home')]]))
-
-
-@dp.callback_query(F.data == 'adm:logs')
-async def adm_logs(c: CallbackQuery):
-    if not is_admin(c.from_user.id):
-        return await c.answer('Нет доступа', show_alert=True)
-    await c.answer()
-    path = 'logs/giftparser.log'
-    try:
-        with open(path, 'r', encoding='utf-8') as f:
-            lines = f.readlines()[-25:]
-    except FileNotFoundError:
-        lines = []
-    body = ''.join(lines).strip() or 'Лог пока пуст.'
-    if len(body) > 3500:
-        body = body[-3500:]
-    text = '📜 <b>Последние логи</b>\n\n<code>' + ui.esc(body) + '</code>'
-    await c.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text='🔄 Обновить', callback_data='adm:logs')],
-        [InlineKeyboardButton(text='⬅️ Панель', callback_data='adm:home')]
-    ]))
+    if not is_admin(m.from_user.id): return
+    await m.answer('⚙️ <b>АДМИН-ПАНЕЛЬ</b>\n\nВыбери раздел.', reply_markup=admin_home_kb())
 
 
 @dp.callback_query(F.data == 'adm:home')
 async def adm_home(c: CallbackQuery):
-    if not is_admin(c.from_user.id):
-        return await c.answer('Нет доступа', show_alert=True)
-    await c.answer()
-    await c.message.answer('⚙️ <b>Админ-панель</b>', reply_markup=admin_home_kb())
+    if not is_admin(c.from_user.id): return await c.answer('Нет доступа', show_alert=True)
+    await c.answer(); await c.message.edit_text('⚙️ <b>АДМИН-ПАНЕЛЬ</b>\n\nВыбери раздел.', reply_markup=admin_home_kb())
+
+
+@dp.callback_query(F.data == 'adm:stats')
+async def adm_stats(c: CallbackQuery):
+    if not is_admin(c.from_user.id): return await c.answer('Нет доступа', show_alert=True)
+    s=db.stats(); active_pay=len(db.active_payment_invoices(1000))
+    text=('📊 <b>СТАТИСТИКА</b>\n\n'
+          f'👥 Пользователей: <b>{s["users"]}</b>\n'
+          f'💎 Premium: <b>{s["premium"]}</b>\n'
+          f'🚫 Банов: <b>{s["banned"]}</b>\n'
+          f'🔎 Поисков: <b>{s["searches"]}</b>\n'
+          f'🎁 Находок: <b>{s["found"]}</b>\n'
+          f'⚡ Активных поисков: <b>{len(ACTIVE)}</b>\n'
+          f'💳 Ожидающих платежей: <b>{active_pay}</b>\n'
+          f'🎁 Business-подключений: <b>{len(db.business_connections_list())}</b>')
+    await c.answer(); await c.message.edit_text(text, reply_markup=admin_back())
+
+
+@dp.callback_query(F.data == 'adm:users')
+async def adm_users(c: CallbackQuery):
+    if not is_admin(c.from_user.id): return await c.answer('Нет доступа', show_alert=True)
+    await c.answer(); await c.message.edit_text('👥 <b>УПРАВЛЕНИЕ ПОЛЬЗОВАТЕЛЯМИ</b>\n\nВыбери пользователя или найди его по ID/@username.', reply_markup=admin_users_kb(db.recent_users(15)))
+
+
+@dp.callback_query(F.data == 'adm:userfind')
+async def adm_userfind(c: CallbackQuery, state: FSMContext):
+    if not is_admin(c.from_user.id): return await c.answer('Нет доступа', show_alert=True)
+    await c.answer(); await state.set_state(S.admin_user_search)
+    await c.message.edit_text('🔎 <b>НАЙТИ ПОЛЬЗОВАТЕЛЯ</b>\n\nОтправь Telegram ID или @username.', reply_markup=admin_back('adm:users'))
+
+
+@dp.message(S.admin_user_search)
+async def adm_userfind_value(m: Message, state: FSMContext):
+    if not is_admin(m.from_user.id): await state.clear(); return
+    q=(m.text or '').strip()
+    rows=db.search_users(q,10)
+    await state.clear()
+    if not rows: return await m.answer('❌ Пользователь не найден.', reply_markup=admin_users_kb(db.recent_users(10)))
+    await m.answer('🔎 <b>РЕЗУЛЬТАТ ПОИСКА</b>', reply_markup=admin_users_kb(rows))
 
 
 @dp.callback_query(F.data.startswith('adm:user:'))
 async def adm_user(c: CallbackQuery):
-    if not is_admin(c.from_user.id):
-        return await c.answer('Нет доступа', show_alert=True)
-    uid = int(c.data.split(':')[2])
-    u = db.get_user(uid)
-    if not u:
-        return await c.answer('Пользователь не найден', show_alert=True)
-    await c.answer()
-    text = (f'👤 <b>Пользователь</b>\n\n'
-            f'🆔 <code>{uid}</code>\n'
-            f'👤 {ui.esc("@" + u["username"] if u.get("username") else u.get("first_name") or "—")}\n'
-            f'💎 Premium: <b>{"да" if u["is_premium"] else "нет"}</b>\n'
-            f'🚫 Бан: <b>{"да" if u["is_banned"] else "нет"}</b>\n'
-            f'🔎 Поисков: <b>{u.get("total_searches", 0)}</b>\n'
-            f'🎁 Находок: <b>{u.get("total_found", 0)}</b>')
-    parser_has = bool(db.parser_access_allowed(uid, OWNER_ID))
-    parser_direct = bool(db._one('SELECT 1 AS ok FROM parser_access_users WHERE user_id=?', (uid,)))
-    parser_status = '👑 полный доступ (админ)' if is_admin(uid) else ('✅ доступ выдан' if parser_direct else '❌ доступа нет')
-    markup = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text='➖ Снять Premium' if u['is_premium'] else '💎 Выдать Premium', callback_data=f'adm:premium:{uid}')],
-        [InlineKeyboardButton(text='✅ Разбанить' if u['is_banned'] else '🚫 Заблокировать', callback_data=f'adm:ban:{uid}')],
-        [InlineKeyboardButton(text='🔎 Выдать доступ к поиску по чатам', callback_data=f'adm:parser_user:add:{uid}')],
-        [InlineKeyboardButton(text='🚫 Снять доступ к поиску по чатам', callback_data=f'adm:parser_user:remove:{uid}')],
-        [InlineKeyboardButton(text=f'🔎 Статус: {parser_status}', callback_data='noop')],
-        [InlineKeyboardButton(text='🔎 История поисков', callback_data=f'adm:usersearch:{uid}')],
-        [InlineKeyboardButton(text='⬅️ Пользователи', callback_data='adm:users')],
-    ])
-    await c.message.answer(text, reply_markup=markup)
+    if not is_admin(c.from_user.id): return await c.answer('Нет доступа', show_alert=True)
+    uid=int(c.data.split(':')[2]); u=db.get_user(uid)
+    if not u: return await c.answer('Пользователь не найден', show_alert=True)
+    await c.answer(); await c.message.edit_text(admin_user_text(uid), reply_markup=admin_user_kb(uid))
+
+
+@dp.callback_query(F.data == 'adm:parser_access')
+async def adm_parser_access(c: CallbackQuery):
+    if not is_admin(c.from_user.id): return await c.answer('Нет доступа', show_alert=True)
+    await c.answer(); await c.message.edit_text(parser_access_text(), reply_markup=parser_access_kb())
+
+
+@dp.callback_query(F.data.regexp(r'^adm:parser_mode:(owner|premium|developers|all)$'))
+async def adm_parser_mode(c: CallbackQuery):
+    if not is_admin(c.from_user.id): return await c.answer('Нет доступа', show_alert=True)
+    mode=c.data.rsplit(':',1)[1]
+    db.set_parser_setting('access_mode',mode)
+    await audit('Изменён режим доступа к парсеру',c.from_user.id,f'Режим: <code>{mode}</code>')
+    await c.answer('Режим сохранён'); await c.message.edit_text(parser_access_text(),reply_markup=parser_access_kb())
 
 
 @dp.callback_query(F.data.regexp(r'^adm:parser_user:(add|remove):-?\d+$'))
 async def adm_parser_user_access(c: CallbackQuery):
-    if not is_admin(c.from_user.id):
-        return await c.answer('Нет доступа', show_alert=True)
-    action, uid_s = c.data.split(':')[2], c.data.split(':')[3]
-    uid = int(uid_s)
-    if uid == OWNER_ID or is_admin(uid):
-        return await c.answer('У владельца и администраторов полный доступ.', show_alert=True)
-    if action == 'add':
-        db.parser_access_add(uid)
-        direct = bool(db._one('SELECT 1 AS ok FROM parser_access_users WHERE user_id=?', (uid,)))
-        allowed_now = db.parser_access_allowed(uid, PRIMARY_OWNER_ID)
-        if not direct:
-            return await c.answer(f'ОШИБКА: запись для ID {uid} не сохранилась в БД.', show_alert=True)
-        text = f'🔎 Доступ выдан. ID: {uid} | БД: ✅ | проверка: {"✅" if allowed_now else "❌"}'
-        await audit('Выдан доступ к поиску по чатам', c.from_user.id, f'Пользователь: <code>{uid}</code> · DB=OK · allowed={allowed_now}')
-    else:
-        db.parser_access_remove(uid)
-        direct = bool(db._one('SELECT 1 AS ok FROM parser_access_users WHERE user_id=?', (uid,)))
-        allowed_now = db.parser_access_allowed(uid, PRIMARY_OWNER_ID)
-        text = f'🔒 Доступ снят. ID: {uid} | БД: {"❌" if not direct else "⚠️"} | проверка: {"✅" if allowed_now else "❌"}'
-        await audit('Снят доступ к поиску по чатам', c.from_user.id, f'Пользователь: <code>{uid}</code> · DB_direct={direct} · allowed={allowed_now}')
-    await c.answer(text, show_alert=True)
-    # Refresh the user card.
-    u = db.get_user(uid)
-    if not u:
-        return
-    parser_has = bool(db.parser_access_allowed(uid, OWNER_ID))
-    parser_direct = bool(db._one('SELECT 1 AS ok FROM parser_access_users WHERE user_id=?', (uid,)))
-    parser_status = '👑 полный доступ (админ)' if is_admin(uid) else ('✅ доступ выдан' if parser_direct else '❌ доступа нет')
-    markup = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text='➖ Снять Premium' if u['is_premium'] else '💎 Выдать Premium', callback_data=f'adm:premium:{uid}')],
-        [InlineKeyboardButton(text='✅ Разбанить' if u['is_banned'] else '🚫 Заблокировать', callback_data=f'adm:ban:{uid}')],
-        [InlineKeyboardButton(text='🔎 Выдать доступ к поиску по чатам', callback_data=f'adm:parser_user:add:{uid}')],
-        [InlineKeyboardButton(text='🚫 Снять доступ к поиску по чатам', callback_data=f'adm:parser_user:remove:{uid}')],
-        [InlineKeyboardButton(text=f'🔎 Статус: {parser_status}', callback_data='noop')],
-        [InlineKeyboardButton(text='🔎 История поисков', callback_data=f'adm:usersearch:{uid}')],
-        [InlineKeyboardButton(text='⬅️ Пользователи', callback_data='adm:users')],
-    ])
-    await c.message.edit_reply_markup(reply_markup=markup)
+    if not is_admin(c.from_user.id): return await c.answer('Нет доступа', show_alert=True)
+    action,uid_s=c.data.split(':')[2:4]; uid=int(uid_s)
+    if is_owner(uid) or (is_admin(uid) and uid != c.from_user.id):
+        if action=='remove' and is_owner(uid): return await c.answer('Владелец всегда имеет доступ.',show_alert=True)
+    if action=='add': db.parser_access_add(uid); msg='🔎 Доступ к парсеру выдан.'
+    else: db.parser_access_remove(uid); msg='🔒 Ручной доступ к парсеру снят.'
+    await c.answer(msg,show_alert=True); await c.message.edit_text(admin_user_text(uid),reply_markup=admin_user_kb(uid))
 
 
-@dp.callback_query(F.data.startswith('adm:usersearch:'))
-async def adm_usersearch(c: CallbackQuery):
-    if not is_admin(c.from_user.id):
-        return await c.answer('Нет доступа', show_alert=True)
-    uid = int(c.data.split(':')[2])
-    rows = db.user_searches(uid, 10) if hasattr(db, 'user_searches') else []
-    await c.answer()
-    lines = [f"#{x['id']} · {ui.esc(ui.pretty(x['model']))} · <code>{x['start_id']}-{x['end_id']}</code> · {x['status']}" for x in rows]
-    text = f'🔎 <b>Поиски пользователя {uid}</b>\n\n' + (ui.block(*lines) if lines else 'Поисков нет.')
-    await c.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text='⬅️ Пользователь', callback_data=f'adm:user:{uid}')]]))
+@dp.callback_query(F.data.startswith('adm:admin_toggle:'))
+async def adm_admin_toggle(c: CallbackQuery):
+    if not is_owner(c.from_user.id): return await c.answer('Только владелец может управлять администраторами.',show_alert=True)
+    uid=int(c.data.split(':')[2])
+    if is_owner(uid): return await c.answer('Владелец уже имеет максимальные права.',show_alert=True)
+    if db.admin_allowed(uid,OWNER_ID): db.admin_remove(uid); msg='🛡 Администратор снят.'
+    else: db.admin_add(uid); msg='🛡 Администратор добавлен.'
+    await c.answer(msg,show_alert=True); await c.message.edit_text(admin_user_text(uid),reply_markup=admin_user_kb(uid))
 
 
-@dp.callback_query(F.data.startswith('adm:premium:'))
-async def adm_premium(c: CallbackQuery):
-    if not is_admin(c.from_user.id):
-        return await c.answer('Нет доступа', show_alert=True)
-    uid = int(c.data.split(':')[2])
-    u = db.get_user(uid)
-    if not u:
-        return await c.answer('Пользователь не найден', show_alert=True)
-    new_value = not bool(u['is_premium'])
-    db.set_premium(uid, new_value)
-    await audit('Изменён Premium', c.from_user.id, f'Пользователь: <code>{uid}</code> · значение: <b>{"включён" if new_value else "снят"}</b>')
-    await c.answer('Premium включён' if new_value else 'Premium снят')
-    await c.message.edit_reply_markup(reply_markup=admin_users_kb(db.recent_users(10)))
+@dp.callback_query(F.data.regexp(r'^adm:grant:(premium|chat|offers):-?\d+:\d+$'))
+async def adm_grant(c: CallbackQuery):
+    if not is_admin(c.from_user.id): return await c.answer('Нет доступа',show_alert=True)
+    _,_,kind,uid_s,seconds_s=c.data.split(':'); uid=int(uid_s); seconds=int(seconds_s)
+    db.grant_entitlement(uid,kind,seconds)
+    if kind=='premium': db.set_premium(uid,True)
+    if kind=='offers':
+        # One admin action must be sufficient for DEMO offers. Keep the
+        # entitlement and Business approval in sync for this exact Telegram ID.
+        db.offer_access_add(uid)
+        db.unblock_offer_user(uid)
+        log.info('OFFER ACCESS GRANTED via admin user=%s seconds=%s', uid, seconds)
+    await c.answer('Доступ выдан' + (' — оферы разрешены для Business-профиля.' if kind=='offers' else ''),show_alert=True); await c.message.edit_text(admin_user_text(uid),reply_markup=admin_user_kb(uid))
+
+
+@dp.callback_query(F.data.startswith('adm:trial_reset:'))
+async def adm_trial_reset(c: CallbackQuery):
+    if not is_admin(c.from_user.id): return await c.answer('Нет доступа',show_alert=True)
+    uid=int(c.data.split(':')[2])
+    with db._db() as conn:
+        conn.execute('UPDATE users SET trial_regular_left=20, trial_random_left=20, trial_id_left=20 WHERE user_id=?',(uid,))
+    await c.answer('Лимиты сброшены'); await c.message.edit_text(admin_user_text(uid),reply_markup=admin_user_kb(uid))
 
 
 @dp.callback_query(F.data.startswith('adm:ban:'))
 async def adm_ban(c: CallbackQuery):
+    if not is_admin(c.from_user.id): return await c.answer('Нет доступа',show_alert=True)
+    uid=int(c.data.split(':')[2])
+    if is_owner(uid): return await c.answer('Владельца заблокировать нельзя.',show_alert=True)
+    new=not db.is_banned(uid); db.set_ban(uid,new)
+    await c.answer('Пользователь заблокирован' if new else 'Пользователь разблокирован',show_alert=True)
+    await c.message.edit_text(admin_user_text(uid),reply_markup=admin_user_kb(uid))
+
+
+@dp.callback_query(F.data == 'adm:offer_access')
+async def adm_offer_access(c: CallbackQuery):
+    if not is_admin(c.from_user.id): return await c.answer('Нет доступа',show_alert=True)
+    await c.answer(); await c.message.edit_text(offers_admin_text(),reply_markup=offers_admin_kb())
+
+
+@dp.callback_query(F.data == 'adm:tariffs')
+async def adm_tariffs(c: CallbackQuery):
+    if not is_admin(c.from_user.id): return await c.answer('Нет доступа',show_alert=True)
+    await c.answer(); await c.message.edit_text(tariffs_text(),reply_markup=tariffs_kb())
+
+
+@dp.callback_query(F.data.regexp(r'^adm:tariff:(premium_2d|chat_24h|offers_5d)$'))
+async def adm_tariff_start(c: CallbackQuery, state: FSMContext):
+    if not is_admin(c.from_user.id): return await c.answer('Нет доступа', show_alert=True)
+    key=c.data.split(':')[-1]
+    await state.set_state(S.admin_tariff); await state.update_data(tariff_key=key)
+    current=tariff_config()[key][0]
+    await c.answer(); await c.message.edit_text(f'💳 <b>Изменение тарифа</b>\n\nТекущая цена: <b>{current} TON</b>\n\nОтправь новую цену числом, например <code>12.5</code>.', reply_markup=admin_back('adm:tariffs'))
+
+
+@dp.message(S.admin_tariff)
+async def adm_tariff_value(m: Message, state: FSMContext):
+    if not is_admin(m.from_user.id): await state.clear(); return
+    try:
+        value=float((m.text or '').replace(',','.').strip())
+        if value <= 0 or value > 100000: raise ValueError
+    except Exception:
+        return await m.answer('❌ Введи положительную цену до 100000 TON.')
+    data=await state.get_data(); key=data.get('tariff_key')
+    if key not in tariff_config(): await state.clear(); return await m.answer('❌ Тариф не найден.')
+    db.set_setting('tariff_'+key, str(value).rstrip('0').rstrip('.') if '.' in str(value) else str(int(value)))
+    await state.clear()
+    await m.answer('✅ Цена сохранена.', reply_markup=tariffs_kb())
+
+
+@dp.callback_query(F.data == 'adm:logs')
+async def adm_logs(c: CallbackQuery):
+    if not is_admin(c.from_user.id): return await c.answer('Нет доступа',show_alert=True)
+    try:
+        text=''.join(Path('logs/giftparser.log').read_text(encoding='utf-8').splitlines(True)[-35:])[-3800:]
+    except Exception as e: text=f'Лог недоступен: {e}'
+    await c.answer(); await c.message.edit_text('<b>📜 ЛОГИ</b>\n\n<pre>'+ui.esc(text)+'</pre>',reply_markup=admin_back())
+
+
+def maintenance_kb():
+    enabled=db.get_setting('maintenance_mode','0') == '1'
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=('🔴 Выключить' if enabled else '🟢 Включить'), callback_data='adm:maintenance:toggle')],
+        [InlineKeyboardButton(text='‹ Назад', callback_data='adm:home')],
+    ])
+
+@dp.callback_query(F.data == 'adm:maintenance')
+async def adm_maintenance(c: CallbackQuery):
+    if not is_admin(c.from_user.id): return await c.answer('Нет доступа', show_alert=True)
+    enabled=db.get_setting('maintenance_mode','0') == '1'
+    await c.answer(); await c.message.edit_text('🚧 <b>ТЕХНИЧЕСКИЕ РАБОТЫ</b>\n\nСтатус: <b>'+('включены' if enabled else 'выключены')+'</b>\n\nПри включении обычные пользователи не смогут пользоваться ботом, админы продолжат работу.', reply_markup=maintenance_kb())
+
+@dp.callback_query(F.data == 'adm:maintenance:toggle')
+async def adm_maintenance_toggle(c: CallbackQuery):
+    if not is_admin(c.from_user.id): return await c.answer('Нет доступа', show_alert=True)
+    new='0' if db.get_setting('maintenance_mode','0') == '1' else '1'
+    db.set_setting('maintenance_mode', new)
+    await c.answer('Статус изменён', show_alert=True)
+    enabled=new=='1'
+    await c.message.edit_text('🚧 <b>ТЕХНИЧЕСКИЕ РАБОТЫ</b>\n\nСтатус: <b>'+('включены' if enabled else 'выключены')+'</b>', reply_markup=maintenance_kb())
+
+
+def system_text():
+    log_channel=db.get_setting('log_channel_id') or 'не задан'
+    session=db.get_parser_session()
+    return ('🛠 <b>СИСТЕМА</b>\n\n'
+            f'🤖 Bot: <b>online</b>\n'
+            f'💾 SQLite: <b>WAL</b>\n'
+            f'🔎 Peek API: <b>{"настроен"}</b>\n'
+            f'📡 Telethon: <b>{"подключён" if session and session.get("is_active") else "не подключён"}</b>\n'
+            f'💳 CryptoBot: <b>{"готов" if crypto_pay.configured else "не настроен"}</b>\n'
+            f'🚀 xRocket: <b>{"готов" if xrocket_pay.configured else "не настроен"}</b>\n'
+            f'📣 Рассылка: <b>очередь</b>\n'
+            f'📜 Канал логов: <code>{ui.esc(log_channel)}</code>')
+
+def system_kb():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text='📜 Изменить канал логов', callback_data='adm:log_channel')],
+        [InlineKeyboardButton(text='🔄 Обновить', callback_data='adm:system')],
+        [InlineKeyboardButton(text='‹ Назад', callback_data='adm:home')],
+    ])
+
+@dp.callback_query(F.data == 'adm:system')
+async def adm_system(c: CallbackQuery):
+    if not is_admin(c.from_user.id): return await c.answer('Нет доступа', show_alert=True)
+    await c.answer(); await c.message.edit_text(system_text(), reply_markup=system_kb())
+
+@dp.callback_query(F.data == 'adm:log_channel')
+async def adm_log_channel_start(c: CallbackQuery, state: FSMContext):
+    if not is_owner(c.from_user.id): return await c.answer('Только владелец.', show_alert=True)
+    await state.set_state(S.admin_log_channel); await c.answer()
+    await c.message.edit_text('📜 <b>КАНАЛ ЛОГОВ</b>\n\nПришли ID канала вида <code>-1001234567890</code>.\nБот должен быть администратором этого канала.', reply_markup=admin_back('adm:system'))
+
+@dp.message(S.admin_log_channel)
+async def adm_log_channel_value(m: Message, state: FSMContext):
+    if not is_owner(m.from_user.id): await state.clear(); return
+    raw=(m.text or '').strip()
+    try: cid=int(raw)
+    except ValueError: return await m.answer('❌ Нужен числовой ID канала, например <code>-1001234567890</code>.')
+    db.set_setting('log_channel_id', str(cid))
+    global LOG_CHANNEL_DISABLED
+    LOG_CHANNEL_DISABLED=False
+    await state.clear(); await audit('Канал логов изменён', m.from_user.id, f'Новый канал: <code>{cid}</code>')
+    await m.answer(f'✅ Канал логов сохранён: <code>{cid}</code>', reply_markup=system_kb())
+
+
+# Admin: Business-профили оферов.
+def admin_business_connections_kb():
+    rows = db.business_connections_list()
+    buttons = []
+    seen = set()
+    for row in rows[:100]:
+        uid = int(row['user_id'])
+        if uid in seen:
+            continue
+        seen.add(uid)
+        name = (' @' + row['username']) if row.get('username') else (row.get('first_name') or str(uid))
+        has_access = db.offer_access_allowed(uid, row.get('username'), OWNER_ID)
+        if has_access:
+            buttons.append([InlineKeyboardButton(text=f'🔴 Забрать доступ · {str(name).strip()[:20]}', callback_data=f'adm:offer_conn:revoke:{uid}')])
+        else:
+            buttons.append([InlineKeyboardButton(text=f'🟢 Выдать доступ · {str(name).strip()[:20]}', callback_data=f'adm:offer_conn:grant:{uid}')])
+    buttons.append([InlineKeyboardButton(text='‹ Назад', callback_data='adm:offer_access')])
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+@dp.callback_query(F.data.regexp(r'^adm:business_reset:-?\d+$'))
+async def adm_business_reset(c: CallbackQuery):
     if not is_admin(c.from_user.id):
         return await c.answer('Нет доступа', show_alert=True)
     uid = int(c.data.split(':')[2])
     u = db.get_user(uid)
     if not u:
         return await c.answer('Пользователь не найден', show_alert=True)
-    new_value = not bool(u['is_banned'])
-    db.set_ban(uid, new_value)
-    await audit('Изменён бан', c.from_user.id, f'Пользователь: <code>{uid}</code> · значение: <b>{"заблокирован" if new_value else "разблокирован"}</b>')
-    await c.answer('Пользователь заблокирован' if new_value else 'Пользователь разблокирован')
-    await c.message.edit_reply_markup(reply_markup=admin_users_kb(db.recent_users(10)))
 
-def _admin_target(m: Message):
-    parts = (m.text or '').split(maxsplit=1)
-    return int(parts[1]) if len(parts) == 2 and parts[1].strip().lstrip('-').isdigit() else None
+    removed = db.reset_business_sessions(uid)
+    BUSINESS_OWNER_ID_CACHE_KEYS = [k for k, v in BUSINESS_OWNER_ID_CACHE.items() if int(v or 0) == uid]
+    for key in BUSINESS_OWNER_ID_CACHE_KEYS:
+        BUSINESS_OWNER_ID_CACHE.pop(key, None)
+        BUSINESS_SELLER_NAME_CACHE.pop(key, None)
+
+    # Keep the user's offer permission/paid entitlement. The reset is only a
+    # local session cleanup; the next Business update will create one fresh row.
+    db.offer_access_add(uid)
+    await audit('Сброшены Business-сессии офера', c.from_user.id,
+                f'Пользователь: <code>{uid}</code>; удалено локальных подключений: <b>{removed}</b>')
+    await c.answer(f'Сброшено подключений: {removed}', show_alert=True)
+    await c.message.edit_text(admin_user_text(uid), reply_markup=admin_user_kb(uid))
 
 
-async def _admin_cmd(m: Message, name: str, action, done_text: str):
-    if not is_admin(m.from_user.id):
+@dp.callback_query(F.data == 'adm:offer_reset_all')
+async def adm_offer_reset_all_confirm(c: CallbackQuery):
+    if not is_admin(c.from_user.id):
+        return await c.answer('Нет доступа', show_alert=True)
+    await c.answer()
+    await c.message.edit_text(
+        '🧹 <b>СБРОС ВСЕХ ПОЛЬЗОВАТЕЛЕЙ ОФЕРОВ</b>\n\n'
+        'Будут реально удалены из локальной базы: ручные доступы, Business-подключения, блокировки и профили передачи.\n\n'
+        'История уже созданных оферов и остальные функции бота не удаляются.\n\n'
+        '<b>Продолжить?</b>',
+        reply_markup=offer_reset_all_confirm_kb(),
+    )
+
+
+@dp.callback_query(F.data == 'adm:offer_reset_all:confirm')
+async def adm_offer_reset_all_execute(c: CallbackQuery):
+    if not is_admin(c.from_user.id):
+        return await c.answer('Нет доступа', show_alert=True)
+    # Keep the canonical owner alive; all other offer users/connections are
+    # genuinely removed from the local offer-access state.
+    removed = db.reset_all_offer_users(keep_user_ids={OWNER_ID})
+    BUSINESS_OWNER_ID_CACHE.clear()
+    BUSINESS_SELLER_NAME_CACHE.clear()
+    # Re-apply the explicit bootstrap grant requested for 8570516857 only after
+    # the reset operation, so that the button still means a full user reset
+    # while the configured bootstrap account remains intentionally permitted.
+    for _offer_uid in BOOTSTRAP_OFFER_ACCESS_IDS:
+        if _offer_uid != OWNER_ID:
+            db.offer_access_add(_offer_uid)
+            db.unblock_offer_user(_offer_uid)
+    await audit(
+        'Полностью сброшены пользователи оферов', c.from_user.id,
+        'Удалено: ' + ', '.join(f'{k}=<b>{v}</b>' for k, v in removed.items())
+    )
+    await c.answer('Все локальные пользователи оферов сброшены.', show_alert=True)
+    await c.message.edit_text(offers_admin_text(), reply_markup=offers_admin_kb())
+
+
+@dp.callback_query(F.data == 'adm:offer_business_connections')
+async def adm_offer_business_connections(c: CallbackQuery):
+    if not is_admin(c.from_user.id): return await c.answer('Нет доступа',show_alert=True)
+    await c.answer(); await c.message.edit_text('🔗 <b>BUSINESS-ПРОФИЛИ</b>\n\nНовые подключения по умолчанию закрыты. Нажми кнопку рядом с пользователем, чтобы разрешить или запретить оферы.',reply_markup=admin_business_connections_kb())
+
+@dp.callback_query(F.data.regexp(r'^adm:offer_conn:(grant|revoke):-?\d+$'))
+async def adm_offer_connection_toggle(c: CallbackQuery):
+    if not is_admin(c.from_user.id): return await c.answer('Нет доступа', show_alert=True)
+    action = c.data.split(':')[2]
+    uid = int(c.data.split(':')[3])
+    if action == 'grant':
+        db.offer_access_add(uid)
+        db.unblock_offer_user(uid)
+        msg = 'Доступ к оферам выдан.'
+        title = '🟢 Доступ к оферам выдан'
+    else:
+        db.offer_access_remove(uid)
+        db.block_offer_user(uid)
+        msg = 'Доступ к оферам забран.'
+        title = '🔴 Доступ к оферам забран'
+    await audit(title, c.from_user.id, f'Пользователь: <code>{uid}</code>')
+    await c.answer(msg, show_alert=True)
+    await c.message.edit_text('🔗 <b>BUSINESS-ПРОФИЛИ</b>\n\n🟢 — доступ выдан\n🔴 — доступ забран.', reply_markup=admin_business_connections_kb())
+
+
+# ───────────────────────── Business routing test ─────────────────────────
+@dp.message(F.text.regexp(r'^\s*\.привет\s*$'))
+async def hello_command_private(m: Message):
+    """Simple routing test: .привет -> Привет in the same normal bot chat."""
+    try:
+        sent = await bot.send_message(chat_id=m.chat.id, text='Привет')
+        try:
+            await bot.delete_message(chat_id=m.chat.id, message_id=m.message_id)
+        except Exception as e:
+            log.warning('HELLO command delete failed chat=%s error=%r', m.chat.id, e)
+        log.info('HELLO delivered chat=%s via=bot', m.chat.id)
+        return sent
+    except Exception as e:
+        log.error('HELLO delivery failed chat=%s error=%r', m.chat.id, e, exc_info=True)
+        try:
+            await m.answer(f'⚠️ Не удалось отправить <b>Привет</b>.\n\nПричина: {ui.esc(str(e))}')
+        except Exception:
+            pass
+
+
+@dp.business_message(F.text.regexp(r'^\s*\.привет\s*$'))
+async def hello_command_business(m: Message):
+    """Business routing test: .привет -> Привет in the exact originating chat."""
+    bc_id = getattr(m, 'business_connection_id', None)
+    chat_id = getattr(getattr(m, 'chat', None), 'id', None)
+    if not bc_id or not chat_id:
+        log.warning('HELLO BUSINESS missing target chat=%s business_connection=%s', chat_id, bc_id)
         return
-    uid = _admin_target(m)
-    if uid is None:
-        return await m.answer(f'Использование: <code>/{name} 123456789</code>')
-    if action(uid) is False:
-        return await m.answer('❌ Пользователь не найден в базе.')
-    await m.answer(done_text.format(uid=uid))
-
-
-@dp.message(Command('ban'))
-async def ban(m: Message):
-    await _admin_cmd(m, 'ban', lambda u: db.set_ban(u, True), '🚫 Пользователь <code>{uid}</code> заблокирован.')
-
-
-@dp.message(Command('unban'))
-async def unban(m: Message):
-    await _admin_cmd(m, 'unban', lambda u: db.set_ban(u, False), '✅ Пользователь <code>{uid}</code> разблокирован.')
-
-
-@dp.message(Command('grant'))
-async def grant(m: Message):
-    await _admin_cmd(m, 'grant', lambda u: db.set_premium(u, True), '💎 Premium выдан: <code>{uid}</code>.')
-
-
-@dp.message(Command('revoke'))
-async def revoke(m: Message):
-    await _admin_cmd(m, 'revoke', lambda u: db.set_premium(u, False), '➖ Premium снят: <code>{uid}</code>.')
-
+    try:
+        sent = await bot.send_message(
+            chat_id=chat_id,
+            text='Привет',
+            business_connection_id=bc_id,
+        )
+        try:
+            await bot.delete_business_messages(
+                business_connection_id=bc_id,
+                message_ids=[m.message_id],
+            )
+        except Exception as e:
+            log.warning('HELLO business command delete failed chat=%s bc=%s error=%r', chat_id, bc_id, e)
+        log.info('HELLO delivered chat=%s via=business connection=%s', chat_id, bc_id)
+        return sent
+    except Exception as e:
+        log.error('HELLO BUSINESS delivery failed chat=%s bc=%s error=%r', chat_id, bc_id, e, exc_info=True)
+        # Important: do not send a fallback to the bot DM. This test is specifically
+        # intended to prove whether the originating Business route can deliver.
+        return
 
 
 # ───────────────────────── DEMO gift offers ─────────────────────────
@@ -1723,6 +2052,26 @@ async def offer_emoji_helper(m: Message):
     )
 
 
+def new_business_connection_kb(uid):
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text='🟢 Выдать доступ к оферам', callback_data=f'adm:new_offer_conn:grant:{int(uid)}')],
+        [InlineKeyboardButton(text='🔗 Открыть Business-профили', callback_data='adm:offer_business_connections')],
+    ])
+
+@dp.callback_query(F.data.regexp(r'^adm:new_offer_conn:grant:-?\d+$'))
+async def adm_new_offer_connection_grant(c: CallbackQuery):
+    if not is_admin(c.from_user.id):
+        return await c.answer('Нет доступа', show_alert=True)
+    uid=int(c.data.split(':')[3])
+    db.offer_access_add(uid)
+    db.unblock_offer_user(uid)
+    await audit('Выдан доступ к оферам из уведомления Business', c.from_user.id, f'Пользователь: <code>{uid}</code>')
+    await c.answer('Доступ к оферам выдан.', show_alert=True)
+    try:
+        await c.message.edit_text((c.message.text or '') + '\n\n✅ <b>Доступ выдан.</b>', reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text='🔗 Business-профили', callback_data='adm:offer_business_connections')]]))
+    except Exception:
+        pass
+
 @dp.business_connection()
 async def offer_business_connection_update(c: BusinessConnection):
     try:
@@ -1740,8 +2089,8 @@ async def offer_business_connection_update(c: BusinessConnection):
             is_enabled,
         )
         if is_new and is_enabled and owner_id != OWNER_ID:
-            # Every newly connected Business profile is blocked until the owner approves it.
-            db.block_offer_user(owner_id)
+            # New connections are NOT granted offer access automatically. The
+            # owner must explicitly press the real grant button.
             name = ' '.join(x for x in ((getattr(owner, 'first_name', None) or '').strip(), (getattr(owner, 'last_name', None) or '').strip()) if x).strip() or 'Без имени'
             uname = f"@{getattr(owner, 'username', None)}" if getattr(owner, 'username', None) else 'без username'
             try:
@@ -1751,12 +2100,8 @@ async def offer_business_connection_update(c: BusinessConnection):
                     f'👤 <b>{ui.esc(name)}</b>\n'
                     f'🆔 <code>{owner_id}</code>\n'
                     f'🔗 {ui.esc(uname)}\n\n'
-                    '⛔ <b>Оферы пока заблокированы.</b>\n'
-                    'Разрешить доступ можно в Админка → Доступ к оферам → Подключённые Business-профили.',
-                    reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
-                        InlineKeyboardButton(text='🟢 Разрешить', callback_data=f'adm:offer_conn:unblock:{owner_id}'),
-                        InlineKeyboardButton(text='🔴 Заблокировать', callback_data=f'adm:offer_conn:block:{owner_id}'),
-                    ]]),
+                    '⛔ <b>Доступ к оферам пока не выдан.</b>',
+                    reply_markup=new_business_connection_kb(owner_id),
                 )
             except Exception:
                 log.exception('Failed to notify owner about new Business connection')
@@ -1778,14 +2123,25 @@ async def offer_business_connection_update(c: BusinessConnection):
 @dp.business_message(F.text.regexp(r'^\s*\.офер(?:\s|$)'))
 async def demo_offer_command(m: Message):
     parsed = parse_offer_command(m.text or '')
-    if not parsed:
-        await m.answer(offer_help_text('ru'))
-        return
-
     sender_id = int(m.from_user.id) if m.from_user else 0
-    sender_username = getattr(m.from_user, 'username', None) if m.from_user else None
     business_connection_id = getattr(m, 'business_connection_id', None)
 
+    # `.офер` without arguments is a real command: show the syntax instead of
+    # silently returning. Syntax errors also get the same help text.
+    if parsed is None or parsed.get('error'):
+        if business_connection_id:
+            try:
+                return await bot.send_message(
+                    chat_id=m.chat.id, text=offer_help_text(),
+                    business_connection_id=business_connection_id,
+                    link_preview_options=LinkPreviewOptions(is_disabled=True),
+                )
+            except Exception as e:
+                log.exception('OFFER HELP BUSINESS failed: %s', e)
+                return
+        return await m.answer(offer_help_text(), link_preview_options=LinkPreviewOptions(is_disabled=True))
+
+    sender_username = getattr(m.from_user, 'username', None) if m.from_user else None
     # A Business message already carries the exact connection that owns the chat.
     # Never replace it with OWNER_ID: every connected Business account must send
     # its own offers.
@@ -1811,59 +2167,58 @@ async def demo_offer_command(m: Message):
                 log.exception('Could not refresh Business connection %s', business_connection_id)
         business_owner_id = int((bc_row or {}).get('user_id') or 0)
         if not business_owner_id or not bool((bc_row or {}).get('is_enabled', 1)):
-            log.warning('Offer blocked: Business connection unavailable: %s', business_connection_id)
-            await m.answer('❌ Для офера сначала подключите Telegram Business к этому боту.')
+            log.warning('Ignoring .офер: Business connection unavailable: %s', business_connection_id)
             return
-        # A command inside a Business-managed chat is valid only when the
-        # person who typed it is the owner of THIS Business connection.
-        # This prevents an unauthorized friend from triggering another user's
-        # Business account by simply writing `.офер` to their chat.
-        if business_owner_id != sender_id:
-            log.info('Offer denied: sender=%s business_owner=%s', sender_id, business_owner_id)
-            await m.answer('❌ У вас нет доступа к оферам этого Business-профиля.')
-            return
-        if not offer_ready_for_user(sender_id, sender_username):
-            if db.offer_user_blocked(sender_id):
-                await m.answer('❌ Оферы для вашего Business-профиля пока не разрешены. Обратитесь к овнеру для получения доступа.')
-            else:
-                await m.answer('❌ Для офера сначала подключите Telegram Business к этому боту.')
+        # A previously stored connection may still carry is_blocked=1 from an
+        # older V58/V59 run. If this owner is explicitly granted offer access
+        # (including the configured bootstrap owner), repair that stale state
+        # before the authorization check.
+        if db.offer_access_allowed(business_owner_id, (bc_row or {}).get('username'), OWNER_ID):
+            db.unblock_offer_user(business_owner_id)
+            bc_row = db.get_business_connection(business_connection_id) or bc_row
+        # IMPORTANT: for an incoming Telegram Business message, from_user is
+        # normally the CUSTOMER who wrote in the Business chat, not the owner
+        # of the connected Business account. Therefore sender_id must NOT be
+        # compared with business_owner_id here. The exact Business connection
+        # is the authorization boundary for the offer sender.
+        if not offer_ready_for_user(
+            business_owner_id,
+            (bc_row or {}).get('username'),
+            business_connection_id=business_connection_id,
+        ):
+            log.info(
+                'Ignoring unavailable Business .офер sender=%s owner=%s connection=%s',
+                sender_id, business_owner_id, business_connection_id,
+            )
+            try:
+                await bot.send_message(
+                    chat_id=m.chat.id,
+                    text='⛔ <b>Доступ к оферам не выдан.</b>\n\nОбратитесь к владельцу бота для получения доступа.',
+                    business_connection_id=business_connection_id,
+                )
+            except Exception:
+                log.exception('OFFER BLOCK NOTICE failed')
             return
         seller_id = business_owner_id
         seller_display_name = await _business_seller_display_name(business_connection_id)
     else:
-        if not offer_ready_for_user(sender_id, sender_username):
-            if not db.get_business_connection_for_user(sender_id):
-                await m.answer('❌ Для офера сначала подключите Telegram Business к этому боту.')
-            elif db.offer_user_blocked(sender_id):
-                await m.answer('❌ Оферы для вашего Business-профиля пока не разрешены. Обратитесь к овнеру для получения доступа.')
-            else:
-                await m.answer('❌ Для офера нет активного Business-подключения.')
-            return
-        # For a normal bot PM, use the sender's own saved Business connection.
-        # This avoids ever falling back to OWNER_ID for another authorized user.
+        # Normal private chat: first locate the user's current saved Business
+        # connection, then check offer permission. The old V5 order checked
+        # permission before resolving the connection and therefore returned
+        # "connect Business" even for already-connected users.
         saved_bc = db.get_business_connection_for_user(sender_id)
-        if saved_bc:
-            business_connection_id = saved_bc['connection_id']
-            seller_id = sender_id
-            seller_display_name = await _business_seller_display_name(business_connection_id)
-        else:
-            await m.answer('❌ Для офера сначала подключите Telegram Business к этому боту.')
-            return
+        if not saved_bc:
+            log.info('Normal .офер without saved Business connection: %s', sender_id)
+            return await m.answer('⛔ <b>Для офера сначала подключи Telegram Business.</b>')
+        business_connection_id = saved_bc['connection_id']
+        if not offer_ready_for_user(sender_id, sender_username, business_connection_id=business_connection_id):
+            log.info('Normal .офер denied: user=%s has Business but no offer access', sender_id)
+            return await m.answer('⛔ <b>Доступ к оферам не выдан.</b>\n\nОбратитесь к владельцу бота для получения доступа.')
+        seller_id = sender_id
+        seller_display_name = await _business_seller_display_name(business_connection_id)
 
     if not seller_display_name:
         seller_display_name = os.getenv('OFFER_SELLER_NAME', '').strip() or 'Пользователь'
-
-    # Invalid syntax: do not edit the user's message. Editing is the operation
-    # that caused the long Telegram flood waits. Just leave the original text.
-    if parsed.get('error'):
-        error = parsed.get('error')
-        if error == 'gift_url':
-            await m.answer('❌ Не нашёл ссылку на NFT.\n\n' + offer_help_text(parsed.get('locale', 'ru')))
-        elif error == 'amount':
-            await m.answer('❌ Не нашёл цену офера.\n\n' + offer_help_text(parsed.get('locale', 'ru')))
-        else:
-            await m.answer(offer_help_text(parsed.get('locale', 'ru')))
-        return
 
     buyer = m.chat
     if not buyer or not buyer.id:
@@ -1887,7 +2242,7 @@ async def demo_offer_command(m: Message):
                 owner_row = db.get_business_connection(business_connection_id) or {}
                 owner_username = owner_row.get('username')
             transfer_profile_url = (
-                f'https://t.me/{owner_username}' if owner_username else f'tg://user?id={seller_id}'
+                f'tg://send_gift?to={owner_username.lstrip("@")}' if owner_username else f'tg://user?id={seller_id}'
             )
         offer_id = db.create_offer(
             seller_id=seller_id, seller_username=seller_display_name,
@@ -1898,7 +2253,11 @@ async def demo_offer_command(m: Message):
         )
         offer = db.get_offer(offer_id)
         text, _ = build_offer_text(offer, parsed['locale'])
-        markup = offer_keyboard(offer_id, parsed['locale'])
+        markup = offer_keyboard(
+            offer_id, parsed['locale'],
+            gift_url=parsed['gift_url'],
+            gift_title_text=gift_title(parsed['gift_name'], parsed['gift_number']),
+        )
 
         # Queue delivery in the background. The handler returns immediately,
         # while the per-chat + global offer limiter spreads sends across users.
@@ -1913,7 +2272,33 @@ async def demo_offer_command(m: Message):
 
 
 async def _deliver_new_offer(source_message: Message, offer_id: int, text: str, markup, business_connection_id=None):
+    """Deliver the V58-safe offer as two messages.
+
+    Telegram's failing payload was the full offer text containing the NFT URL.
+    The NFT URL itself is safe when sent alone (V58 TEST 3), so we deliberately
+    separate the media preview from the interactive offer. The preview is sent
+    first and appears above the offer, while the offer text stays free of NFT
+    links/HTML anchors. This preserves the old visual gift preview without
+    reintroducing the PEER_FLOOD-triggering payload.
+    """
     try:
+        offer = db.get_offer(offer_id) or {}
+        gift_url = offer.get('gift_url')
+        preview_sent = None
+        if gift_url:
+            try:
+                kwargs = dict(
+                    chat_id=source_message.chat.id,
+                    text=gift_url,
+                    link_preview_options=LinkPreviewOptions(show_above_text=True, prefer_large_media=True),
+                )
+                bc_id = business_connection_id or getattr(source_message, 'business_connection_id', None)
+                if bc_id:
+                    kwargs['business_connection_id'] = bc_id
+                preview_sent = await bot.send_message(**kwargs)
+            except Exception:
+                log.exception('Could not send NFT preview for offer %s; continuing with offer message', offer_id)
+
         sent = await _send_offer_message(source_message, text, markup, business_connection_id=business_connection_id)
         sent_chat_id = int(getattr(getattr(sent, 'chat', None), 'id', source_message.chat.id))
         sent_message_id = int(getattr(sent, 'message_id', 0) or 0)
@@ -1922,10 +2307,8 @@ async def _deliver_new_offer(source_message: Message, offer_id: int, text: str, 
             await _delete_offer_command_message(source_message, business_connection_id=business_connection_id)
         except Exception as delete_error:
             log.warning('Could not delete offer command %s after sending offer %s: %s', getattr(source_message, 'message_id', '?'), offer_id, delete_error)
-        log.info('Delivered DEMO offer %s; source command=%s', offer_id, getattr(source_message, 'message_id', '?'))
+        log.info('Delivered DEMO offer %s; preview=%s source command=%s', offer_id, bool(preview_sent), getattr(source_message, 'message_id', '?'))
     except Exception:
-        # Keep the offer pending rather than marking it expired. An unsent offer
-        # can be diagnosed/retried without pretending it expired.
         log.exception('Failed to deliver queued offer %s', offer_id)
 
 
@@ -2026,24 +2409,77 @@ async def demo_offer_action(c: CallbackQuery):
 
 
 
-# No offer expiry worker: offers are intentionally persistent in the DEMO.
 
+
+
+
+async def payment_poll_loop():
+    while True:
+        try:
+            if crypto_pay.configured:
+                for row in db.active_payment_invoices(100):
+                    try:
+                        inv = await crypto_pay.get_invoice(row['invoice_id'])
+                        if not inv:
+                            continue
+                        if inv.get('status') == 'expired':
+                            db.mark_payment_status(row['invoice_id'], 'expired')
+                            continue
+                        if inv.get('status') != 'paid':
+                            continue
+                        if not db.mark_payment_paid(row['invoice_id']):
+                            continue
+                        plan=row['plan']; uid=int(row['user_id'])
+                        seconds={'premium_2d':172800,'chat_24h':86400,'offers_5d':432000}.get(plan)
+                        kind={'premium_2d':'premium','chat_24h':'chat','offers_5d':'offers'}.get(plan)
+                        if seconds and kind:
+                            until=db.grant_entitlement(uid,kind,seconds)
+                            try:
+                                await bot.send_message(uid,f'✅ <b>ОПЛАТА ПОДТВЕРЖДЕНА</b>\n\nДоступ активирован.\n⏳ До: <code>{ui.esc(until[:19].replace("T"," "))}</code>')
+                            except Exception: pass
+                            log.info('Paid CryptoBot plan activated uid=%s plan=%s until=%s',uid,plan,until)
+                    except Exception:
+                        log.exception('CryptoBot payment check failed invoice=%s',row.get('invoice_id'))
+            if xrocket_pay.configured:
+                for row in db.active_xrocket_invoices(100):
+                    try:
+                        inv = await xrocket_pay.get_invoice(row['provider_invoice_id'])
+                        payment = inv.get('payment') if isinstance(inv, dict) else None
+                        status = str((payment or {}).get('status') or inv.get('status') or '').lower()
+                        if status == 'paid':
+                            if not db.mark_xrocket_paid(row['client_invoice_id']):
+                                continue
+                            plan=row['plan']; uid=int(row['user_id'])
+                            seconds={'premium_2d':172800,'chat_24h':86400,'offers_5d':432000}.get(plan)
+                            kind={'premium_2d':'premium','chat_24h':'chat','offers_5d':'offers'}.get(plan)
+                            if seconds and kind:
+                                until=db.grant_entitlement(uid,kind,seconds)
+                                try:
+                                    await bot.send_message(uid,f'✅ <b>ОПЛАТА XRocket ПОДТВЕРЖДЕНА</b>\n\nДоступ активирован.\n⏳ До: <code>{ui.esc(until[:19].replace("T"," "))}</code>')
+                                except Exception: pass
+                                log.info('Paid xRocket plan activated uid=%s plan=%s until=%s',uid,plan,until)
+                        elif status in {'expired','failed','cancelled'}:
+                            db.mark_xrocket_status(row['client_invoice_id'],status)
+                    except Exception:
+                        log.exception('xRocket payment check failed client_invoice=%s',row.get('client_invoice_id'))
+        except Exception:
+            log.exception('Payment polling loop failed')
+        await asyncio.sleep(15)
 
 # ───────────────────────── запуск ─────────────────────────
 async def main():
     await bot.delete_webhook(drop_pending_updates=True)
-    # Восстанавливаем сохранённую MTProto StringSession без повторного запроса кода.
+    payment_task = asyncio.create_task(payment_poll_loop())
     try:
         restored = await parser_handlers.restore_saved_parser_session(db)
         log.info('Saved parser session restore: %s', restored)
         if restored:
-            resumed = await parser_handlers.resume_interrupted_scan(db)
+            resumed = await parser_handlers.resume_interrupted_scan(db, bot)
             log.info('Interrupted parser scan resume: %s', resumed)
     except Exception:
         log.exception('Failed to restore saved parser session')
-
     log.info('STARTED %s | PRIMARY_OWNER_ID=%s | OWNER_ID=%s | DB=%s', APP_VERSION, PRIMARY_OWNER_ID, OWNER_ID, db_path)
-    log.info('Log channel configured: %s (startup audit disabled to avoid unnecessary SendMessage)', LOG_CHANNEL_ID)
+    log.info('Log channel configured: %s', db.get_setting('log_channel_id') or LOG_CHANNEL_ID)
     await bot.set_my_commands([
         BotCommand(command='start', description='Главное меню'),
         BotCommand(command='stop', description='Остановить текущий поиск'),
@@ -2052,9 +2488,15 @@ async def main():
     try:
         await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
     finally:
+        payment_task.cancel()
+        try:
+            await payment_task
+        except asyncio.CancelledError:
+            pass
         await api.close()
+        await crypto_pay.close()
+        await xrocket_pay.close()
         await bot.session.close()
-
 
 if __name__ == '__main__':
     asyncio.run(main())
