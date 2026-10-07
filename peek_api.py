@@ -16,9 +16,16 @@ except ImportError:  # прокси необязателен
 PEEK_URL = 'https://server.peek.tg/api/nft/gifts/search'
 log = logging.getLogger(__name__)
 
-from gift_catalog import GIFT_MODELS
-
-AVAILABLE_MODELS = GIFT_MODELS
+AVAILABLE_MODELS = [
+    'PreciousPeach', 'PlushPepe', 'HeroicHelmet', 'MightyArm', 'IonGem', 'DurovsCap', 'NailBracelet',
+    'PerfumeBottle', 'MagicPotion', 'MiniOscar', 'AstralShard', 'ArtisanBrick', 'GemSignet', 'GenieLamp',
+    'BondedRing', 'SharpTongue', 'ElectricSkull', 'BlingBinky', 'WestsideSign', 'KissedFrog', 'LootBag',
+    'SignetRing', 'ToyBear', 'IceCream', 'DeskCalendar', 'LightSword', 'SnowGlobe', 'ScaredCat',
+    'JoyfulBundle', 'EasterEgg', 'JellyBunny', 'RestlessJar', 'PrettyPosy', 'SwagBag', 'StellarRocket',
+    'PetSnake', 'GingerCookie', 'FreshSocks', 'BerryBox', 'InputKey', 'VictoryMedal', 'HypnoLollipop',
+    'SnoopCigar', 'EvilEye', 'SpringBasket', 'ValentineBox', 'LushBouquet', 'RecordPlayer', 'InstantRamen',
+    'HexPot', 'SnakeBox', 'IonicDryer', 'HomemadeCake', 'SpicedWine', 'SantaHat', 'EternalRose',
+]
 
 
 # ───────────── названия моделей ─────────────
@@ -120,8 +127,6 @@ class PeekAPI:
         self.proxy_url = os.getenv('PROXY_URL') or None
         self.session = None
         self.sem = asyncio.Semaphore(self.concurrency)
-        self.cache = {}
-        self.cache_ttl = float(os.getenv('PEEK_CACHE_TTL', '120'))
 
     async def _ensure_session(self):
         if self.session and not self.session.closed:
@@ -133,16 +138,12 @@ class PeekAPI:
             connector = ProxyConnector.from_url(self.proxy_url, rdns=True)
         self.session = aiohttp.ClientSession(
             connector=connector, timeout=self.timeout,
-            headers={'User-Agent': 'GiftParser/24.0', 'Accept': 'application/json, text/plain, */*',
+            headers={'User-Agent': 'GiftParser/5.2', 'Accept': 'application/json, text/plain, */*',
                      'Origin': 'https://peek.tg', 'Referer': 'https://peek.tg/'})
 
     async def get_gift(self, model, number, retries=4):
         """Вернёт подарок, None (если его нет) или бросит RuntimeError (если не удалось проверить)."""
         await self._ensure_session()
-        cache_key = (str(model), int(number))
-        cached = self.cache.get(cache_key)
-        if cached and cached[0] > asyncio.get_running_loop().time():
-            return cached[1]
         params = {'name': model.replace(' ', ''), 'page': 1, 'sortOrder': 'asc',
                   'giftNumber': number, 'limit': 20}
         last_error = 'неизвестная ошибка'
@@ -162,9 +163,7 @@ class PeekAPI:
                             continue
                         if r.status != 200:
                             raise RuntimeError(f'Peek HTTP {r.status}: {(await r.text())[:250]}')
-                        result = self._extract(await r.json(content_type=None), number, model)
-                        self.cache[cache_key] = (asyncio.get_running_loop().time() + self.cache_ttl, result)
-                        return result
+                        return self._extract(await r.json(content_type=None), number, model)
                 except (aiohttp.ClientError, asyncio.TimeoutError) as e:
                     last_error = f'сеть: {e}'
                     await asyncio.sleep(1.5 * (attempt + 1))

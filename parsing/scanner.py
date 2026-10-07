@@ -345,7 +345,7 @@ class ChatScanner:
                 await asyncio.sleep(min(30, 2 * attempt))
             except Exception as e:
                 msg = str(e)
-                if 'Could not find the input entity' in msg or 'InputPeerUser' in msg or 'An invalid Peer was used' in msg or 'invalid Peer' in msg:
+                if 'Could not find the input entity' in msg or 'InputPeerUser' in msg:
                     log.warning('Gift lookup skipped for %s: missing Telegram access_hash/entity', user['user_id'])
                     return []
                 if attempt == MAX_RETRIES:

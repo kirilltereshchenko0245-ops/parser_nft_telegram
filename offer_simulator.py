@@ -3,6 +3,7 @@
 This module only simulates an offer visually. It never transfers Stars/Gram and
 never calls Telegram payment/gift transfer APIs.
 """
+import os
 import re
 from urllib.parse import unquote
 
@@ -10,10 +11,7 @@ from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
 from ui import esc, num, pretty
 
-GIFT_RE = re.compile(
-    r"(?:https?://)?(?:(?:www\.)?t\.me|(?:www\.)?telegram\.me)/nft/(?P<slug>[^/?#\s]+)-(?P<number>\d+)(?=$|[/?#\s])",
-    re.I,
-)
+GIFT_RE = re.compile(r"(?:https?://)?t\.me/nft/([^/?#\s]+?)-(\d+)(?:[/?#\s]|$)", re.I)
 AMOUNT_RE = re.compile(r"(?P<amount>\d+(?:[.,]\d+)?)\s*(?P<currency>грам(?:м|s)?|gram(?:s)?|зв(?:езд|ёзд)?|stars?|⭐)", re.I)
 LOCALE_RU = 'ru'
 LOCALE_EN = 'en'
@@ -50,17 +48,10 @@ def parse_offer_command(text: str):
     gift = GIFT_RE.search(tail)
     if not gift:
         return {'locale': locale, 'error': 'gift_url'}
-    gift_name = unquote(gift.group('slug'))
-    gift_number = int(gift.group('number'))
-    # Normalize the NFT URL so query strings/fragments/trailing slashes do not
-    # become part of the URL button. Telegram accepts both t.me and telegram.me
-    # links, with or without https/www; keep the canonical https://t.me form.
-    gift_url = f'https://t.me/nft/{gift_name}-{gift_number}'
-    # Amount may be placed before OR after the NFT URL. This makes copy/paste
-    # from common offer formats much less fragile.
-    before = tail[:gift.start()].strip()
+    gift_name = unquote(gift.group(1))
+    gift_number = int(gift.group(2))
     after = tail[gift.end():].strip()
-    amount = AMOUNT_RE.search(after) or AMOUNT_RE.search(before)
+    amount = AMOUNT_RE.search(after)
     if not amount:
         return {'locale': locale, 'gift_name': gift_name, 'gift_number': gift_number, 'error': 'amount'}
     value = float(amount.group('amount').replace(',', '.'))
@@ -72,7 +63,7 @@ def parse_offer_command(text: str):
         'gift_number': gift_number,
         'amount': value,
         'currency': _currency(amount.group('currency')),
-        'gift_url': gift_url
+        'gift_url': gift.group(0).rstrip('.,)')
     }
 
 
@@ -103,26 +94,23 @@ def offer_help_text(locale=LOCALE_RU):
     )
 
 
-def keyboard(offer_id: int, locale: str, status: str = STATUS_PENDING, gift_url: str | None = None, gift_title_text: str | None = None):
+def keyboard(offer_id: int, locale: str, status: str = STATUS_PENDING):
     if status != STATUS_PENDING:
         return None
-    rows = []
-    # Telegram is currently rejecting the full first-offer text when the NFT
-    # URL is embedded as an HTML text_link entity. Keep the NFT link clickable
-    # via a URL button instead; this preserves the DEMO flow without triggering
-    # the PEER_FLOOD seen in the production-like text payload.
-    if gift_url and gift_title_text:
-        rows.append([InlineKeyboardButton(text=gift_title_text, url=gift_url)])
-    rows.append([
+    if locale == LOCALE_EN:
+        return InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(text='Отклонить', icon_custom_emoji_id=DECLINE_EMOJI_ID, callback_data=f'of:decline:{offer_id}'),
+            InlineKeyboardButton(text='Принять', icon_custom_emoji_id=ACCEPT_EMOJI_ID, callback_data=f'of:accept:{offer_id}'),
+        ]])
+    return InlineKeyboardMarkup(inline_keyboard=[[
         InlineKeyboardButton(text='Отклонить', icon_custom_emoji_id=DECLINE_EMOJI_ID, callback_data=f'of:decline:{offer_id}'),
         InlineKeyboardButton(text='Принять', icon_custom_emoji_id=ACCEPT_EMOJI_ID, callback_data=f'of:accept:{offer_id}'),
-    ])
-    return InlineKeyboardMarkup(inline_keyboard=rows)
+    ]])
 
 
 def transfer_keyboard(offer: dict, locale: str):
-    # Only the buyer transfer button remains.
     buyer_url = offer.get('transfer_profile_url') or offer.get('buyer_url')
+    help_url = os.getenv('OFFER_HELP_URL', '').strip()
     rows = []
     if buyer_url:
         rows.append([InlineKeyboardButton(
@@ -130,21 +118,27 @@ def transfer_keyboard(offer: dict, locale: str):
             icon_custom_emoji_id=TRANSFER_EMOJI_ID,
             url=buyer_url,
         )])
+    if help_url:
+        rows.append([InlineKeyboardButton(
+            text='Как передать?' if locale == LOCALE_RU else 'How to transfer?',
+            url=help_url,
+        )])
     return InlineKeyboardMarkup(inline_keyboard=rows) if rows else None
 
 
 def _linked_title(offer: dict):
+    # V23-compatible title, but without an HTML <a> anchor.
+    # V58 showed that the production offer payload can trigger Telegram
+    # PEER_FLOOD when an NFT link is embedded in the message text.
+    # Keep the NFT URL only in data / buttons, never in the offer text.
     name = esc(pretty(offer['gift_name']))
     number = num(offer['gift_number'])
-    url = esc(offer.get('gift_url') or '')
-    if not url:
-        return f'{name} #{number}'
-    return f'<a href="{url}">{name} #{number}</a>'
+    return f'{name} #{number}'
 
 
 def build_offer_text(offer: dict, locale: str, remaining_seconds=None, **_ignored):
-    """Text for the first offer. The NFT title is linked by the URL button."""
-    title = gift_title(offer['gift_name'], offer['gift_number'])
+    """Text for the first offer screenshot."""
+    title = _linked_title(offer)
     amount = format_amount(offer['amount'], offer['currency'], locale)
     sender = (offer.get('seller_username') or '').strip()
     # seller_username historically stored @username. For the offer UI we now

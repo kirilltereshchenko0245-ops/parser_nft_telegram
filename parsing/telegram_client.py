@@ -143,16 +143,7 @@ class ParserClient:
             raise RuntimeError('Клиент не подключён')
         import random
         from telethon.errors import FloodWaitError
-        try:
-            entity = await self.client.get_input_entity(chat_id)
-        except (ValueError, TypeError):
-            entity = None
-            async for dialog in self.client.iter_dialogs():
-                if int(dialog.id) == int(chat_id):
-                    entity = dialog.entity
-                    break
-            if entity is None:
-                raise ValueError(f'Chat {chat_id} is not present in Telethon dialog cache')
+        entity = await self.client.get_input_entity(chat_id)
         total = int(participant_count or 0)
         if total <= 0:
             try:

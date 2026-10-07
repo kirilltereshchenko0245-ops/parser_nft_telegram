@@ -18,8 +18,6 @@ class Database:
     @contextmanager
     def _db(self):
         c = sqlite3.connect(self.path, timeout=30)
-        c.execute('PRAGMA busy_timeout=10000')
-        c.execute('PRAGMA synchronous=NORMAL')
         c.row_factory = sqlite3.Row
         try:
             yield c
@@ -59,24 +57,9 @@ class Database:
                 found_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 UNIQUE(search_id, gift_number))''')
             c.execute('''CREATE TABLE IF NOT EXISTS favorites(
-                user_id INTEGER, gift_number INTEGER, model TEXT, username TEXT, gift_name TEXT,
+                user_id INTEGER, gift_number INTEGER, model TEXT, username TEXT,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 PRIMARY KEY(user_id, gift_number, model))''')
-            fav_cols = {r[1] for r in c.execute('PRAGMA table_info(favorites)').fetchall()}
-            if 'gift_name' not in fav_cols:
-                c.execute('ALTER TABLE favorites ADD COLUMN gift_name TEXT')
-
-            user_cols = {r[1] for r in c.execute('PRAGMA table_info(users)').fetchall()}
-            for col, typ, default in [
-                ('trial_regular_left', 'INTEGER', '20'),
-                ('trial_random_left', 'INTEGER', '20'),
-                ('trial_id_left', 'INTEGER', '20'),
-                ('premium_until', 'TEXT', 'NULL'),
-                ('chat_parser_until', 'TEXT', 'NULL'),
-                ('offer_until', 'TEXT', 'NULL'),
-            ]:
-                if col not in user_cols:
-                    c.execute(f'ALTER TABLE users ADD COLUMN {col} {typ} DEFAULT {default}')
             
             # Таблицы для MTProto-парсера
             c.execute('''CREATE TABLE IF NOT EXISTS parser_session(
@@ -163,26 +146,6 @@ class Database:
             c.execute('''CREATE TABLE IF NOT EXISTS parser_access_users(
                 user_id INTEGER PRIMARY KEY,
                 added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)''')
-            c.execute('''CREATE TABLE IF NOT EXISTS payment_invoices(
-                invoice_id INTEGER PRIMARY KEY,
-                user_id INTEGER NOT NULL,
-                plan TEXT NOT NULL,
-                amount TEXT NOT NULL,
-                asset TEXT NOT NULL DEFAULT 'TON',
-                status TEXT NOT NULL DEFAULT 'active',
-                payload TEXT,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                paid_at TIMESTAMP)''')
-            c.execute('''CREATE TABLE IF NOT EXISTS xrocket_invoices(
-                client_invoice_id TEXT PRIMARY KEY,
-                provider_invoice_id TEXT NOT NULL,
-                user_id INTEGER NOT NULL,
-                plan TEXT NOT NULL,
-                amount TEXT NOT NULL,
-                asset TEXT NOT NULL DEFAULT 'TON',
-                status TEXT NOT NULL DEFAULT 'active',
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                paid_at TIMESTAMP)''')
             c.execute('''CREATE TABLE IF NOT EXISTS offer_access_users(
                 user_id INTEGER PRIMARY KEY,
                 added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)''')
@@ -257,13 +220,6 @@ class Database:
                         SELECT id,user_id,chat_id,gift_id,gift_name,gift_slug,is_collectible,is_upgraded,raw_data,found_at
                         FROM parser_gifts_legacy''')
                 c.execute('DROP TABLE parser_gifts_legacy')
-
-            c.execute('CREATE INDEX IF NOT EXISTS idx_users_last_activity ON users(last_activity)')
-            c.execute('CREATE INDEX IF NOT EXISTS idx_history_user_started ON search_history(user_id, started_at DESC)')
-            c.execute('CREATE INDEX IF NOT EXISTS idx_found_user ON found_gifts(user_id, found_at DESC)')
-            c.execute('CREATE INDEX IF NOT EXISTS idx_orders_user_status ON payment_invoices(user_id, status, created_at DESC)')
-            c.execute('CREATE INDEX IF NOT EXISTS idx_xorders_user_status ON xrocket_invoices(user_id, status, created_at DESC)')
-            c.execute('CREATE INDEX IF NOT EXISTS idx_offers_seller_status ON gift_offers(seller_id, status, created_at DESC)')
 
             # Business connection used to update/delete offer messages after creation.
             self._add_col(c, 'gift_offers', 'business_connection_id', 'TEXT')
@@ -472,82 +428,6 @@ class Database:
     def business_connections_list(self):
         return self._all('SELECT * FROM offer_business_connections ORDER BY updated_at DESC')
 
-    def reset_business_sessions(self, user_id):
-        """Remove all locally stored Business/offer connection sessions for one user.
-
-        This does not revoke Telegram Business on the user's account; it only
-        clears the bot's local connection records so the next Business update
-        can register a clean current connection. Offer access/entitlements are
-        intentionally preserved.
-        """
-        uid = int(user_id)
-        with self._db() as c:
-            cur = c.execute('DELETE FROM offer_business_connections WHERE user_id=?', (uid,))
-            c.execute('DELETE FROM offer_blocked_users WHERE user_id=?', (uid,))
-            return cur.rowcount
-
-    def reset_offer_state_v7(self, keep_user_ids=()):
-        """One-time clean reset of local offer state and Business sessions.
-
-        Keeps unrelated bot/parser/admin data. Existing offer history is cleared
-        because it belongs to the resettable offer subsystem. Telegram-side
-        Business connections are not revoked; fresh updates recreate them.
-        """
-        keep = {int(x) for x in (keep_user_ids or ()) if int(x or 0)}
-        with self._db() as c:
-            removed = {}
-            # Offer history / pending state
-            cur = c.execute('DELETE FROM gift_offers')
-            removed['gift_offers'] = cur.rowcount
-            # Access and connection state
-            if keep:
-                ph=','.join('?' for _ in keep)
-                for table,col,key in [
-                    ('offer_access_users','user_id','access_users'),
-                    ('offer_blocked_users','user_id','blocked_users'),
-                    ('offer_business_connections','user_id','business_connections'),
-                    ('offer_user_profiles','user_id','user_profiles'),
-                ]:
-                    cur=c.execute(f'DELETE FROM {table} WHERE {col} NOT IN ({ph})', tuple(keep))
-                    removed[key]=cur.rowcount
-            else:
-                for table,key in [('offer_access_users','access_users'),('offer_blocked_users','blocked_users'),('offer_business_connections','business_connections'),('offer_user_profiles','user_profiles')]:
-                    cur=c.execute(f'DELETE FROM {table}')
-                    removed[key]=cur.rowcount
-            cur=c.execute('DELETE FROM offer_access_usernames')
-            removed['access_usernames']=cur.rowcount
-            return removed
-
-    def reset_all_offer_users(self, keep_user_ids=()):
-        """Hard reset all local DEMO-offer users/connections.
-
-        This is intentionally local to the bot database: it removes every
-        manually granted offer permission, username permission, Business
-        connection, block marker and per-user transfer profile, except IDs
-        explicitly listed in keep_user_ids. Existing gift_offers/history and
-        unrelated parser/admin data are preserved.
-        """
-        keep = sorted({int(x) for x in (keep_user_ids or ()) if int(x or 0)})
-        with self._db() as c:
-            def delete_except(table, column):
-                if keep:
-                    placeholders = ','.join('?' for _ in keep)
-                    cur = c.execute(f'DELETE FROM {table} WHERE {column} NOT IN ({placeholders})', keep)
-                else:
-                    cur = c.execute(f'DELETE FROM {table}')
-                return cur.rowcount
-
-            removed = {}
-            removed['access_users'] = delete_except('offer_access_users', 'user_id')
-            removed['blocked_users'] = delete_except('offer_blocked_users', 'user_id')
-            removed['business_connections'] = delete_except('offer_business_connections', 'user_id')
-            removed['user_profiles'] = delete_except('offer_user_profiles', 'user_id')
-            # Username grants cannot be safely mapped back to IDs, so a full
-            # reset clears them all.
-            cur = c.execute('DELETE FROM offer_access_usernames')
-            removed['access_usernames'] = cur.rowcount
-            return removed
-
     # ───────────── профили для передачи подарков ─────────────
     def offer_profile_add(self, name, url):
         name = str(name).strip()
@@ -609,117 +489,6 @@ class Database:
 
     def get_user(self, uid):
         return self._one('SELECT * FROM users WHERE user_id=?', (uid,))
-
-    def trial_left(self, uid, kind):
-        key = {'regular': 'trial_regular_left', 'random': 'trial_random_left', 'id': 'trial_id_left'}.get(kind)
-        if not key:
-            raise ValueError('unknown trial kind')
-        row = self._one(f'SELECT {key} AS n FROM users WHERE user_id=?', (int(uid),))
-        return int((row or {}).get('n') or 0)
-
-    def consume_trial_kind(self, uid, kind, count=1):
-        key = {'regular': 'trial_regular_left', 'random': 'trial_random_left', 'id': 'trial_id_left'}.get(kind)
-        if not key:
-            raise ValueError('unknown trial kind')
-        with self._db() as c:
-            c.execute(f'UPDATE users SET {key}=MAX(0,{key}-?) WHERE user_id=?', (int(count), int(uid)))
-
-    def grant_entitlement(self, uid, kind, seconds):
-        from datetime import datetime, timedelta, timezone
-        column = {'premium': 'premium_until', 'chat': 'chat_parser_until', 'offers': 'offer_until'}.get(kind)
-        if not column:
-            raise ValueError('unknown entitlement')
-        current = self._one(f'SELECT {column} AS until FROM users WHERE user_id=?', (int(uid),))
-        now = datetime.now(timezone.utc)
-        base = now
-        if current and current.get('until'):
-            try:
-                old = datetime.fromisoformat(str(current['until']).replace('Z', '+00:00'))
-                if old > base:
-                    base = old
-            except Exception:
-                pass
-        until = base + timedelta(seconds=int(seconds))
-        with self._db() as c:
-            if kind == 'premium':
-                c.execute(f'UPDATE users SET {column}=?, is_premium=1 WHERE user_id=?', (until.isoformat(), int(uid)))
-            else:
-                c.execute(f'UPDATE users SET {column}=? WHERE user_id=?', (until.isoformat(), int(uid)))
-        return until.isoformat()
-
-    def entitlement_active(self, uid, kind):
-        from datetime import datetime, timezone
-        column = {'premium': 'premium_until', 'chat': 'chat_parser_until', 'offers': 'offer_until'}.get(kind)
-        if not column:
-            return False
-        if int(uid) == 8564624250:
-            return True
-        row = self._one(f'SELECT {column} AS until FROM users WHERE user_id=?', (int(uid),))
-        if not row or not row.get('until'):
-            return False
-        try:
-            return datetime.fromisoformat(str(row['until']).replace('Z', '+00:00')) > datetime.now(timezone.utc)
-        except Exception:
-            return False
-
-    def entitlement_until(self, uid, kind):
-        column = {'premium': 'premium_until', 'chat': 'chat_parser_until', 'offers': 'offer_until'}.get(kind)
-        return (self._one(f'SELECT {column} AS until FROM users WHERE user_id=?', (int(uid),)) or {}).get('until') if column else None
-
-    def save_payment_invoice(self, invoice_id, user_id, plan, amount, payload, status='active'):
-        with self._db() as c:
-            c.execute('''INSERT OR REPLACE INTO payment_invoices(invoice_id,user_id,plan,amount,asset,status,payload)
-                         VALUES(?,?,?,?,?,?,?)''', (int(invoice_id), int(user_id), plan, str(amount), 'TON', status, payload))
-
-    def get_payment_invoice(self, invoice_id):
-        return self._one('SELECT * FROM payment_invoices WHERE invoice_id=?', (int(invoice_id),))
-
-    def active_payment_invoices(self, limit=100):
-        return self._all("SELECT * FROM payment_invoices WHERE status='active' ORDER BY created_at LIMIT ?", (int(limit),))
-
-    def mark_payment_paid(self, invoice_id):
-        with self._db() as c:
-            c.execute("UPDATE payment_invoices SET status='paid', paid_at=CURRENT_TIMESTAMP WHERE invoice_id=? AND status!='paid'", (int(invoice_id),))
-            return c.rowcount > 0
-
-    def mark_payment_status(self, invoice_id, status):
-        with self._db() as c:
-            c.execute("UPDATE payment_invoices SET status=? WHERE invoice_id=? AND status!='paid'", (str(status), int(invoice_id)))
-
-    def payment_history(self, uid, limit=20):
-        return self._all('SELECT invoice_id, plan, amount, asset, status, created_at, paid_at FROM payment_invoices WHERE user_id=? ORDER BY created_at DESC LIMIT ?', (int(uid), int(limit)))
-
-    def save_xrocket_invoice(self, client_invoice_id, provider_invoice_id, user_id, plan, amount, asset='TON', status='active'):
-        with self._db() as c:
-            c.execute('''INSERT OR REPLACE INTO xrocket_invoices(client_invoice_id,provider_invoice_id,user_id,plan,amount,asset,status) VALUES(?,?,?,?,?,?,?)''',
-                      (str(client_invoice_id),str(provider_invoice_id),int(user_id),str(plan),str(amount),str(asset),str(status)))
-    def active_xrocket_invoices(self, limit=100):
-        return self._all("SELECT * FROM xrocket_invoices WHERE status='active' ORDER BY created_at LIMIT ?", (int(limit),))
-    def mark_xrocket_paid(self, client_invoice_id):
-        with self._db() as c:
-            c.execute("UPDATE xrocket_invoices SET status='paid', paid_at=CURRENT_TIMESTAMP WHERE client_invoice_id=? AND status!='paid'", (str(client_invoice_id),))
-            return c.rowcount > 0
-    def mark_xrocket_status(self, client_invoice_id, status):
-        with self._db() as c:
-            c.execute("UPDATE xrocket_invoices SET status=? WHERE client_invoice_id=? AND status!='paid'", (str(status),str(client_invoice_id)))
-
-    def user_count(self):
-        row=self._one('SELECT COUNT(*) AS n FROM users')
-        return int((row or {}).get('n') or 0)
-    def all_user_ids(self):
-        return [int(r['user_id']) for r in self._all('SELECT user_id FROM users ORDER BY user_id')]
-    def broadcast_user_ids(self, audience='all'):
-        audience = str(audience or 'all')
-        if audience == 'premium':
-            return [int(r['user_id']) for r in self._all("SELECT user_id FROM users WHERE is_banned=0 AND (premium_until IS NOT NULL AND premium_until > CURRENT_TIMESTAMP)")]
-        if audience == 'offers':
-            return [int(r['user_id']) for r in self._all("SELECT user_id FROM users WHERE is_banned=0 AND (offer_until IS NOT NULL AND offer_until > CURRENT_TIMESTAMP)")]
-        if audience == 'chat':
-            return [int(r['user_id']) for r in self._all("SELECT user_id FROM users WHERE is_banned=0 AND (chat_parser_until IS NOT NULL AND chat_parser_until > CURRENT_TIMESTAMP)")]
-        if audience == 'active':
-            return [int(r['user_id']) for r in self._all("SELECT user_id FROM users WHERE is_banned=0 AND last_activity > datetime('now','-7 days')")]
-        return self.all_user_ids()
-
 
     def is_banned(self, uid):
         return bool((self.get_user(uid) or {}).get('is_banned'))
@@ -894,21 +663,13 @@ class Database:
         with self._db() as c:
             c.execute('INSERT INTO parser_settings(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value', (key, str(value)))
 
-    def parser_access_mode(self):
-        return (self.get_parser_setting('access_mode', 'owner') or 'owner').strip().lower()
-
-    def set_parser_access_mode(self, mode):
-        mode=str(mode).strip().lower()
-        if mode not in {'owner','premium','developers','all'}:
-            mode='owner'
-        self.set_parser_setting('access_mode', mode)
-        return mode
-
     def parser_admin_only(self):
-        return self.parser_access_mode() == 'owner'
+        # Search-by-chats is closed by default: owner/admins + explicitly granted users only.
+        # Existing DBs that have no setting are therefore treated as restricted too.
+        return self.get_parser_setting('admin_only', '1') == '1'
 
     def set_parser_admin_only(self, value):
-        self.set_parser_access_mode('owner' if value else 'all')
+        self.set_parser_setting('admin_only', '1' if value else '0')
 
     def parser_access_add(self, user_id):
         with self._db() as c:
@@ -921,26 +682,16 @@ class Database:
             return cur.rowcount > 0
 
     def parser_access_allowed(self, user_id, owner_id=0):
-        uid=int(user_id or 0)
-        if not uid:
-            return False
-        if owner_id and uid==int(owner_id):
+        uid = int(user_id or 0)
+        if owner_id and uid == int(owner_id):
             return True
-        if uid==8564624250:
+        row = self._one('SELECT 1 AS ok FROM bot_admins WHERE user_id=?', (uid,)) if uid else None
+        if row:
             return True
-        if self._one('SELECT 1 AS ok FROM bot_admins WHERE user_id=?',(uid,)):
+        if not self.parser_admin_only():
             return True
-        if self._one('SELECT 1 AS ok FROM parser_access_users WHERE user_id=?',(uid,)):
-            return True
-        mode=self.parser_access_mode()
-        if mode=='all':
-            return True
-        if mode=='premium' and self.entitlement_active(uid,'premium'):
-            return True
-        if mode=='developers':
-            return bool(self._one('SELECT 1 AS ok FROM bot_admins WHERE user_id=?',(uid,)))
-        # Paid 24h chat package is always a valid explicit entitlement.
-        return self.entitlement_active(uid,'chat')
+        row = self._one('SELECT 1 AS ok FROM parser_access_users WHERE user_id=?', (uid,)) if uid else None
+        return bool(row)
 
     def parser_access_list(self):
         return self._all('SELECT user_id, added_at FROM parser_access_users ORDER BY added_at, user_id')
