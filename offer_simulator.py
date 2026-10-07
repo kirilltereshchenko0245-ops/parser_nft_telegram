@@ -128,30 +128,44 @@ def transfer_keyboard(offer: dict, locale: str):
 
 
 def _linked_title(offer: dict):
-    # V58-safe: never embed the NFT URL as an HTML text_link entity.
-    # The NFT is shown by a separate preview message and remains available as
-    # a normal URL button in the offer.
-    return gift_title(offer['gift_name'], offer['gift_number'])
+    # The NFT name itself is the clickable link, exactly like the working
+    # offer UI: Telegram renders the NFT preview above the text, while the
+    # gift title in the text opens the same NFT.
+    title = gift_title(offer['gift_name'], offer['gift_number'])
+    url = (offer.get('gift_url') or '').strip()
+    if url:
+        return f'<a href="{esc(url)}">{esc(title)}</a>'
+    return esc(title)
+
+
+def _format_remaining(remaining_seconds):
+    try:
+        total = max(0, int(remaining_seconds))
+    except (TypeError, ValueError):
+        total = 0
+    hours = total // 3600
+    minutes = (total % 3600) // 60
+    return hours, minutes
 
 
 def build_offer_text(offer: dict, locale: str, remaining_seconds=None, **_ignored):
-    """Text for the first offer. The NFT title is linked by the URL button."""
-    title = gift_title(offer['gift_name'], offer['gift_number'])
+    """Build the single-message offer shown under the Telegram NFT preview."""
+    title = _linked_title(offer)
     amount = format_amount(offer['amount'], offer['currency'], locale)
     sender = (offer.get('seller_username') or '').strip()
-    # seller_username historically stored @username. For the offer UI we now
-    # deliberately store/render the profile display name (first/last name),
-    # never the @username.
     sender_html = f'Пользователь <b>{esc(sender)}</b>' if sender else '<b>Пользователь</b>'
-    # Static display only. It intentionally never counts down and never expires.
+
+    if remaining_seconds is None:
+        remaining_seconds = 6 * 3600 - 1
+    hours, minutes = _format_remaining(remaining_seconds)
     if locale == LOCALE_EN:
         return (
             f'{sender_html} offers you <b>{esc(amount)}</b> for the gift {title}.\n\n'
-            f'Offer expires in <b>6h</b>.'
+            f'This offer is active for <b>{hours}h {minutes}m</b>.'
         ), None
     return (
         f'{sender_html} предлагает Вам <b>{esc(amount)}</b> за подарок {title}.\n\n'
-        f'Предложение действует ещё <b>6ч</b>.'
+        f'Это предложение активно ещё <b>{hours}ч {minutes}м</b>.'
     ), None
 
 def accepted_alert_text(offer: dict, locale: str):

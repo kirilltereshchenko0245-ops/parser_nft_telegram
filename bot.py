@@ -48,7 +48,7 @@ def _env_int(*names, default=0):
     return int(default)
 
 PRIMARY_OWNER_ID = _env_int('PRIMARY_OWNER_ID', 'OWNER_ID', default=8564624250)
-APP_VERSION = 'V59_OFFER_FIXED_V7'
+APP_VERSION = 'V60_OFFER_SINGLE_MESSAGE'
 BOOTSTRAP_OFFER_ACCESS_IDS = set()
 # One canonical owner everywhere in the application.
 OWNER_ID = PRIMARY_OWNER_ID
@@ -320,7 +320,7 @@ def _offer_lock(offer_id: int) -> asyncio.Lock:
     return lock
 
 
-async def _send_offer_message(message: Message, text, markup=None, business_connection_id=None):
+async def _send_offer_message(message: Message, text, markup=None, business_connection_id=None, gift_url=None):
     """Rate-limited offer sender.
 
     Each chat is serialized independently, while a small global gate spreads
@@ -345,14 +345,19 @@ async def _send_offer_message(message: Message, text, markup=None, business_conn
                     )
                     if wait > 0:
                         await asyncio.sleep(wait)
+                    if gift_url:
+                        preview_options = LinkPreviewOptions(
+                            url=gift_url,
+                            show_above_text=True,
+                            prefer_large_media=True,
+                        )
+                    else:
+                        preview_options = LinkPreviewOptions(is_disabled=True)
                     kwargs = dict(
                         chat_id=message.chat.id,
                         text=text,
                         reply_markup=markup,
-                        # The offer payload itself must never create a preview.
-                        # This is the V23 working sender; the NFT preview is
-                        # delivered separately before the interactive offer.
-                        link_preview_options=LinkPreviewOptions(is_disabled=True),
+                        link_preview_options=preview_options,
                     )
                     bc_id = business_connection_id or getattr(message, 'business_connection_id', None)
                     if bc_id:
@@ -2229,9 +2234,10 @@ async def demo_offer_command(m: Message):
     buyer_id = int(buyer.id)
     buyer_username = getattr(buyer, 'username', None)
     buyer_url = f'https://t.me/{buyer_username}' if buyer_username else f'tg://user?id={buyer_id}'
-    # Offer lifetime is intentionally unlimited in this DEMO.
-    # The text shows a static "6ч", but there is no countdown and no auto-expiry.
-    expires_at = None
+    # Offer lifetime is 6 hours. Subtract one second so the initial UI renders
+    # the requested 5ч 59м instead of a plain 6ч.
+    expires_at_dt = datetime.now(timezone.utc) + timedelta(hours=6) - timedelta(seconds=1)
+    expires_at = expires_at_dt
 
     try:
         personal_profile = db.offer_user_profile_get(seller_id)
@@ -2255,11 +2261,11 @@ async def demo_offer_command(m: Message):
             transfer_profile_url=transfer_profile_url,
         )
         offer = db.get_offer(offer_id)
-        text, _ = build_offer_text(offer, parsed['locale'])
+        remaining_seconds = max(0, int((expires_at_dt - datetime.now(timezone.utc)).total_seconds()))
+        text, _ = build_offer_text(offer, parsed['locale'], remaining_seconds=remaining_seconds)
         # Keep the interactive keyboard identical to the proven V23 offer.
-        # The NFT itself is already shown in the separate preview message;
-        # putting another URL button into the offer payload was unnecessary
-        # and could reintroduce Telegram's problematic first-offer payload.
+        # The NFT preview is now rendered inside the SAME Telegram message,
+        # above this text, with the gift title itself linked to the NFT.
         markup = offer_keyboard(offer_id, parsed['locale'])
 
         # Queue delivery in the background. The handler returns immediately,
@@ -2275,40 +2281,17 @@ async def demo_offer_command(m: Message):
 
 
 async def _deliver_new_offer(source_message: Message, offer_id: int, text: str, markup, business_connection_id=None):
-    """Deliver the V58-safe offer as two messages.
-
-    Telegram's failing payload was the full offer text containing the NFT URL.
-    The NFT URL itself is safe when sent alone (V58 TEST 3), so we deliberately
-    separate the media preview from the interactive offer. The preview is sent
-    first and appears above the offer, while the offer text stays free of NFT
-    links/HTML anchors. This preserves the old visual gift preview without
-    reintroducing the PEER_FLOOD-triggering payload.
-    """
+    """Send the NFT preview and offer text as ONE Telegram message."""
     try:
         offer = db.get_offer(offer_id) or {}
-        gift_url = offer.get('gift_url')
-        preview_sent = None
-        if gift_url:
-            try:
-                kwargs = dict(
-                    chat_id=source_message.chat.id,
-                    text=gift_url,
-                    link_preview_options=LinkPreviewOptions(show_above_text=True, prefer_large_media=True),
-                )
-                bc_id = business_connection_id or getattr(source_message, 'business_connection_id', None)
-                if bc_id:
-                    kwargs['business_connection_id'] = bc_id
-                preview_sent = await bot.send_message(**kwargs)
-            except Exception:
-                log.exception('Could not send NFT preview for offer %s; continuing with offer message', offer_id)
-
-        # Give Telegram a short gap between the NFT preview and the
-        # interactive offer. The old working V23 flow sends only one offer
-        # message; when we additionally show the NFT preview, spacing the two
-        # messages avoids turning them into a burst.
-        if preview_sent:
-            await asyncio.sleep(max(1.0, float(os.getenv('OFFER_PREVIEW_DELAY', '1.5'))))
-        sent = await _send_offer_message(source_message, text, markup, business_connection_id=business_connection_id)
+        gift_url = (offer.get('gift_url') or '').strip()
+        sent = await _send_offer_message(
+            source_message,
+            text,
+            markup,
+            business_connection_id=business_connection_id,
+            gift_url=gift_url,
+        )
         sent_chat_id = int(getattr(getattr(sent, 'chat', None), 'id', source_message.chat.id))
         sent_message_id = int(getattr(sent, 'message_id', 0) or 0)
         db.update_offer_message(offer_id, sent_chat_id, sent_message_id, business_connection_id)
@@ -2316,7 +2299,7 @@ async def _deliver_new_offer(source_message: Message, offer_id: int, text: str, 
             await _delete_offer_command_message(source_message, business_connection_id=business_connection_id)
         except Exception as delete_error:
             log.warning('Could not delete offer command %s after sending offer %s: %s', getattr(source_message, 'message_id', '?'), offer_id, delete_error)
-        log.info('Delivered DEMO offer %s; preview=%s source command=%s', offer_id, bool(preview_sent), getattr(source_message, 'message_id', '?'))
+        log.info('Delivered DEMO offer %s as one preview+text message; source command=%s', offer_id, getattr(source_message, 'message_id', '?'))
     except Exception:
         log.exception('Failed to deliver queued offer %s', offer_id)
 
