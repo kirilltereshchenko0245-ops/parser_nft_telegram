@@ -147,3 +147,19 @@ The offer flow remains a simulation: it never transfers Stars or Gram automatica
 - Owner username is resolved from the BusinessConnection / owner chat instead of falling back to the literal `пользователь` when possible.
 - Removed per-message and generic callback audit spam that could trigger Telegram `SendMessage` flood control.
 - Long `TelegramRetryAfter` values are no longer slept through inside handlers; short waits are retried, long waits are surfaced/logged instead of making the offer appear frozen for minutes.
+
+
+## Диагностика маршрута DEMO-оферов
+
+Для проверки причины `PEER_FLOOD` в Business-чате доступны две временные команды:
+
+- `.тестофер` — отправляет минимальное Business-сообщение без inline-кнопок.
+- `.тестофер2` — отправляет минимальное Business-сообщение с одной inline-кнопкой.
+
+Обе команды используют тот же `business_connection_id` и тот же внутренний метод отправки, что и `.офер`.
+Они нужны только для диагностики и не создают реальный офер/транзакцию.
+
+Интерпретация:
+1. `.тестофер` не отправляется с `PEER_FLOOD` → ограничение связано с самим Business peer/маршрутом, а не с inline-кнопками.
+2. `.тестофер` работает, `.тестофер2` падает → отдельно проверяем inline-клавиатуру.
+3. оба теста работают, а `.офер` падает → проверяем payload настоящего DEMO-офера (preview/HTML/ссылка/клавиатура).
