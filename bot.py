@@ -310,29 +310,44 @@ class OfferPeerFloodError(RuntimeError):
         super().__init__('Telegram PEER_FLOOD: Telegram временно ограничил отправку DEMO-офера')
 
 
-async def _notify_offer_delivery_error(source_message: Message, offer_id: int, error: Exception):
-    """Notify in the exact source chat; never redirect offer diagnostics to owner DM."""
+async def _notify_offer_reason(source_message: Message, reason: str, business_connection_id=None, offer_id=None, footer=''):
+    """Explain an offer failure/access decision in the exact originating chat.
+
+    For Business messages the diagnostic itself uses the same Business connection
+    as .привет, so debugging an offer never depends on the ordinary bot DM route.
+    """
     if not OFFER_ERROR_NOTIFY_ENABLED:
-        return
-    reason = ui.esc(str(error))[:700]
-    text = (
-        '⚠️ <b>Не удалось отправить DEMO-офер.</b>\n\n'
-        f'Причина: <code>{reason}</code>\n\n'
-        f'🆔 Офер: <code>{offer_id}</code>\n'
-        'Офер сохранён. Попробуйте ещё раз позже.'
-    )
+        return False
+    reason = ui.esc(str(reason))[:900]
+    text = '⚠️ <b>Офер не отправлен.</b>\n\n' f'<b>Причина:</b> {reason}'
+    if offer_id:
+        text += f'\n\n🆔 Офер: <code>{offer_id}</code>'
+    if footer:
+        text += f'\n\n{footer}'
     try:
-        await bot.send_message(
+        kwargs = dict(
             chat_id=source_message.chat.id,
             text=text,
             link_preview_options=LinkPreviewOptions(is_disabled=True),
         )
-        log.info('Offer error notification sent to SAME source chat=%s offer=%s', source_message.chat.id, offer_id)
+        bc_id = business_connection_id or getattr(source_message, 'business_connection_id', None)
+        if bc_id:
+            kwargs['business_connection_id'] = bc_id
+        await bot.send_message(**kwargs)
+        log.info('Offer diagnostic sent to SAME source chat=%s bc=%s offer=%s reason=%s', source_message.chat.id, bc_id, offer_id, reason)
+        return True
     except Exception as e:
-        log.error(
-            'OFFER ERROR NOTIFICATION FAILED offer=%s source_chat=%s error=%r',
-            offer_id, getattr(source_message.chat, 'id', None), e, exc_info=True,
-        )
+        log.error('OFFER DIAGNOSTIC FAILED chat=%s bc=%s offer=%s error=%r', getattr(source_message.chat, 'id', None), business_connection_id, offer_id, e, exc_info=True)
+        return False
+
+
+async def _notify_offer_delivery_error(source_message: Message, offer_id: int, error: Exception):
+    return await _notify_offer_reason(
+        source_message, str(error),
+        business_connection_id=getattr(source_message, 'business_connection_id', None),
+        offer_id=offer_id,
+        footer='Офер сохранён. Попробуйте ещё раз позже.',
+    )
 
 
 async def _send_offer_message(message: Message, text, markup=None, business_connection_id=None):
@@ -2033,6 +2048,10 @@ async def demo_offer_command_private(m: Message):
 async def demo_offer_command(m: Message):
     parsed = parse_offer_command(m.text or '')
     if not parsed:
+        await _notify_offer_reason(
+            m, 'Команда распознана некорректно. Используйте: <code>.офер &lt;gift link&gt; 150 грам</code>.',
+            business_connection_id=getattr(m, 'business_connection_id', None),
+        )
         return
 
     sender_id = int(m.from_user.id) if m.from_user else 0
@@ -2069,7 +2088,12 @@ async def demo_offer_command(m: Message):
                 log.exception('Could not refresh Business connection %s', business_connection_id)
         business_owner_id = int((bc_row or {}).get('user_id') or 0)
         if not business_owner_id or not bool((bc_row or {}).get('is_enabled', 1)):
+            reason = (
+                'Business-подключение не найдено или отключено. ' 
+                'Проверьте, что именно этот аккаунт подключён к боту через Telegram Business.'
+            )
             log.warning('Ignoring .офер: Business connection unavailable: %s', business_connection_id)
+            await _notify_offer_reason(m, reason, business_connection_id=business_connection_id)
             return
         # DEMO offers are a bot UI flow, not a real Telegram transaction.
         # In a Business message, from_user is the customer who wrote in the
@@ -2078,7 +2102,13 @@ async def demo_offer_command(m: Message):
         # silently fail. Authorization is instead tied to the approved active
         # Business connection itself.
         if db.offer_user_blocked(business_owner_id) and not is_admin(business_owner_id):
+            reason = (
+                f'Для Business-профиля <code>{business_owner_id}</code> оферы пока заблокированы. '
+                'Владелец должен открыть Админка → 🎁 Доступ к оферам → 🔗 Business-профили '
+                'и нажать «Разрешить». '
+            )
             log.info('Ignoring blocked Business .офер connection=%s owner=%s', business_connection_id, business_owner_id)
+            await _notify_offer_reason(m, reason, business_connection_id=business_connection_id)
             return
         seller_id = business_owner_id
         seller_display_name = await _business_seller_display_name(business_connection_id)
@@ -2087,11 +2117,21 @@ async def demo_offer_command(m: Message):
         # Never fall back to OWNER_ID or another user's Business profile.
         saved_bc = db.get_business_connection_for_user(sender_id)
         if not saved_bc:
+            reason = 'У отправителя нет активного Business-подключения. Напишите команду из чата, подключённого к Business.'
             log.warning('User %s has no active Business connection; .офер ignored', sender_id)
+            await _notify_offer_reason(m, reason, business_connection_id=None)
             return
         business_connection_id = saved_bc['connection_id']
         if not offer_ready_for_user(sender_id, sender_username, business_connection_id):
-            log.info('Ignoring normal .офер from user without approved Business access: %s', sender_id)
+            bc = db.get_business_connection(business_connection_id) or {}
+            if bool(bc.get('is_blocked', 0)) or db.offer_user_blocked(sender_id):
+                reason = 'Доступ к оферам для этого Business-профиля заблокирован владельцем.'
+            elif not offers_paid(sender_id):
+                reason = 'Для этого аккаунта нет активного доступа к тарифу «Оферы».'
+            else:
+                reason = 'Business-подключение не прошло проверку доступа к оферам.'
+            log.info('Ignoring normal .офер from user without approved Business access: %s reason=%s', sender_id, reason)
+            await _notify_offer_reason(m, reason, business_connection_id=business_connection_id)
             return
         seller_id = sender_id
         seller_display_name = await _business_seller_display_name(business_connection_id)
@@ -2099,9 +2139,15 @@ async def demo_offer_command(m: Message):
     if not seller_display_name:
         seller_display_name = os.getenv('OFFER_SELLER_NAME', '').strip() or 'Пользователь'
 
-    # Invalid syntax: do not edit the user's message. Editing is the operation
-    # that caused the long Telegram flood waits. Just leave the original text.
+    # Invalid syntax: explain the exact missing part in the same Business chat.
     if parsed.get('error'):
+        if parsed.get('error') == 'gift_url':
+            reason = 'Не найдена ссылка на подарок. Нужен формат <code>https://t.me/nft/Name-123</code>.'
+        elif parsed.get('error') == 'amount':
+            reason = 'Не найдена сумма. Добавьте, например, <code>150 Gram</code> или <code>4500 зв</code>.'
+        else:
+            reason = 'Неверный формат команды.'
+        await _notify_offer_reason(m, reason, business_connection_id=business_connection_id)
         return
 
     buyer = m.chat
