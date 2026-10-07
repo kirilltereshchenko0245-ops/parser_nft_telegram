@@ -11,7 +11,10 @@ from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
 from ui import esc, num, pretty
 
-GIFT_RE = re.compile(r"(?:https?://)?t\.me/nft/([^/?#\s]+?)-(\d+)(?:[/?#\s]|$)", re.I)
+GIFT_RE = re.compile(
+    r'(?:https?://)?t\.me/(?:nft/)?([^/?#\s]+?)-(\d+)(?:[/?#\s]|$)',
+    re.I,
+)
 AMOUNT_RE = re.compile(r"(?P<amount>\d+(?:[.,]\d+)?)\s*(?P<currency>грам(?:м|s)?|gram(?:s)?|зв(?:езд|ёзд)?|stars?|⭐)", re.I)
 LOCALE_RU = 'ru'
 LOCALE_EN = 'en'
@@ -34,6 +37,12 @@ def _currency(raw: str):
 
 
 def parse_offer_command(text: str):
+    _clean_offer_command = (
+        text.strip()
+        .replace("\u200b", "")
+        .replace("`", "")
+        .replace("“", '"').replace("”", '"')
+    )
     text = (text or '').strip()
     m = re.match(r'^\.офер(?:\s+(.+))?$', text, re.I)
     if not m:

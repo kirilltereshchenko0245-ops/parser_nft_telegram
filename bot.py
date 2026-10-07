@@ -2043,6 +2043,61 @@ async def demo_offer_command_private(m: Message):
     except Exception:
         log.exception('Could not explain Business-only offer mode to chat=%s', getattr(m.chat, 'id', None))
 
+# --- V42 diagnostic handlers ---
+@dp.business_message(F.text.regexp(r'^\s*\.тестофер(?:\s|$)', flags=re.I))
+async def demo_offer_route_test_1(m: Message):
+    bc_id = getattr(m, "business_connection_id", None)
+    if not bc_id:
+        await m.answer("❌ Это тест только для Business-чата.")
+        return
+    try:
+        await _send_offer_message(
+            m,
+            '<b>🧪 TEST 1</b> — обычный текст\n\nBusiness-маршрут дошёл до отправки.',
+            None,
+            business_connection_id=bc_id,
+        )
+    except Exception as e:
+        try:
+            await m.bot.send_message(
+                chat_id=m.chat.id,
+                text=f"❌ TEST 1 ошибка: <code>{str(e)[:700]}</code>",
+                business_connection_id=bc_id,
+                parse_mode="HTML",
+            )
+        except Exception:
+            pass
+
+
+@dp.business_message(F.text.regexp(r'^\s*\.тестофер2(?:\s|$)', flags=re.I))
+async def demo_offer_route_test_2(m: Message):
+    bc_id = getattr(m, "business_connection_id", None)
+    if not bc_id:
+        await m.answer("❌ Это тест только для Business-чата.")
+        return
+    markup = InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="Принять", callback_data="of:test:accept")
+    ]])
+    try:
+        await _send_offer_message(
+            m,
+            '<b>🧪 TEST 2</b> — текст + inline-кнопка\n\nBusiness-маршрут + inline дошли до отправки.',
+            markup,
+            business_connection_id=bc_id,
+        )
+    except Exception as e:
+        try:
+            await m.bot.send_message(
+                chat_id=m.chat.id,
+                text=f"❌ TEST 2 ошибка: <code>{str(e)[:700]}</code>",
+                business_connection_id=bc_id,
+                parse_mode="HTML",
+            )
+        except Exception:
+            pass
+
+
+
 
 @dp.business_message(F.text.regexp(r'^\s*\.офер(?:\s|$)'))
 async def demo_offer_command(m: Message):
@@ -2142,7 +2197,7 @@ async def demo_offer_command(m: Message):
     # Invalid syntax: explain the exact missing part in the same Business chat.
     if parsed.get('error'):
         if parsed.get('error') == 'gift_url':
-            reason = 'Не найдена ссылка на подарок. Нужен формат <code>https://t.me/nft/Name-123</code>.'
+            reason = 'Не найдена ссылка на подарок. Формат: https://t.me/nft/Название-123 150 Gram Нужен формат <code>https://t.me/nft/Name-123</code>.'
         elif parsed.get('error') == 'amount':
             reason = 'Не найдена сумма. Добавьте, например, <code>150 Gram</code> или <code>4500 зв</code>.'
         else:
