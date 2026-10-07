@@ -2014,9 +2014,26 @@ async def _run_offer_send_diagnostics(m: Message):
     callback_kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text='Принять', callback_data='offer_diag_accept')]
     ])
+    offer_kb = InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text='Отклонить', icon_custom_emoji_id='5778527486270770928', callback_data='offer_diag_decline'),
+        InlineKeyboardButton(text='Принять', icon_custom_emoji_id='5776375003280838798', callback_data='offer_diag_accept'),
+    ]])
+    transfer_kb = InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text='Передать', icon_custom_emoji_id='5879770735999717115', url='https://t.me/example')
+    ]])
     url_kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text='Как передать подарок', url=telegraph_url)]
     ])
+    exact_offer_text = (
+        'Пользователь <b>Тестовый Пользователь</b> предлагает Вам <b>150 Gram</b> за подарок '
+        '<a href="https://t.me/nft/PartySparkler-140864">Party Sparkler #140,864</a>.\n\n'
+        'Предложение действует ещё <b>6ч</b>.'
+    )
+    exact_final_text = (
+        '<tg-emoji emoji-id="6032937473162614352">🎁</tg-emoji> Подарок: '
+        '<a href="https://t.me/nft/PartySparkler-140864">Party Sparkler #140,864</a> успешно продан!\n\n'
+        '<b>• Передайте подарок покупателю для зачисления 150 Gram на ваш баланс.</b>'
+    )
 
     tests = [
         ('TEST 1 — обычный текст', 'Business-маршрут + обычный текст.', None, None),
@@ -2024,6 +2041,9 @@ async def _run_offer_send_diagnostics(m: Message):
         ('TEST 3 — NFT-ссылка без preview', f'NFT-ссылка без preview: {nft_url}', None, no_preview),
         ('TEST 4 — NFT-ссылка + inline-кнопка', f'NFT-ссылка + callback inline-кнопка: {nft_url}', callback_kb, no_preview),
         ('TEST 5 — Telegraph URL-кнопка', 'Только URL-кнопка Telegraph (тестовый payload, НЕ рабочий офер).', url_kb, no_preview),
+        ('TEST 6 — полный первый офер', exact_offer_text, offer_kb, LinkPreviewOptions(show_above_text=True, prefer_large_media=True)),
+        ('TEST 7 — полный первый офер без preview', exact_offer_text, offer_kb, no_preview),
+        ('TEST 8 — полный финальный офер + Передать', exact_final_text, transfer_kb, LinkPreviewOptions(show_above_text=True, prefer_large_media=True)),
     ]
 
     results = []
@@ -2051,7 +2071,7 @@ async def _run_offer_send_diagnostics(m: Message):
         short = detail.replace('\n', ' ')[:220]
         summary.append(f'{icon} {name}: {ui.esc(short)}')
     summary.append('')
-    summary.append('TEST 5 проверяет URL-кнопку Telegraph отдельно. Она не используется в рабочем офере.')
+    summary.append('TEST 5 — отдельная Telegraph-кнопка; TEST 6–8 — реальные payload-подобные варианты рабочего офера.')
 
     # If at least one raw send succeeded, this summary is delivered through the
     # same Business connection. If the route is fully blocked, the detailed
@@ -2076,7 +2096,7 @@ async def offer_diagnostic_command(m: Message):
     try:
         await bot.send_message(
             chat_id=chat_id,
-            text='🧪 <b>Диагностика оферов запущена.</b>\n\nТесты 1–5 будут отправлены последовательно.',
+            text='🧪 <b>Диагностика оферов запущена.</b>\n\nТесты 1–8 будут отправлены последовательно. Рабочий .офер не изменяется.',
             business_connection_id=bc_id,
         )
     except Exception as e:
