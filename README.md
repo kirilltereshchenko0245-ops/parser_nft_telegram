@@ -1,21 +1,21 @@
-# V43 — Offer parser fixed
+# V59 OFFER FIXED V5
 
-Изменения:
-- Исправлен regex подарка: `https://t.me/nft/Name-123`, `t.me/nft/Name-123`,
-  URL с `/`, `?query` и `#fragment` распознаются.
-- Перед разбором удаляются zero-width символы, backticks и типографские кавычки.
-- Ошибка отсутствующей ссылки теперь показывает ожидаемый формат.
-- Отдельные `.тестофер`/`.тестофер2` удалены из диагностической версии.
-- Business-отправка DEMO-офера остаётся прежней; реальных переводов Stars/подарков нет.
+Исправления:
+- `.офер` без аргументов показывает инструкцию команд.
+- `.офер` с неверным синтаксисом тоже показывает инструкцию.
+- Business-офер определяется по точному `business_connection_id` входящего сообщения.
+- Старый флаг `is_blocked` из V58/V59 больше не блокирует рабочее Business-подключение.
+- Новое активное Business-подключение получает доступ к DEMO-оферам автоматически. Явная блокировка администратора сохраняется.
+- При невозможности отправки из-за доступа бот сообщает причину, а не молча ничего не делает.
+- NFT в первом офере остаётся URL-кнопкой, без HTML-якоря.
 
-Тест:
-`.офер https://t.me/nft/PartySparkler-140864 150 Gram`
+Примеры:
+`.офер`
+`.офер https://t.me/nft/PartySparkler-140864 1000 зв`
+`.офер ру https://t.me/nft/PartySparkler-140864 1000 зв`
+`.офер англ https://t.me/nft/PartySparkler-140864 1000 stars`
 
 
-## V44 offer diagnostics
-V44 records the exact DEMO-offer send stage in `logs/giftparser.log`. For an offer send, look for:
-- `OFFER SEND API START method=sendMessage`
-- `OFFER SEND API OK ...`
-- or `OFFER SEND API BAD_REQUEST ... PEER_FLOOD`
+## V6 offer transport fix
 
-The offer is sent only through the originating Business connection. There is no normal-bot fallback and no anti-spam bypass.
+The first `.офер` is deliberately sent as plain text with the NFT only in a URL button. Link previews are disabled. No HTML text-link, inline NFT URL, custom emoji, or preview is included in the first-offer payload. This follows the V58 isolation results: full text without the NFT anchor was stable, while production combinations containing the NFT link could return PEER_FLOOD.

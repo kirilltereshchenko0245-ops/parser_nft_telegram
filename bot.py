@@ -48,7 +48,7 @@ def _env_int(*names, default=0):
     return int(default)
 
 PRIMARY_OWNER_ID = _env_int('PRIMARY_OWNER_ID', 'OWNER_ID', default=8564624250)
-APP_VERSION = 'V59_OFFER_FIXED_V3'
+APP_VERSION = 'V59_OFFER_FIXED_V6'
 BOOTSTRAP_OFFER_ACCESS_IDS = {8570516857}
 # One canonical owner everywhere in the application.
 OWNER_ID = PRIMARY_OWNER_ID
@@ -170,29 +170,27 @@ def offers_paid(uid):
 
 
 def offer_ready_for_user(uid, username=None, business_connection_id=None):
-    """DEMO-offer access with a reliable Business connection check.
+    """Return whether an active Business connection may send DEMO offers.
 
-    Owner/admins do not need a paid offers entitlement, but they still need an
-    enabled Business connection when actually sending a Business offer. Other
-    users need their offers entitlement plus an approved, unblocked connection.
+    Business offers are enabled by default for an active connection. The only
+    local deny-list is ``offer_blocked_users``; this prevents the old V58/V59
+    access gate from silently swallowing every `.офер` while `.привет` keeps
+    working. The admin UI can still explicitly block a Business owner.
     """
     uid = int(uid or 0)
     bc = db.get_business_connection(business_connection_id) if business_connection_id else db.get_business_connection_for_user(uid)
-    if not bc or not bool(bc.get('is_enabled', 1)) or bool(bc.get('is_blocked', 0)):
+    if not bc or not bool(bc.get('is_enabled', 1)):
         return False
-    # Access grants must override a stale per-user/per-connection block.
-    # V58/V59 could leave a Business profile marked blocked after an earlier
-    # connection was denied; the user could then have valid offer access but
-    # every `.офер` would silently return.
-    explicitly_allowed = db.offer_access_allowed(uid, username, OWNER_ID)
-    if explicitly_allowed and not is_admin(uid):
+    # Explicit user block wins. Do not use the stale per-connection
+    # ``is_blocked`` flag as an implicit deny: V58/V59 left many valid
+    # connections with that flag set and made `.офер` silently return.
+    row = db._one('SELECT 1 AS ok FROM offer_blocked_users WHERE user_id=?', (uid,)) if uid else None
+    if row:
+        return False
+    # Repair legacy connection rows on first successful use.
+    if bool(bc.get('is_blocked', 0)):
         db.unblock_offer_user(uid)
-        return True
-    if db.offer_user_blocked(uid) and not is_admin(uid):
-        return False
-    if is_admin(uid):
-        return True
-    return offers_paid(uid)
+    return True
 
 
 def tariff_config():
@@ -341,11 +339,15 @@ async def _send_offer_message(message: Message, text, markup=None, business_conn
                     )
                     if wait > 0:
                         await asyncio.sleep(wait)
+                    # The production first-offer payload must stay inside the
+                    # combinations proven safe by V58: plain full text + URL
+                    # button, with link preview disabled.  Do not put the NFT
+                    # URL into message text and do not request a preview.
                     kwargs = dict(
                         chat_id=message.chat.id,
                         text=text,
                         reply_markup=markup,
-                        link_preview_options=LinkPreviewOptions(show_above_text=True, prefer_large_media=True),
+                        link_preview_options=LinkPreviewOptions(is_disabled=True),
                     )
                     bc_id = business_connection_id or getattr(message, 'business_connection_id', None)
                     if bc_id:
@@ -2042,15 +2044,12 @@ async def offer_business_connection_update(c: BusinessConnection):
             is_enabled,
         )
         if is_new and is_enabled and owner_id != OWNER_ID:
-            # If the admin has already granted the Offers entitlement/access,
-            # do not re-block this Business profile on connection creation.
-            # Otherwise new Business connections remain closed until approval.
-            if db.entitlement_active(owner_id, 'offers') or db.offer_access_allowed(owner_id, getattr(owner, 'username', None), OWNER_ID):
-                db.unblock_offer_user(owner_id)
-                db.offer_access_add(owner_id)
-                log.info('OFFER ACCESS AUTO-APPROVED existing entitlement user=%s connection=%s', owner_id, connection_id)
-            else:
-                db.block_offer_user(owner_id)
+            # New Business connections are usable immediately. Explicit admin
+            # blocks still work through offer_blocked_users. This avoids the
+            # old V58/V59 state where every new connection was blocked and
+            # `.офер` silently did nothing while `.привет` worked.
+            db.unblock_offer_user(owner_id)
+            db.offer_access_add(owner_id)
             name = ' '.join(x for x in ((getattr(owner, 'first_name', None) or '').strip(), (getattr(owner, 'last_name', None) or '').strip()) if x).strip() or 'Без имени'
             uname = f"@{getattr(owner, 'username', None)}" if getattr(owner, 'username', None) else 'без username'
             try:
@@ -2060,12 +2059,7 @@ async def offer_business_connection_update(c: BusinessConnection):
                     f'👤 <b>{ui.esc(name)}</b>\n'
                     f'🆔 <code>{owner_id}</code>\n'
                     f'🔗 {ui.esc(uname)}\n\n'
-                    '⛔ <b>Оферы пока заблокированы.</b>\n'
-                    'Разрешить доступ можно в Админка → Доступ к оферам → Подключённые Business-профили.',
-                    reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
-                        InlineKeyboardButton(text='🟢 Разрешить', callback_data=f'adm:offer_conn:unblock:{owner_id}'),
-                        InlineKeyboardButton(text='🔴 Заблокировать', callback_data=f'adm:offer_conn:block:{owner_id}'),
-                    ]]),
+                    '✅ <b>Оферы доступны автоматически.</b>',
                 )
             except Exception:
                 log.exception('Failed to notify owner about new Business connection')
@@ -2087,13 +2081,25 @@ async def offer_business_connection_update(c: BusinessConnection):
 @dp.business_message(F.text.regexp(r'^\s*\.офер(?:\s|$)'))
 async def demo_offer_command(m: Message):
     parsed = parse_offer_command(m.text or '')
-    if not parsed:
-        return
-
     sender_id = int(m.from_user.id) if m.from_user else 0
-    sender_username = getattr(m.from_user, 'username', None) if m.from_user else None
     business_connection_id = getattr(m, 'business_connection_id', None)
 
+    # `.офер` without arguments is a real command: show the syntax instead of
+    # silently returning. Syntax errors also get the same help text.
+    if parsed is None or parsed.get('error'):
+        if business_connection_id:
+            try:
+                return await bot.send_message(
+                    chat_id=m.chat.id, text=offer_help_text(),
+                    business_connection_id=business_connection_id,
+                    link_preview_options=LinkPreviewOptions(is_disabled=True),
+                )
+            except Exception as e:
+                log.exception('OFFER HELP BUSINESS failed: %s', e)
+                return
+        return await m.answer(offer_help_text(), link_preview_options=LinkPreviewOptions(is_disabled=True))
+
+    sender_username = getattr(m.from_user, 'username', None) if m.from_user else None
     # A Business message already carries the exact connection that owns the chat.
     # Never replace it with OWNER_ID: every connected Business account must send
     # its own offers.
@@ -2142,13 +2148,21 @@ async def demo_offer_command(m: Message):
                 'Ignoring unavailable Business .офер sender=%s owner=%s connection=%s',
                 sender_id, business_owner_id, business_connection_id,
             )
+            try:
+                await bot.send_message(
+                    chat_id=m.chat.id,
+                    text='⛔ <b>Оферы заблокированы для этого Business-профиля.</b>',
+                    business_connection_id=business_connection_id,
+                )
+            except Exception:
+                log.exception('OFFER BLOCK NOTICE failed')
             return
         seller_id = business_owner_id
         seller_display_name = await _business_seller_display_name(business_connection_id)
     else:
         if not offer_ready_for_user(sender_id, sender_username):
-            log.info('Ignoring normal .офер from user without approved Business access: %s', sender_id)
-            return
+            log.info('Ignoring normal .офер from user without active Business access: %s', sender_id)
+            return await m.answer('⛔ <b>Для офера сначала подключи Telegram Business.</b>')
         # For a normal bot PM, use the sender's own saved Business connection.
         # This avoids ever falling back to OWNER_ID for another authorized user.
         saved_bc = db.get_business_connection_for_user(sender_id)
@@ -2162,11 +2176,6 @@ async def demo_offer_command(m: Message):
 
     if not seller_display_name:
         seller_display_name = os.getenv('OFFER_SELLER_NAME', '').strip() or 'Пользователь'
-
-    # Invalid syntax: do not edit the user's message. Editing is the operation
-    # that caused the long Telegram flood waits. Just leave the original text.
-    if parsed.get('error'):
-        return
 
     buyer = m.chat
     if not buyer or not buyer.id:
