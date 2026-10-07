@@ -24,6 +24,7 @@ from database import Database
 from peek_api import AVAILABLE_MODELS, PeekAPI, gift_url, is_known_model, normalize_model_name, suggest_models
 from gift_catalog import GIFT_CATALOG, GIFT_MODELS, GIFT_BY_API, GIFT_PAGE_SIZE
 from price_estimator import estimate_stars
+from live_gift_price import live_price
 from payments import CryptoPay, XRocketPay
 from parsing import handlers as parser_handlers
 from offer_simulator import (parse_offer_command, offer_help_text, keyboard as offer_keyboard, build_offer_text, accepted_alert_text, final_offer_text, declined_text, transfer_keyboard, STATUS_PENDING, STATUS_ACCEPTED, STATUS_DECLINED)
@@ -34,9 +35,21 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s | %(levelname)s | %(
 log = logging.getLogger('giftparser')
 
 TOKEN = os.getenv('BOT_TOKEN')
-PRIMARY_OWNER_ID = 8564624250
-APP_VERSION = 'V27_STABLE_REDESIGN'
-# Canonical project owner. This is intentionally independent of a stale Railway OWNER_ID.
+# Canonical owner comes from Railway/Environment variables.
+# PRIMARY_OWNER_ID has priority when explicitly set; OWNER_ID remains a compatible fallback.
+def _env_int(*names, default=0):
+    for name in names:
+        raw = os.getenv(name)
+        if raw is not None and str(raw).strip():
+            try:
+                return int(str(raw).strip())
+            except ValueError:
+                pass
+    return int(default)
+
+PRIMARY_OWNER_ID = _env_int('PRIMARY_OWNER_ID', 'OWNER_ID', default=8564624250)
+APP_VERSION = 'V28_OWNER_ENV_FIX'
+# One canonical owner everywhere in the application.
 OWNER_ID = PRIMARY_OWNER_ID
 CONCURRENCY = int(os.getenv('PEEK_CONCURRENCY') or 1)  # По 1 ID последовательно
 if not TOKEN:
@@ -58,11 +71,11 @@ db = Database(db_path)
 if not db.get_setting('log_channel_id') and LOG_CHANNEL_ID:
     db.set_setting('log_channel_id', str(LOG_CHANNEL_ID))
 if OWNER_ID:
+    # Bootstrap/migrate the current owner into every owner-level permission table.
     db.offer_access_add(OWNER_ID)
     db.admin_add(OWNER_ID)
-db.admin_add(PRIMARY_OWNER_ID)
-db.parser_access_add(PRIMARY_OWNER_ID)
-log.info('PARSER ACCESS BOOT version=%s owner=%s db=%s', APP_VERSION, PRIMARY_OWNER_ID, os.path.abspath(db_path))
+    db.parser_access_add(OWNER_ID)
+log.info('OWNER BOOT version=%s owner=%s db=%s', APP_VERSION, OWNER_ID, os.path.abspath(db_path))
 api = PeekAPI(CONCURRENCY)
 crypto_pay = CryptoPay(os.getenv('CRYPTO_PAY_API_TOKEN'))
 xrocket_pay = XRocketPay(os.getenv('XROCKET_PAY_API_TOKEN'))
@@ -1097,18 +1110,43 @@ async def v24_random_run(c: CallbackQuery):
     if not trial_allowed(uid,'random',count): return await c.answer(f'Осталось: {db.trial_left(uid,"random")}',show_alert=True)
     if uid in ACTIVE: return await c.answer('У тебя уже идёт проверка.',show_alert=True)
     await c.answer('Запускаю…'); ACTIVE.add(uid); db.clear_stop(uid)
-    status=await c.message.answer(f'🎲 Проверяю <b>{count}</b> случайных подарков…',reply_markup=kb.running_kb())
-    found=0; errors=0
+    status=await c.message.edit_text(f'🎲 Проверяю <b>{count}</b> случайных подарков…',reply_markup=kb.running_kb())
+    found=0; errors=0; prices=[]; owners=set(); results=[]
     try:
+        try:
+            await parser_handlers.ensure_client(db)
+        except Exception:
+            pass
         for i in range(count):
             if db.should_stop(uid): break
             model=random.choice(GIFT_MODELS) if selected_model == 'any' else selected_model; number=random.randint(1,100000)
             try: gift=await peek_get_gift(model,number)
-            except Exception as e: gift=None; errors+=1; log.warning('V24 random failed model=%s number=%s: %s',model,number,e)
+            except Exception as e: gift=None; errors+=1; log.warning('Random failed model=%s number=%s: %s',model,number,e)
             db.consume_trial_kind(uid,'random',1)
-            if gift:
-                found+=1; await send_card(c.message,uid,gift)
-        await edit(status,f'🎲 <b>СЛУЧАЙНЫЙ ПАРСЕР ЗАВЕРШЁН</b>\n\nПроверено: <b>{count}</b>\nНайдено: <b>{found}</b>\nОшибок сети: <b>{errors}</b>',reply_markup=kb.inline_main_menu(is_admin(uid),is_unlimited(uid)))
+            if not gift: continue
+            found+=1
+            gift['gift_slug'] = gift.get('gift_slug') or f'{gift.get("model") or model}-{gift.get("giftNumber") or number}'
+            live, source, details = await live_price(parser_handlers.parser_client, gift)
+            if live:
+                gift['market'] = {'price': live, 'source': source, 'details': details}
+                prices.append(live)
+            owner = gift.get('username') or gift.get('userId') or gift.get('owner')
+            if owner: owners.add(str(owner))
+            results.append(gift)
+            await send_card(c.message,uid,gift)
+        total=sum(prices) if prices else 0
+        avg=round(total/len(prices)) if prices else 0
+        owner_text=', '.join(f'@{x}' if not x.isdigit() else x for x in list(owners)[:15]) or 'не определены'
+        summary=(f'🎲 <b>СЛУЧАЙНЫЙ ПАРСЕР ЗАВЕРШЁН</b>\n\n'
+                 f'🔎 Проверено: <b>{count}</b>\n'
+                 f'🎁 Найдено подарков: <b>{found}</b>\n'
+                 f'👤 Владельцев: <b>{len(owners)}</b>\n'
+                 f'👥 Владельцы: <b>{ui.esc(owner_text)}</b>\n'
+                 f'⭐ Оценено по Telegram: <b>{len(prices)}/{found}</b>\n'
+                 f'💰 Суммарная оценка: <b>~{total:,} Stars</b>\n'
+                 f'📊 Средняя цена: <b>~{avg:,} Stars</b>' if prices else
+                 f'🎲 <b>СЛУЧАЙНЫЙ ПАРСЕР ЗАВЕРШЁН</b>\n\nПроверено: <b>{count}</b>\nНайдено подарков: <b>{found}</b>\nВладельцев: <b>{len(owners)}</b>\n⚠️ Актуальную цену Telegram не удалось получить для найденных подарков.')
+        await edit(status,summary,reply_markup=kb.inline_main_menu(is_admin(uid),is_unlimited(uid)))
     finally:
         ACTIVE.discard(uid); db.clear_stop(uid)
 

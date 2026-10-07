@@ -13,6 +13,7 @@ from parsing.telegram_client import ParserClient
 from parsing.scanner import ChatScanner
 from parsing import keyboards as parser_kb
 from price_estimator import estimate_stars
+from live_gift_price import live_price
 
 log = logging.getLogger('giftparser.parser')
 router = Router()
@@ -400,6 +401,9 @@ async def start_scan_with_limit(message, uid, state, db, limit, call, explicit_m
 
     async def on_result(user, gifts):
         for gift in gifts[:5]:
+            live, source, details = await live_price(parser_client, gift)
+            if live:
+                gift['market'] = {'price': live, 'source': source, 'details': details}
             card = format_gift_card(user, gift)
             await origin_message.answer(card)
 
@@ -427,7 +431,7 @@ def format_gift_card(user, gift):
         status = '—'
     link = f'https://t.me/nft/{gift["gift_slug"]}' if gift.get('gift_slug') else 'ссылка недоступна для обычного подарка'
     price, source = estimate_stars(gift)
-    price_label = '⭐ Примерная цена' if source != 'market' else '⭐ Рыночная оценка'
+    price_label = '⭐ Актуальная оценка Telegram' if source == 'market' else '⭐ Цена: нет данных'
     return ('🎁 <b>НАЙДЕН ПОДАРОК</b>\n\n'
             f'👤 Владелец: <b>{username}</b>\n'
             f'🆔 Telegram ID: <code>{user.get("user_id")}</code>\n'
@@ -436,7 +440,8 @@ def format_gift_card(user, gift):
             f'🔢 ID типа: <code>{gift.get("gift_id") or "—"}</code>\n'
             f'🔢 Номер: <code>{gift.get("gift_num") or "—"}</code>\n'
             f'📌 Статус: <b>{status}</b>\n'
-            f'{price_label}: <b>~{price:,} Stars</b>\n\n'
+            f'{price_label}: <b>~{price:,} Stars</b>\n\n' if price else
+            f'{price_label}\n\n'
             f'🔗 {link}')
 
 
