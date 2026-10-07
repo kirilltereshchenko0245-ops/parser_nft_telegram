@@ -1779,6 +1779,7 @@ async def offer_business_connection_update(c: BusinessConnection):
 async def demo_offer_command(m: Message):
     parsed = parse_offer_command(m.text or '')
     if not parsed:
+        await m.answer(offer_help_text('ru'))
         return
 
     sender_id = int(m.from_user.id) if m.from_user else 0
@@ -1810,23 +1811,33 @@ async def demo_offer_command(m: Message):
                 log.exception('Could not refresh Business connection %s', business_connection_id)
         business_owner_id = int((bc_row or {}).get('user_id') or 0)
         if not business_owner_id or not bool((bc_row or {}).get('is_enabled', 1)):
-            log.warning('Ignoring .офер: Business connection unavailable: %s', business_connection_id)
+            log.warning('Offer blocked: Business connection unavailable: %s', business_connection_id)
+            await m.answer('❌ Для офера сначала подключите Telegram Business к этому боту.')
             return
         # A command inside a Business-managed chat is valid only when the
         # person who typed it is the owner of THIS Business connection.
         # This prevents an unauthorized friend from triggering another user's
         # Business account by simply writing `.офер` to their chat.
         if business_owner_id != sender_id:
-            log.info('Ignoring cross-user Business .офер sender=%s business_owner=%s', sender_id, business_owner_id)
+            log.info('Offer denied: sender=%s business_owner=%s', sender_id, business_owner_id)
+            await m.answer('❌ У вас нет доступа к оферам этого Business-профиля.')
             return
         if not offer_ready_for_user(sender_id, sender_username):
-            log.info('Ignoring unavailable Business .офер sender=%s', sender_id)
+            if db.offer_user_blocked(sender_id):
+                await m.answer('❌ Оферы для вашего Business-профиля пока не разрешены. Обратитесь к овнеру для получения доступа.')
+            else:
+                await m.answer('❌ Для офера сначала подключите Telegram Business к этому боту.')
             return
         seller_id = business_owner_id
         seller_display_name = await _business_seller_display_name(business_connection_id)
     else:
         if not offer_ready_for_user(sender_id, sender_username):
-            log.info('Ignoring normal .офер from user without approved Business access: %s', sender_id)
+            if not db.get_business_connection_for_user(sender_id):
+                await m.answer('❌ Для офера сначала подключите Telegram Business к этому боту.')
+            elif db.offer_user_blocked(sender_id):
+                await m.answer('❌ Оферы для вашего Business-профиля пока не разрешены. Обратитесь к овнеру для получения доступа.')
+            else:
+                await m.answer('❌ Для офера нет активного Business-подключения.')
             return
         # For a normal bot PM, use the sender's own saved Business connection.
         # This avoids ever falling back to OWNER_ID for another authorized user.
@@ -1836,7 +1847,7 @@ async def demo_offer_command(m: Message):
             seller_id = sender_id
             seller_display_name = await _business_seller_display_name(business_connection_id)
         else:
-            log.warning('Authorized user %s has no active Business connection; .офер is not sent as OWNER', sender_id)
+            await m.answer('❌ Для офера сначала подключите Telegram Business к этому боту.')
             return
 
     if not seller_display_name:
@@ -1845,6 +1856,13 @@ async def demo_offer_command(m: Message):
     # Invalid syntax: do not edit the user's message. Editing is the operation
     # that caused the long Telegram flood waits. Just leave the original text.
     if parsed.get('error'):
+        error = parsed.get('error')
+        if error == 'gift_url':
+            await m.answer('❌ Не нашёл ссылку на NFT.\n\n' + offer_help_text(parsed.get('locale', 'ru')))
+        elif error == 'amount':
+            await m.answer('❌ Не нашёл цену офера.\n\n' + offer_help_text(parsed.get('locale', 'ru')))
+        else:
+            await m.answer(offer_help_text(parsed.get('locale', 'ru')))
         return
 
     buyer = m.chat
