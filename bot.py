@@ -1433,7 +1433,8 @@ async def offer_self_profile_url(m: Message, state: FSMContext):
     elif re.fullmatch(r'tg://user\?id=-?\d+', raw, re.I):
         url = raw
     elif re.fullmatch(r'https?://t\.me/[A-Za-z0-9_]{5,32}/?', raw, re.I):
-        url = f'tg://send_gift?to={raw.rstrip('/').rsplit('/', 1)[-1]}'
+        username = raw.rstrip('/').rsplit('/', 1)[-1]
+        url = f'tg://send_gift?to={username}'
     else:
         return await m.answer('❌ Отправь username без @, например <code>witensea</code>.')
     data = await state.get_data(); name = data.get('personal_profile_name') or 'Мой профиль'
