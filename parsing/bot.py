@@ -27,7 +27,6 @@ from price_estimator import estimate_stars
 from live_gift_price import live_price
 from payments import CryptoPay, XRocketPay
 from parsing import handlers as parser_handlers
-from offer_simulator import (parse_offer_command, offer_help_text, keyboard as offer_keyboard, build_offer_text, accepted_alert_text, final_offer_text, declined_text, transfer_keyboard, STATUS_PENDING, STATUS_ACCEPTED, STATUS_DECLINED)
 
 load_dotenv()
 os.makedirs('logs', exist_ok=True)
@@ -71,8 +70,6 @@ db = Database(db_path)
 if not db.get_setting('log_channel_id') and LOG_CHANNEL_ID:
     db.set_setting('log_channel_id', str(LOG_CHANNEL_ID))
 if OWNER_ID:
-    # Bootstrap/migrate the current owner into every owner-level permission table.
-    db.offer_access_add(OWNER_ID)
     db.admin_add(OWNER_ID)
     db.parser_access_add(OWNER_ID)
 log.info('OWNER BOOT version=%s owner=%s db=%s', APP_VERSION, OWNER_ID, os.path.abspath(db_path))
@@ -80,18 +77,6 @@ api = PeekAPI(CONCURRENCY)
 crypto_pay = CryptoPay(os.getenv('CRYPTO_PAY_API_TOKEN'))
 xrocket_pay = XRocketPay(os.getenv('XROCKET_PAY_API_TOKEN'))
 ACTIVE: set[int] = set()  # пользователи с запущенным поиском
-OFFER_ACTION_LOCKS: dict[int, asyncio.Lock] = {}
-OFFER_CHAT_SEND_LOCKS: dict[int, asyncio.Lock] = {}
-OFFER_SEND_GATE = asyncio.Lock()
-OFFER_SEND_LAST_AT = 0.0
-OFFER_SEND_BLOCKED_UNTIL = 0.0
-OFFER_SEND_INTERVAL = float(os.getenv('OFFER_SEND_INTERVAL', '4.0'))
-OFFER_PEER_FLOOD_RETRIES = int(os.getenv('OFFER_PEER_FLOOD_RETRIES', '6'))
-OFFER_PEER_FLOOD_BASE_DELAY = float(os.getenv('OFFER_PEER_FLOOD_BASE_DELAY', '30'))
-OFFER_ERROR_NOTIFY_ENABLED = os.getenv('OFFER_ERROR_NOTIFY_ENABLED', '1').strip().lower() not in {'0','false','no'}
-OFFER_DELIVERY_TASKS: set[asyncio.Task] = set()
-BUSINESS_SELLER_NAME_CACHE: dict[str, str] = {}
-BUSINESS_OWNER_ID_CACHE: dict[str, int] = {}
 
 # Подключаем router парсера
 dp.include_router(parser_handlers.router)
@@ -159,26 +144,8 @@ def chat_parser_allowed(uid):
     return is_admin(uid) or db.parser_access_allowed(uid, OWNER_ID)
 
 
-def offers_paid(uid):
-    return is_admin(uid) or db.entitlement_active(uid, 'offers')
 
 
-def offer_ready_for_user(uid, username=None, business_connection_id=None):
-    """DEMO-offer access with a reliable Business connection check.
-
-    Owner/admins do not need a paid offers entitlement, but they still need an
-    enabled Business connection when actually sending a Business offer. Other
-    users need their offers entitlement plus an approved, unblocked connection.
-    """
-    uid = int(uid or 0)
-    bc = db.get_business_connection(business_connection_id) if business_connection_id else db.get_business_connection_for_user(uid)
-    if not bc or not bool(bc.get('is_enabled', 1)) or bool(bc.get('is_blocked', 0)):
-        return False
-    if db.offer_user_blocked(uid) and not is_admin(uid):
-        return False
-    if is_admin(uid):
-        return True
-    return offers_paid(uid)
 
 
 def tariff_config():
@@ -294,12 +261,6 @@ def no_preview():
     return LinkPreviewOptions(is_disabled=True)
 
 
-def _offer_lock(offer_id: int) -> asyncio.Lock:
-    lock = OFFER_ACTION_LOCKS.get(offer_id)
-    if lock is None:
-        lock = asyncio.Lock()
-        OFFER_ACTION_LOCKS[offer_id] = lock
-    return lock
 
 
 class OfferPeerFloodError(RuntimeError):
@@ -350,96 +311,10 @@ async def _notify_offer_delivery_error(source_message: Message, offer_id: int, e
     )
 
 
-async def _send_offer_message(message: Message, text, markup=None, business_connection_id=None):
-    """Send the DEMO offer immediately.
-
-    We do not attempt to bypass Telegram anti-spam restrictions. If Telegram
-    rejects the Business-context send with PEER_FLOOD, raise immediately so the
-    caller can give the author a useful response. A normal bot send is only a
-    delivery fallback when the bot itself is allowed to post in the source
-    chat; it does not impersonate the Business profile.
-    """
-    global OFFER_SEND_LAST_AT
-    chat_id = int(message.chat.id)
-    chat_lock = OFFER_CHAT_SEND_LOCKS.get(chat_id)
-    if chat_lock is None:
-        chat_lock = asyncio.Lock()
-        OFFER_CHAT_SEND_LOCKS[chat_id] = chat_lock
-
-    async with chat_lock:
-        async with OFFER_SEND_GATE:
-            loop = asyncio.get_running_loop()
-            wait = OFFER_SEND_INTERVAL - (loop.time() - OFFER_SEND_LAST_AT)
-            if wait > 0:
-                await asyncio.sleep(wait)
-            kwargs = dict(
-                chat_id=message.chat.id,
-                text=text,
-                reply_markup=markup,
-                link_preview_options=LinkPreviewOptions(show_above_text=True, prefer_large_media=True),
-            )
-            bc_id = business_connection_id or getattr(message, 'business_connection_id', None)
-            if bc_id:
-                kwargs['business_connection_id'] = bc_id
-            try:
-                result = await bot.send_message(**kwargs)
-                OFFER_SEND_LAST_AT = loop.time()
-                return result
-            except TelegramRetryAfter as e:
-                # A regular Bot API rate limit is different from PEER_FLOOD.
-                # Do not sleep in the handler for a long time; report it now.
-                retry_after = int(getattr(e, 'retry_after', 1) or 1)
-                raise RuntimeError(
-                    f'Telegram временно ограничил частоту отправки. Повторите через {retry_after} сек.'
-                ) from e
-            except TelegramBadRequest as e:
-                desc = str(e).upper()
-                if 'PEER_FLOOD' in desc:
-                    raise OfferPeerFloodError(
-                        chat_id=chat_id,
-                        business_connection_id=bc_id,
-                        retry_after=None,
-                    ) from e
-                raise
 
 
-async def _delete_offer_command_message(message: Message, business_connection_id=None):
-    """Delete the original .офер message after the offer is safely sent."""
-    bc_id = business_connection_id or getattr(message, 'business_connection_id', None)
-    if bc_id:
-        return await safe(bot.delete_business_messages, business_connection_id=bc_id, message_ids=[message.message_id])
-    return await safe(bot.delete_message, chat_id=message.chat.id, message_id=message.message_id)
 
 
-async def _business_seller_display_name(business_connection_id):
-    """Resolve and cache the connected account's profile display name.
-
-    Never use the @username for the offer text.
-    """
-    if business_connection_id in BUSINESS_SELLER_NAME_CACHE:
-        return BUSINESS_SELLER_NAME_CACHE[business_connection_id]
-    try:
-        bc = await safe(bot.get_business_connection, business_connection_id)
-        owner = getattr(bc, 'user', None) if bc else None
-        owner_id = int(getattr(owner, 'id', 0) or 0)
-        if owner_id:
-            BUSINESS_OWNER_ID_CACHE[business_connection_id] = owner_id
-        first = (getattr(owner, 'first_name', None) or '').strip()
-        last = (getattr(owner, 'last_name', None) or '').strip()
-        name = ' '.join(x for x in (first, last) if x).strip()
-        if not name and owner:
-            try:
-                chat = await safe(bot.get_chat, int(owner.id))
-                first = (getattr(chat, 'first_name', None) or '').strip()
-                last = (getattr(chat, 'last_name', None) or '').strip()
-                name = ' '.join(x for x in (first, last) if x).strip()
-            except Exception:
-                pass
-        if name:
-            BUSINESS_SELLER_NAME_CACHE[business_connection_id] = name
-        return name or None
-    except Exception:
-        return None
 
 
 # ───────────────────────── аудит / логи ─────────────────────────
@@ -1069,18 +944,7 @@ async def v24_admin_menu(c: CallbackQuery):
         return await c.answer('Нет доступа', show_alert=True)
     await c.answer(); await c.message.edit_text('⚙️ <b>АДМИН-ПАНЕЛЬ</b>\n\nВыбери раздел:', reply_markup=admin_home_kb())
 
-@dp.callback_query(F.data == 'menu:offers')
-async def v24_offers_menu(c: CallbackQuery):
-    uid=c.from_user.id; await c.answer()
-    if not offers_paid(uid):
-        return await c.message.edit_text(ui.v24_offers(False), reply_markup=kb.offers_locked_kb())
-    if not offer_ready_for_user(uid, getattr(c.from_user,'username',None)):
-        return await c.message.edit_text('🎁 <b>ОФЕРЫ</b>\n\nДоступ оплачен, но Business-профиль ещё не подключён/не одобрен.\n\nОбратись к @witensea, если подключение уже сделано.', reply_markup=kb.offers_active_kb())
-    await c.message.edit_text(ui.v24_offers(True, db.entitlement_until(uid,'offers')), reply_markup=kb.offers_active_kb())
 
-@dp.callback_query(F.data == 'offers:install')
-async def v24_offers_install(c: CallbackQuery):
-    await c.answer(); await c.message.edit_text(ui.v24_install(), reply_markup=kb.offers_active_kb())
 
 @dp.callback_query(F.data == 'parser_ui:regular')
 async def v24_regular(c: CallbackQuery, state: FSMContext):
@@ -1313,96 +1177,20 @@ async def models_page(c: CallbackQuery):
     await show_models(c.message, int(c.data.split(':')[1]), edit_mode=True)
 
 
-def personal_offer_profile_text(uid):
-    profile = db.offer_user_profile_get(uid)
-    if profile:
-        return (
-            '🎁 <b>Доступ к оферам</b>\n\n'
-            '🟢 Доступ разрешён.\n\n'
-            f'👤 Профиль передачи: <b>{ui.esc(profile["name"])}</b>\n'
-            f'🔗 <code>{ui.esc(profile["url"])}</code>\n\n'
-            'Этот профиль используется только для твоих оферов.'
-        )
-    return ('🎁 <b>Доступ к оферам</b>\n\n'
-            '🟢 Доступ разрешён.\n\n'
-            '⚠️ Профиль передачи ещё не настроен.\n'
-            'Добавь свой профиль — он будет использоваться только в твоих оферах.')
 
 
-def personal_offer_profile_kb(uid):
-    profile = db.offer_user_profile_get(uid)
-    buttons=[]
-    buttons.append([InlineKeyboardButton(text='✏️ Настроить профиль передачи', callback_data='offer:self:profile')])
-    if profile:
-        buttons.append([InlineKeyboardButton(text='🗑 Удалить мой профиль', callback_data='offer:self:profile:remove')])
-    buttons.append([InlineKeyboardButton(text='⬅️ Назад', callback_data='offer:self:back')])
-    return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 
-@dp.message(F.text == kb.BTN_OFFERS)
-async def offers_tab(m: Message):
-    uid = int(m.from_user.id)
-    if not offers_paid(uid):
-        return await m.answer(ui.v24_offers(False), reply_markup=kb.offers_locked_kb())
-    if not offer_ready_for_user(uid, getattr(m.from_user, 'username', None)):
-        return await m.answer('🎁 <b>ОФЕРЫ</b>\n\nДоступ куплен, но Business-профиль ещё не подключён или не одобрен владельцем.\n\n@witensea', reply_markup=kb.offers_active_kb())
-    await m.answer(ui.v24_offers(True, db.entitlement_until(uid, 'offers')), reply_markup=kb.offers_active_kb())
 
 
-@dp.callback_query(F.data == 'offer:self:profile')
-async def offer_self_profile_start(c: CallbackQuery, state: FSMContext):
-    uid = int(c.from_user.id)
-    if not offer_ready_for_user(uid, getattr(c.from_user, 'username', None)):
-        return await c.answer('Сначала подключите Business и получите разрешение на оферы.', show_alert=True)
-    await c.answer()
-    await state.set_state(S.offer_user_profile_name)
-    await c.message.answer('✏️ <b>Профиль передачи</b>\n\nОтправь название профиля, например: <code>Мой профиль</code>')
 
 
-@dp.message(S.offer_user_profile_name)
-async def offer_self_profile_name(m: Message, state: FSMContext):
-    uid = int(m.from_user.id)
-    if not offer_ready_for_user(uid, getattr(m.from_user, 'username', None)):
-        await state.clear(); return
-    name = (m.text or '').strip()
-    if not name or len(name) > 64:
-        return await m.answer('❌ Название должно быть от 1 до 64 символов.')
-    await state.update_data(personal_profile_name=name)
-    await state.set_state(S.offer_user_profile_url)
-    await m.answer('🔗 Отправь ссылку Telegram-профиля: <code>https://t.me/username</code> или <code>tg://user?id=123456789</code>')
 
 
-@dp.message(S.offer_user_profile_url)
-async def offer_self_profile_url(m: Message, state: FSMContext):
-    uid = int(m.from_user.id)
-    if not offer_ready_for_user(uid, getattr(m.from_user, 'username', None)):
-        await state.clear(); return
-    url = (m.text or '').strip()
-    if not re.match(r'^(?:https?://t\.me/[^\s]+|tg://user\?id=-?\d+)$', url, re.I):
-        return await m.answer('❌ Нужна Telegram-ссылка профиля.')
-    data = await state.get_data(); name = data.get('personal_profile_name') or 'Мой профиль'
-    db.offer_user_profile_set(uid, name, url)
-    await state.clear()
-    await m.answer('✅ <b>Твой профиль передачи сохранён.</b>\n\nОн используется только для твоих новых оферов.', reply_markup=personal_offer_profile_kb(uid))
 
 
-@dp.callback_query(F.data == 'offer:self:profile:remove')
-async def offer_self_profile_remove(c: CallbackQuery):
-    uid = int(c.from_user.id)
-    if not offer_ready_for_user(uid, getattr(c.from_user, 'username', None)):
-        return await c.answer('Доступ к оферам закрыт.', show_alert=True)
-    db.offer_user_profile_remove(uid)
-    await c.answer('Профиль удалён')
-    await c.message.edit_text(personal_offer_profile_text(uid), reply_markup=personal_offer_profile_kb(uid))
 
 
-@dp.callback_query(F.data == 'offer:self:back')
-async def offer_self_back(c: CallbackQuery):
-    await c.answer()
-    try:
-        await c.message.delete()
-    except Exception:
-        pass
 
 
 # ───────────────────────── Рассылка ─────────────────────────
@@ -1583,22 +1371,8 @@ def parser_access_kb():
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
-def offers_admin_text():
-    active=db._one("SELECT COUNT(*) n FROM users WHERE offer_until IS NOT NULL AND offer_until > CURRENT_TIMESTAMP")
-    connections=len(db.business_connections_list())
-    return ('🎁 <b>ДОСТУП К ОФЕРАМ</b>\n\n'
-            f'🟢 Активных доступов: <b>{int((active or {}).get("n",0))}</b>\n'
-            f'🔗 Business-подключений: <b>{connections}</b>\n\n'
-            'Покупка: <b>25 TON · 5 дней</b>.\n'
-            'Владелец и администраторы имеют служебный доступ.')
 
 
-def offers_admin_kb():
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text='🔗 Business-профили', callback_data='adm:offer_business_connections')],
-        [InlineKeyboardButton(text='👤 Пользователи', callback_data='adm:users')],
-        [InlineKeyboardButton(text='‹ Назад', callback_data='adm:home')],
-    ])
 
 
 def tariffs_text():
@@ -1742,10 +1516,6 @@ async def adm_ban(c: CallbackQuery):
     await c.message.edit_text(admin_user_text(uid),reply_markup=admin_user_kb(uid))
 
 
-@dp.callback_query(F.data == 'adm:offer_access')
-async def adm_offer_access(c: CallbackQuery):
-    if not is_admin(c.from_user.id): return await c.answer('Нет доступа',show_alert=True)
-    await c.answer(); await c.message.edit_text(offers_admin_text(),reply_markup=offers_admin_kb())
 
 
 @dp.callback_query(F.data == 'adm:tariffs')
@@ -1866,18 +1636,7 @@ def admin_business_connections_kb():
     buttons.append([InlineKeyboardButton(text='‹ Назад',callback_data='adm:offer_access')])
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
-@dp.callback_query(F.data == 'adm:offer_business_connections')
-async def adm_offer_business_connections(c: CallbackQuery):
-    if not is_admin(c.from_user.id): return await c.answer('Нет доступа',show_alert=True)
-    await c.answer(); await c.message.edit_text('🔗 <b>BUSINESS-ПРОФИЛИ</b>\n\nНовые подключения по умолчанию закрыты. Нажми кнопку рядом с пользователем, чтобы разрешить или запретить оферы.',reply_markup=admin_business_connections_kb())
 
-@dp.callback_query(F.data.regexp(r'^adm:offer_conn:(block|unblock):-?\d+$'))
-async def adm_offer_connection_toggle(c: CallbackQuery):
-    if not is_admin(c.from_user.id): return await c.answer('Нет доступа',show_alert=True)
-    action=c.data.split(':')[2]; uid=int(c.data.split(':')[3])
-    if action=='block': db.block_offer_user(uid); msg='Оферы заблокированы.'
-    else: db.unblock_offer_user(uid); msg='Оферы разрешены.'
-    await c.answer(msg,show_alert=True); await c.message.edit_text('🔗 <b>BUSINESS-ПРОФИЛИ</b>\n\nНовые подключения по умолчанию закрыты.',reply_markup=admin_business_connections_kb())
 
 
 # ───────────────────────── Business routing test ─────────────────────────
@@ -1931,51 +1690,12 @@ async def hello_command_business(m: Message):
 
 
 # ───────────────────────── DEMO gift offers ─────────────────────────
-def _offer_custom_emoji_id():
-    return db.get_setting('offer_custom_emoji_id') or os.getenv('OFFER_CUSTOM_EMOJI_ID', '').strip() or None
 
 
-def _offer_target_url(user):
-    if user.username:
-        return f'https://t.me/{user.username}'
-    return f'tg://user?id={user.id}'
 
 
-def _offer_sender_name(user):
-    return user.username or user.first_name or str(user.id)
 
 
-@dp.message(F.text.regexp(r'^\s*\.эмодзи\b'))
-@dp.business_message(F.text.regexp(r'^\s*\.эмодзи\b'))
-async def offer_emoji_helper(m: Message):
-    if not is_admin(m.from_user.id):
-        return
-    entities = m.entities or []
-    found = [e for e in entities if e.type == 'custom_emoji' and e.custom_emoji_id]
-    if not found:
-        return await m.answer(
-            '🧩 <b>Как получить Premium Emoji ID</b>\n\n'
-            'Отправьте мне сообщение, содержащее нужный Telegram Premium emoji, '
-            'с командой <code>.эмодзи</code> перед ним.\n\n'
-            'Пример: <code>.эмодзи 🎁</code> (где 🎁 — именно custom emoji, а не обычный emoji).'
-        )
-    entity = found[0]
-    emoji_id = str(entity.custom_emoji_id)
-    # MessageEntity offsets are UTF-16 code units, not Python code points.
-    raw = m.text or ''
-    def _utf16_slice(value, start, length):
-        data = value.encode('utf-16-le')
-        part = data[start * 2:(start + length) * 2]
-        return part.decode('utf-16-le', errors='ignore') or '🎁'
-    alt = _utf16_slice(raw, entity.offset, entity.length)
-    db.set_setting('offer_custom_emoji_id', emoji_id)
-    db.set_setting('offer_custom_emoji_alt', alt)
-    await m.answer(
-        '✅ <b>Custom Emoji сохранён.</b>\n\n'
-        f'ID: <code>{emoji_id}</code>\n'
-        f'Альтернатива: {ui.esc(alt)}\n\n'
-        'Теперь он будет использоваться в DEMO-оферах.'
-    )
 
 
 @dp.business_connection()
@@ -2099,312 +1819,10 @@ async def demo_offer_route_test_2(m: Message):
 
 
 
-@dp.business_message(F.text.regexp(r'^\s*\.офер(?:\s|$)'))
-async def demo_offer_command(m: Message):
-    parsed = parse_offer_command(m.text or '')
-    if not parsed:
-        await _notify_offer_reason(
-            m, 'Команда распознана некорректно. Используйте: <code>.офер &lt;gift link&gt; 150 грам</code>.',
-            business_connection_id=getattr(m, 'business_connection_id', None),
-        )
-        return
-
-    sender_id = int(m.from_user.id) if m.from_user else 0
-    log.info(
-        'OFFER COMMAND RECEIVED sender=%s chat=%s business_connection=%s text=%r',
-        sender_id, getattr(getattr(m, 'chat', None), 'id', None),
-        getattr(m, 'business_connection_id', None), m.text,
-    )
-    sender_username = getattr(m.from_user, 'username', None) if m.from_user else None
-    business_connection_id = getattr(m, 'business_connection_id', None)
-
-    # A Business message already carries the exact connection that owns the chat.
-    # Never replace it with OWNER_ID: every connected Business account must send
-    # its own offers.
-    seller_id = sender_id
-    seller_display_name = None
-    if business_connection_id:
-        bc_row = db.get_business_connection(business_connection_id)
-        if not bc_row:
-            # The connection update can be missed after a restart; fetch the
-            # connection through Bot API and cache it from the current message.
-            try:
-                bc = await safe(bot.get_business_connection, business_connection_id)
-                owner = getattr(bc, 'user', None) if bc else None
-                owner_id = int(getattr(owner, 'id', 0) or 0)
-                if owner_id:
-                    db.save_business_connection(
-                        business_connection_id, owner_id,
-                        getattr(owner, 'username', None), getattr(owner, 'first_name', None), getattr(owner, 'last_name', None),
-                        bool(getattr(bc, 'is_enabled', True)),
-                    )
-                    bc_row = db.get_business_connection(business_connection_id)
-            except Exception:
-                log.exception('Could not refresh Business connection %s', business_connection_id)
-        business_owner_id = int((bc_row or {}).get('user_id') or 0)
-        if not business_owner_id or not bool((bc_row or {}).get('is_enabled', 1)):
-            reason = (
-                'Business-подключение не найдено или отключено. ' 
-                'Проверьте, что именно этот аккаунт подключён к боту через Telegram Business.'
-            )
-            log.warning('Ignoring .офер: Business connection unavailable: %s', business_connection_id)
-            await _notify_offer_reason(m, reason, business_connection_id=business_connection_id)
-            return
-        # DEMO offers are a bot UI flow, not a real Telegram transaction.
-        # In a Business message, from_user is the customer who wrote in the
-        # managed chat, NOT the Business account owner. Requiring
-        # sender_id == business_owner_id therefore made every Business .офер
-        # silently fail. Authorization is instead tied to the approved active
-        # Business connection itself.
-        if db.offer_user_blocked(business_owner_id) and not is_admin(business_owner_id):
-            reason = (
-                f'Для Business-профиля <code>{business_owner_id}</code> оферы пока заблокированы. '
-                'Владелец должен открыть Админка → 🎁 Доступ к оферам → 🔗 Business-профили '
-                'и нажать «Разрешить». '
-            )
-            log.info('Ignoring blocked Business .офер connection=%s owner=%s', business_connection_id, business_owner_id)
-            await _notify_offer_reason(m, reason, business_connection_id=business_connection_id)
-            return
-        seller_id = business_owner_id
-        seller_display_name = await _business_seller_display_name(business_connection_id)
-    else:
-        # For a normal bot PM, use the sender's own saved Business connection.
-        # Never fall back to OWNER_ID or another user's Business profile.
-        saved_bc = db.get_business_connection_for_user(sender_id)
-        if not saved_bc:
-            reason = 'У отправителя нет активного Business-подключения. Напишите команду из чата, подключённого к Business.'
-            log.warning('User %s has no active Business connection; .офер ignored', sender_id)
-            await _notify_offer_reason(m, reason, business_connection_id=None)
-            return
-        business_connection_id = saved_bc['connection_id']
-        if not offer_ready_for_user(sender_id, sender_username, business_connection_id):
-            bc = db.get_business_connection(business_connection_id) or {}
-            if bool(bc.get('is_blocked', 0)) or db.offer_user_blocked(sender_id):
-                reason = 'Доступ к оферам для этого Business-профиля заблокирован владельцем.'
-            elif not offers_paid(sender_id):
-                reason = 'Для этого аккаунта нет активного доступа к тарифу «Оферы».'
-            else:
-                reason = 'Business-подключение не прошло проверку доступа к оферам.'
-            log.info('Ignoring normal .офер from user without approved Business access: %s reason=%s', sender_id, reason)
-            await _notify_offer_reason(m, reason, business_connection_id=business_connection_id)
-            return
-        seller_id = sender_id
-        seller_display_name = await _business_seller_display_name(business_connection_id)
-
-    if not seller_display_name:
-        seller_display_name = os.getenv('OFFER_SELLER_NAME', '').strip() or 'Пользователь'
-
-    # Invalid syntax: explain the exact missing part in the same Business chat.
-    if parsed.get('error'):
-        if parsed.get('error') == 'gift_url':
-            reason = 'Не найдена ссылка на подарок. Нужен формат <code>https://t.me/nft/Name-123</code>.'
-        elif parsed.get('error') == 'amount':
-            reason = 'Не найдена сумма. Добавьте, например, <code>150 Gram</code> или <code>4500 зв</code>.'
-        else:
-            reason = 'Неверный формат команды.'
-        await _notify_offer_reason(m, reason, business_connection_id=business_connection_id)
-        return
-
-    buyer = m.chat
-    if not buyer or not buyer.id:
-        return
-    buyer_id = int(buyer.id)
-    log.info('OFFER DELIVERY TARGET chat=%s sender=%s business_connection=%s', buyer_id, sender_id, business_connection_id)
-    buyer_username = getattr(buyer, 'username', None)
-    buyer_url = f'https://t.me/{buyer_username}' if buyer_username else f'tg://user?id={buyer_id}'
-    # Offer lifetime is intentionally unlimited in this DEMO.
-    # The text shows a static "6ч", but there is no countdown and no auto-expiry.
-    expires_at = None
-
-    try:
-        personal_profile = db.offer_user_profile_get(seller_id)
-        if personal_profile:
-            transfer_profile_url = personal_profile['url']
-        else:
-            # Без общего профиля: по умолчанию ссылка ведёт на самого продавца.
-            # У каждого Business-профиля остаётся полностью независимая настройка.
-            owner_username = None
-            if business_connection_id:
-                owner_row = db.get_business_connection(business_connection_id) or {}
-                owner_username = owner_row.get('username')
-            transfer_profile_url = (
-                f'https://t.me/{owner_username}' if owner_username else f'tg://user?id={seller_id}'
-            )
-        offer_id = db.create_offer(
-            seller_id=seller_id, seller_username=seller_display_name,
-            buyer_id=buyer_id, buyer_username=buyer_username, buyer_url=buyer_url,
-            gift_name=parsed['gift_name'], gift_number=parsed['gift_number'], gift_url=parsed['gift_url'],
-            amount=parsed['amount'], currency=parsed['currency'], locale=parsed['locale'], expires_at=expires_at,
-            transfer_profile_url=transfer_profile_url,
-        )
-        offer = db.get_offer(offer_id)
-        text, _ = build_offer_text(offer, parsed['locale'])
-        markup = offer_keyboard(offer_id, parsed['locale'])
-
-        # Deliver synchronously so the author gets an immediate result.
-        await _deliver_new_offer(m, offer_id, text, markup, business_connection_id)
-    except Exception:
-        if 'offer_id' in locals():
-            db.set_offer_status(offer_id, STATUS_DECLINED)
-        log.exception('Failed to create demo offer')
 
 
-async def _deliver_new_offer(source_message: Message, offer_id: int, text: str, markup, business_connection_id=None):
-    """Deliver a DEMO offer strictly in the originating Business chat.
-
-    There is deliberately NO normal-bot fallback for the offer itself.
-    The offer must be sent through the Business connection so the message
-    belongs to the connected Business profile.
-    """
-    try:
-        if not business_connection_id:
-            raise RuntimeError('Business connection отсутствует: офер не отправлен.')
-
-        sent = await _send_offer_message(
-            source_message, text, markup,
-            business_connection_id=business_connection_id,
-        )
-        sent_chat_id = int(getattr(getattr(sent, 'chat', None), 'id', source_message.chat.id))
-        sent_message_id = int(getattr(sent, 'message_id', 0) or 0)
-        db.update_offer_message(offer_id, sent_chat_id, sent_message_id, business_connection_id)
-
-        try:
-            await _delete_offer_command_message(
-                source_message, business_connection_id=business_connection_id
-            )
-        except Exception as delete_error:
-            log.warning(
-                'Could not delete offer command %s after sending offer %s: %s',
-                getattr(source_message, 'message_id', '?'), offer_id, delete_error,
-            )
-        log.info(
-            'Delivered DEMO offer %s strictly in Business chat=%s connection=%s',
-            offer_id, source_message.chat.id, business_connection_id,
-        )
-
-    except OfferPeerFloodError as e:
-        # Important: do not redirect the offer to the bot DM or use a normal
-        # bot-message fallback. Report the failure in the originating chat.
-        log.warning(
-            'DEMO offer %s Business PEER_FLOOD chat=%s business_connection=%s',
-            offer_id, e.chat_id, e.business_connection_id,
-        )
-        await _notify_offer_delivery_error(source_message, offer_id, e)
-    except Exception as e:
-        log.error('Failed to deliver offer %s: %s', offer_id, e, exc_info=True)
-        try:
-            await _notify_offer_delivery_error(source_message, offer_id, e)
-        except Exception:
-            log.exception('Failed to report offer delivery error offer=%s', offer_id)
 
 
-@dp.callback_query(F.data.regexp(r'^of:(accept|decline):\d+$'))
-async def demo_offer_action(c: CallbackQuery):
-    try:
-        _, action, raw_id = c.data.split(':', 2)
-        offer_id = int(raw_id)
-    except Exception:
-        return await c.answer('Некорректный офер', show_alert=True)
-
-    lock = _offer_lock(offer_id)
-    async with lock:
-        offer = db.get_offer(offer_id)
-        if not offer:
-            return await c.answer('Офер не найден', show_alert=True)
-        if offer['status'] != STATUS_PENDING:
-            return await c.answer('Офер уже обработан.', show_alert=True)
-        if not c.message:
-            return await c.answer('Сообщение офера недоступно.', show_alert=True)
-
-        locale = offer['locale'] or 'ru'
-        message = c.message
-        bc_id = (
-            getattr(c, 'business_connection_id', None)
-            or offer.get('business_connection_id')
-            or getattr(message, 'business_connection_id', None)
-        )
-
-        if action == 'accept':
-            new_text = final_offer_text(offer, locale)
-            new_markup = transfer_keyboard(offer, locale)
-            alert = accepted_alert_text(offer, locale)
-            new_status = STATUS_ACCEPTED
-        else:
-            new_text = declined_text(offer, locale)
-            new_markup = None
-            alert = None
-            new_status = STATUS_DECLINED
-
-        # Variant A: keep ONE message and edit it in the same Business context.
-        # This intentionally may show Telegram's normal "edited" marker.
-        try:
-            await c.answer(alert, show_alert=True) if alert else await c.answer()
-        except Exception:
-            pass
-
-        try:
-            if bc_id:
-                edited = await bot.edit_message_text(
-                    chat_id=message.chat.id,
-                    message_id=message.message_id,
-                    text=new_text,
-                    reply_markup=new_markup,
-                    business_connection_id=bc_id,
-                    link_preview_options=LinkPreviewOptions(
-                        show_above_text=True,
-                        prefer_large_media=True,
-                    ),
-                )
-            else:
-                edited = await bot.edit_message_text(
-                    chat_id=message.chat.id,
-                    message_id=message.message_id,
-                    text=new_text,
-                    reply_markup=new_markup,
-                    link_preview_options=LinkPreviewOptions(
-                        show_above_text=True,
-                        prefer_large_media=True,
-                    ),
-                )
-
-            db.update_offer_message(
-                offer_id,
-                int(message.chat.id),
-                int(message.message_id),
-                bc_id,
-            )
-            db.set_offer_status(offer_id, new_status)
-            log.info(
-                'Offer %s moved to %s by EDITING SAME MESSAGE chat=%s message=%s connection=%s',
-                offer_id, new_status, message.chat.id, message.message_id, bc_id,
-            )
-        except TelegramRetryAfter as e:
-            log.warning(
-                'Could not edit offer %s: flood retry_after=%s',
-                offer_id, getattr(e, 'retry_after', '?'),
-            )
-            try:
-                await c.answer(
-                    f'Telegram временно ограничил изменение сообщения. Повторите через {getattr(e, "retry_after", "несколько")} сек.',
-                    show_alert=True,
-                )
-            except Exception:
-                pass
-        except TelegramBadRequest as e:
-            if 'PEER_FLOOD' in str(e).upper():
-                log.warning('Offer %s edit PEER_FLOOD connection=%s chat=%s', offer_id, bc_id, message.chat.id)
-            else:
-                log.exception('Could not edit offer %s after %s', offer_id, action)
-            try:
-                await c.answer('Не удалось обновить офер. Попробуйте ещё раз.', show_alert=True)
-            except Exception:
-                pass
-        except Exception:
-            log.exception('Could not edit offer %s after %s', offer_id, action)
-            try:
-                await c.answer('Не удалось обновить офер. Попробуйте ещё раз.', show_alert=True)
-            except Exception:
-                pass
 
 
 

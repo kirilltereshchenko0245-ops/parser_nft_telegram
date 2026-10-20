@@ -15,7 +15,6 @@ BTN_PROFILE = '👤 Профиль'
 BTN_HELP = '❓ Помощь'
 BTN_PREMIUM = '💎 Премиум'
 BTN_ADMIN = '⚙️ Админка'
-BTN_OFFERS = '🎁 Оферы'
 BTN_PARSER = '🔎 Парсер'
 BTN_CANCEL = '✖️ Отмена'
 BTN_STOP = '⏹ Остановить'
@@ -26,12 +25,12 @@ LIST_PER_PAGE = 8
 def main_menu(admin=False, premium=False, parser_visible=True):
     b = ReplyKeyboardBuilder()
     b.row(KeyboardButton(text='🔎 Парсер'), KeyboardButton(text='💎 Премиум'))
-    b.row(KeyboardButton(text='🎁 Оферы'), KeyboardButton(text='👤 Профиль'))
+    b.row(KeyboardButton(text='👤 Профиль'))
     if admin:
         b.row(KeyboardButton(text=BTN_ADMIN))
     return b.as_markup(resize_keyboard=True, input_field_placeholder='Выберите действие…')
 
-def inline_main_menu(admin=False, premium=False, offers=False):
+def inline_main_menu(admin=False, premium=False):
     b = InlineKeyboardBuilder()
     b.row(InlineKeyboardButton(text='🔎 Парсер', callback_data='menu:parser'))
     b.row(InlineKeyboardButton(text='💎 Премиум', callback_data='menu:premium'),
@@ -65,23 +64,10 @@ def premium_menu_kb():
     b = InlineKeyboardBuilder()
     b.row(InlineKeyboardButton(text='⚡ 7 TON · 2 дня', callback_data='buy:premium_2d'))
     b.row(InlineKeyboardButton(text='📡 10 TON · чаты · 24 часа', callback_data='buy:chat_24h'))
-    b.row(InlineKeyboardButton(text='🎁 25 TON · оферы · 5 дней', callback_data='buy:offers_5d'))
     b.row(InlineKeyboardButton(text='‹ Главное меню', callback_data='menu:home'))
     return b.as_markup()
 
-def offers_locked_kb():
-    b = InlineKeyboardBuilder()
-    b.row(InlineKeyboardButton(text='💎 Купить доступ в Премиум', callback_data='menu:premium'))
-    b.row(InlineKeyboardButton(text='📖 Инструкция по установке', callback_data='offers:install'))
-    b.row(InlineKeyboardButton(text='‹ Главное меню', callback_data='menu:home'))
-    return b.as_markup()
 
-def offers_active_kb():
-    b = InlineKeyboardBuilder()
-    b.row(InlineKeyboardButton(text='⚙️ Настроить профиль передачи', callback_data='offer:self:profile'))
-    b.row(InlineKeyboardButton(text='📖 Инструкция по установке', callback_data='offers:install'))
-    b.row(InlineKeyboardButton(text='‹ Главное меню', callback_data='menu:home'))
-    return b.as_markup()
 
 def catalog_kb(items, page, pages, query=''):
     b = InlineKeyboardBuilder()
